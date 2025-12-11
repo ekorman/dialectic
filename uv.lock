@@ -162,6 +162,18 @@ wheels = [
 ]
 
 [[package]]
+name = "jaxtyping"
+version = "0.3.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "wadler-lindig" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/1e/827f9e17b26e21c7d4d934fd1a214284ad05663afedd37c21ed105db366b/jaxtyping-0.3.3.tar.gz", hash = "sha256:8003cfd16ba2ad9b47fdda1d982a575299a81ddfc7997ad0e917c87a0897ea86", size = 45484, upload-time = "2025-10-01T13:46:51.933Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/97/88264b1af140f66ba7ca6eb2f3a108be233ee278bb3f1d5c750243e7458a/jaxtyping-0.3.3-py3-none-any.whl", hash = "sha256:a1c2f0f4351a8deda84b0e3b5c5a50894a1cdae2b82d841279fce4393aff4a7c", size = 55926, upload-time = "2025-10-01T13:46:50.621Z" },
+]
+
+[[package]]
 name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
@@ -172,32 +184,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c
 wheels = [
     { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
 ]
-
-[[package]]
-name = "llm"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "tokenizers" },
-    { name = "torch" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "jinja2" },
-    { name = "pytest" },
-    { name = "transformers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1.6" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
-    { name = "tokenizers", specifier = ">=0.22.1" },
-    { name = "torch", specifier = ">=2.9.1" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = ">=4.57.3" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "markupsafe"
@@ -703,6 +689,37 @@ wheels = [
 ]
 
 [[package]]
+name = "tllm"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "jaxtyping" },
+    { name = "tokenizers" },
+    { name = "torch" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "jinja2" },
+    { name = "pytest" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "jaxtyping", specifier = ">=0.3.3" },
+    { name = "tokenizers", specifier = ">=0.22.1" },
+    { name = "torch", specifier = ">=2.9.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "jinja2", specifier = ">=3.1.6" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "transformers", specifier = ">=4.57.3" },
+]
+
+[[package]]
 name = "tokenizers"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
@@ -840,4 +857,13 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1e/24/a2a2ed9addd907787d7aa0355ba36a6cadf1768b934c652ea78acbd59dcd/urllib3-2.6.2.tar.gz", hash = "sha256:016f9c98bb7e98085cb2b4b17b87d2c702975664e4f060c6532e64d1c1a5e797", size = 432930, upload-time = "2025-12-11T15:56:40.252Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6d/b9/4095b668ea3678bf6a0af005527f39de12fb026516fb3df17495a733b7f8/urllib3-2.6.2-py3-none-any.whl", hash = "sha256:ec21cddfe7724fc7cb4ba4bea7aa8e2ef36f607a4bab81aa6ce42a13dc3f03dd", size = 131182, upload-time = "2025-12-11T15:56:38.584Z" },
+]
+
+[[package]]
+name = "wadler-lindig"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/67/cbae4bf7683a64755c2c1778c418fea96d00e34395bb91743f08bd951571/wadler_lindig-0.1.7.tar.gz", hash = "sha256:81d14d3fe77d441acf3ebd7f4aefac20c74128bf460e84b512806dccf7b2cd55", size = 15842, upload-time = "2025-06-18T07:00:42.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/96/04e7b441807b26b794da5b11e59ed7f83b2cf8af202bd7eba8ad2fa6046e/wadler_lindig-0.1.7-py3-none-any.whl", hash = "sha256:e3ec83835570fd0a9509f969162aeb9c65618f998b1f42918cfc8d45122fe953", size = 20516, upload-time = "2025-06-18T07:00:41.684Z" },
 ]
