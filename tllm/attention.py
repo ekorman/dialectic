@@ -14,7 +14,14 @@ TMH = Float[Tensor, "batch num_heads seq_length head_d"]
 
 def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
     # [batch, num_heads, seq_length, head_d]
-    seq_length, head_d = q.shape[-2:]
+    num_heads, seq_length, head_d = q.shape[-3:]
+
+    num_kv_heads = k.shape[1]
+
+    if num_kv_heads != num_heads:
+        k = k.repeat_interleave(num_heads // num_kv_heads, 1)
+        v = v.repeat_interleave(num_heads // num_kv_heads, 1)
+
     dot_prods = torch.matmul(q, k.transpose(3, 2)) / (head_d**0.5)
     if causal:
         dot_prods.masked_fill_(

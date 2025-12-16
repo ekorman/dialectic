@@ -43,8 +43,8 @@ def test_mhsa_not_causal_no_rope():
     torch.testing.assert_close(y1, y2[0].transpose(1, 0))
 
 
-def test_attention():
-    l, b, d, num_heads = 4, 6, 20, 2
+def test_attention_no_gqa():
+    l, b, d, num_heads = 4, 6, 20, 4
 
     q, k, v = [torch.rand(b, num_heads, l, d) for _ in range(3)]
 
@@ -56,6 +56,17 @@ def test_attention():
     # test causal
     a1 = attention(q, k, v, causal=True)
     a2 = scaled_dot_product_attention(q, k, v, is_causal=True)
+    torch.testing.assert_close(a1, a2)
+
+
+def test_attention_with_gqa():
+    l, b, d, num_heads, num_kv_heads = 4, 6, 20, 4, 2
+    k, v = [torch.rand(b, num_kv_heads, l, d) for _ in range(2)]
+    q = torch.rand(b, num_heads, l, d)
+
+    a1 = attention(q, k, v, causal=False)
+    a2 = scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
+
     torch.testing.assert_close(a1, a2)
 
 
