@@ -28,7 +28,7 @@ def get_input_text_from_messages(
 
 
 def test_tokenizer():
-    auto_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+    auto_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     tokenizer: Tokenizer = Tokenizer.from_file("qwen-tokenizer/tokenizer.json")
 
     prompt = "Give me a short introduction to large language model."

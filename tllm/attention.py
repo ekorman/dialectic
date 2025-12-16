@@ -2,13 +2,14 @@ from dataclasses import dataclass
 
 import numpy as np
 from jaxtyping import Float
+from torch import Tensor
 import torch
 import torch.nn as nn
 
 
-T = Float[torch.Tensor, "batch seq_length d"]
+T = Float[Tensor, "batch seq_length d"]
 
-TMH = Float[torch.Tensor, "batch num_heads seq_length head_d"]
+TMH = Float[Tensor, "batch num_heads seq_length head_d"]
 
 
 def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
@@ -24,6 +25,30 @@ def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
     return torch.matmul(soft_max_dot_prods, v)
 
 
+# for our RoPE implementation we follow closely the paper, where adjacent components in the vector
+# dimension are paired. this contrasts with huggingface where they split the vector into first and second half
+# instead of interleaving
+#
+# c.f.: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py
+# https://github.com/huggingface/transformers/issues/25199
+# https://github.com/rasbt/LLMs-from-scratch/pull/747
+# https://github.com/rasbt/LLMs-from-scratch/issues/751
+
+
+def apply_rope(
+    x: Float[Tensor, "batch num_heads seq_length d"],
+    sin: Float[Tensor, "batch seq_length d"],
+    cos: Float[Tensor, "batch seq_length d"],
+) -> Float[Tensor, "batch seq_length d"]:
+    d = x.shape[-1]
+    # rot = torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
+    rot = torch.stack(
+        [-x[:, :, :, torch.arange(1, d, 2)], x[:, :, :, torch.arange(0, d, 2)]], -1
+    ).reshape(*x.shape)
+
+    return x * cos.unsqueeze(1) + rot * sin.unsqueeze(1)
+
+
 @dataclass
 class RopeBufferParams:
     context_length: int
@@ -31,16 +56,26 @@ class RopeBufferParams:
 
 
 def create_rope_sine_cosine_tensors(
-    dim: int, rope_params: RopeBufferParams
-) -> tuple[Float[torch.Tensor, "dim length"], Float[torch.Tensor, "dim length"]]:
-    sin = torch.zeros([rope_params.context_length, dim], dtype=float)
-    cos = torch.zeros([rope_params.context_length, dim], dtype=float)
+    dim: int, batch_size: int, rope_params: RopeBufferParams
+) -> tuple[Float[Tensor, "dim length"], Float[Tensor, "dim length"]]:
+    sin = torch.zeros([rope_params.context_length, dim], dtype=torch.float32)
+    cos = torch.zeros([rope_params.context_length, dim], dtype=torch.float32)
 
-    for m in range(rope_params.context_length):
-        for i in range(dim):
-            theta = rope_params.base ** (-2 * (i - 1) / dim)
-            sin[m, i] = np.sin(m * theta)
-            cos[m, i] = np.cos(m * theta)
+    thetas = rope_params.base_value ** (-2 * (torch.arange(dim // 2)) / dim)
+    thetas = thetas.repeat_interleave(2)
+
+    freqs = torch.outer(torch.arange(rope_params.context_length), thetas)
+
+    sin = (
+        freqs.sin()
+        .view(1, rope_params.context_length, dim)
+        .expand(batch_size, rope_params.context_length, dim)
+    )
+    cos = (
+        freqs.cos()
+        .view(1, rope_params.context_length, dim)
+        .expand(batch_size, rope_params.context_length, dim)
+    )
 
     return sin, cos
 
