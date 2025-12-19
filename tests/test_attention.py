@@ -135,7 +135,7 @@ def test_attention_vs_hf_qwen():
         apply_rms_norm=True,
         rope_base_value=10000,
     )
-    our_att.load_state_dict(hf_att.state_dict(), strict=False)
+    our_att.load_state_dict(hf_att.state_dict())
 
     x = torch.rand(b, l, d)
     rot_emb = Qwen3RotaryEmbedding(conf)
