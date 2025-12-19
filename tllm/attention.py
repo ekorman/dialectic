@@ -48,36 +48,26 @@ def apply_rope(
     sin: Float[Tensor, "batch seq_length d"],
     cos: Float[Tensor, "batch seq_length d"],
 ) -> Float[Tensor, "batch seq_length d"]:
-    d = x.shape[-1]
     rot = torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
-    # rot = torch.stack(
-    #     [-x[:, :, :, torch.arange(1, d, 2)], x[:, :, :, torch.arange(0, d, 2)]], -1
-    # ).reshape(*x.shape)
 
     return x * cos.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(
         1
     ) + rot * sin.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(1)
 
 
-@dataclass
-class RopeBufferParams:
-    context_length: int
-    base_value: float = 10000
-
-
 def create_rope_sine_cosine_tensors(
-    dim: int, rope_params: RopeBufferParams
+    dim: int, base_value: float, context_length: int
 ) -> tuple[Float[Tensor, "dim length"], Float[Tensor, "dim length"]]:
-    sin = torch.zeros([rope_params.context_length, dim], dtype=torch.float32)
-    cos = torch.zeros([rope_params.context_length, dim], dtype=torch.float32)
+    sin = torch.zeros([context_length, dim], dtype=torch.float32)
+    cos = torch.zeros([context_length, dim], dtype=torch.float32)
 
-    thetas = rope_params.base_value ** (-2 * (torch.arange(dim // 2)) / dim)
+    thetas = base_value ** (-2 * (torch.arange(dim // 2)) / dim)
     thetas = thetas.repeat(2)
 
-    freqs = torch.outer(torch.arange(rope_params.context_length), thetas)
+    freqs = torch.outer(torch.arange(context_length), thetas)
 
-    sin = freqs.sin().view(1, rope_params.context_length, dim)
-    cos = freqs.cos().view(1, rope_params.context_length, dim)
+    sin = freqs.sin().view(1, context_length, dim)
+    cos = freqs.cos().view(1, context_length, dim)
 
     return sin, cos
 
@@ -104,7 +94,7 @@ class MHSA(nn.Module):
         num_kv_heads: int | None = None,
         bias: bool = False,
         causal: bool = False,
-        rope_params: RopeBufferParams | None = None,
+        rope_base_value: float = None,
         apply_rms_norm: bool = False,
     ):
         super().__init__()
@@ -121,13 +111,14 @@ class MHSA(nn.Module):
         self.o_proj = nn.Linear(num_heads * head_d, d, bias=bias)
 
         self.causal = causal
-        self.use_rope = rope_params is not None
+        self.use_rope = rope_base_value is not None
+        self.rope_base_value = rope_base_value
         self.apply_rms_norm = apply_rms_norm
 
-        if self.use_rope:
-            sin, cos = create_rope_sine_cosine_tensors(head_d, rope_params=rope_params)
-            self.register_buffer("rope_sin", sin)
-            self.register_buffer("rope_cos", cos)
+        # if self.use_rope:
+        #     sin, cos = create_rope_sine_cosine_tensors(head_d, rope_params=rope_params)
+        # self.register_buffer("rope_sin", sin)
+        # self.register_buffer("rope_cos", cos)
 
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d)
@@ -154,8 +145,11 @@ class MHSA(nn.Module):
             k = self.k_norm(k)
 
         if self.use_rope:
-            q = apply_rope(q, sin=self.rope_sin, cos=self.rope_cos)
-            k = apply_rope(k, sin=self.rope_sin, cos=self.rope_cos)
+            sin, cos = create_rope_sine_cosine_tensors(
+                self.head_d, base_value=self.rope_base_value, context_length=x.shape[1]
+            )
+            q = apply_rope(q, sin=sin, cos=cos)
+            k = apply_rope(k, sin=sin, cos=cos)
         ret = attention(q, k, v, causal=self.causal)
 
         # move sequence length back to second position and join the heads
@@ -188,21 +182,25 @@ class QwenDecoderLayer(nn.Module):
         attn_num_heads: int,
         attn_num_kv_heads: int,
         mlp_hidden_d: int,
+        rope_base_value: float = None,
     ):
         super().__init__()
-        self.pre_attn_norm = RMSNorm(d)
-        self.attention = MHSA(
+        self.input_layernorm = RMSNorm(d)
+        self.self_attn = MHSA(
             d=d,
             head_d=attn_head_d,
             num_heads=attn_num_heads,
             num_kv_heads=attn_num_kv_heads,
+            causal=True,
+            apply_rms_norm=True,
+            rope_base_value=rope_base_value,
         )
-        self.post_attn_norm = RMSNorm(d)
-        self.MLP = GatedMLP(hidden_d=mlp_hidden_d)
+        self.post_attention_layernorm = RMSNorm(d)
+        self.mlp = GatedMLP(d=d, hidden_d=mlp_hidden_d)
 
     def forward(self, x):
-        x = x + self.attention(self.pre_attn_norm(x))
-        x = x + self.MLP(self.post_attn_norm(x))
+        x = x + self.self_attn(self.input_layernorm(x))
+        x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
 

@@ -5,6 +5,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
     Qwen3Attention,
     Qwen3RotaryEmbedding,
+    Qwen3DecoderLayer,
     Qwen3MLP,
 )
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -12,7 +13,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from tllm.attention import (
     GatedMLP,
-    RopeBufferParams,
+    QwenDecoderLayer,
     apply_rope,
     attention,
     MHSA,
@@ -27,7 +28,7 @@ def test_mhsa_not_causal_no_rope():
 
     x = torch.rand(b, l, d)
 
-    mhsa = MHSA(d, d // num_heads, num_heads=num_heads, rope_params=None)
+    mhsa = MHSA(d, d // num_heads, num_heads=num_heads)
 
     torch_mhsa = nn.MultiheadAttention(d, num_heads=num_heads, bias=False)
     torch_mhsa.in_proj_weight = nn.Parameter(
@@ -83,7 +84,7 @@ def test_rope_cosine_sine_against_hf():
     position_ids = torch.stack([torch.arange(0, l) for _ in range(b)])
     hf_cos, hf_sin = rot_emb(x, position_ids)
 
-    sin, cos = create_rope_sine_cosine_tensors(d, RopeBufferParams(context_length=l))
+    sin, cos = create_rope_sine_cosine_tensors(d, base_value=10000, context_length=l)
 
     dec_point_tol = 6
 
@@ -113,20 +114,6 @@ def test_rope_cosine_sine_against_hf():
     torch.testing.assert_close(our_x_with_pe, hf_x_with_pe)
 
 
-def convert_hf_att_weights_to_att_weights(
-    sd: dict[str, torch.Tensor],  # permute_qkv: bool
-) -> dict[str, torch.Tensor]:
-    key_mapper = {
-        "q_proj.weight": "Q.weight",
-        "k_proj.weight": "K.weight",
-        "v_proj.weight": "V.weight",
-        "o_proj.weight": "out_proj.weight",
-        "q_norm.weight": "q_norm.weight",
-        "k_norm.weight": "k_norm.weight",
-    }
-    return {key_mapper[k]: v for k, v in sd.items()}
-
-
 def test_attention_vs_hf_qwen():
     l, b, d, head_d, num_heads, num_kv_heads = 4, 6, 20, 16, 8, 2
 
@@ -146,7 +133,7 @@ def test_attention_vs_hf_qwen():
         num_kv_heads,
         causal=True,
         apply_rms_norm=True,
-        rope_params=RopeBufferParams(l),
+        rope_base_value=10000,
     )
     our_att.load_state_dict(hf_att.state_dict(), strict=False)
 
@@ -176,3 +163,36 @@ def test_gated_mlp():
     mlp1.load_state_dict(mlp2.state_dict())
 
     torch.testing.assert_close(mlp1(x), mlp2(x))
+
+
+def test_qwen_decoder_layer():
+    l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
+    x = torch.rand(b, l, d)
+
+    conf = Qwen3Config()
+    conf.hidden_size = d
+    conf.intermediate_size = mlp_hidden_d
+    conf.head_dim = head_d
+    conf.num_key_value_heads = num_kv_heads
+    conf.num_attention_heads = num_heads
+    conf._attn_implementation = "sdpa"
+
+    rot_emb = Qwen3RotaryEmbedding(conf)
+
+    d1 = QwenDecoderLayer(
+        d,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=10000,
+    )
+    d2 = Qwen3DecoderLayer(conf, 0)
+
+    d1.load_state_dict(d2.state_dict())
+
+    position_ids = torch.stack([torch.arange(0, l) for _ in range(b)])
+    torch.testing.assert_close(
+        d1(x),
+        d2(x, position_embeddings=rot_emb(x, position_ids=position_ids)),
+    )
