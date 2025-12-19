@@ -165,6 +165,45 @@ class MHSA(nn.Module):
         return self.out_proj(ret)
 
 
+class GatedMLP(nn.Module):
+    def __init__(self, d: int, hidden_d: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(d, hidden_d, bias=False)
+        self.up_proj = nn.Linear(d, hidden_d, bias=False)
+        self.down_proj = nn.Linear(hidden_d, d, bias=False)
+
+    def forward(self, x: T) -> T:
+        return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class QwenDecoderLayer(nn.Module):
+    """
+    RMSNorm -> Residual attention -> RMSNorm -> Residual MLP
+    """
+
+    def __init__(
+        self,
+        d: int,
+        attn_head_d: int,
+        attn_num_heads: int,
+        attn_num_kv_heads: int,
+        mlp_hidden_d: int,
+    ):
+        super().__init__()
+        self.pre_attn_norm = RMSNorm(d)
+        self.attention = MHSA(
+            d=d,
+            head_d=attn_head_d,
+            num_heads=attn_num_heads,
+            num_kv_heads=attn_num_kv_heads,
+        )
+        self.post_attn_norm = RMSNorm(d)
+        self.MLP = GatedMLP(hidden_d=mlp_hidden_d)
+
+    def forward(self, x):
+        pass
+
+
 class Qwen(nn.Module):
     def __init__(self, vocab_size: int, token_embedding_dim: int):
         super().__init__()
