@@ -115,10 +115,10 @@ class MHSA(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.Q = nn.Linear(d, num_heads * head_d, bias=bias)
-        self.K = nn.Linear(d, num_kv_heads * head_d, bias=bias)
-        self.V = nn.Linear(d, num_kv_heads * head_d, bias=bias)
-        self.out_proj = nn.Linear(num_heads * head_d, d, bias=bias)
+        self.q_proj = nn.Linear(d, num_heads * head_d, bias=bias)
+        self.k_proj = nn.Linear(d, num_kv_heads * head_d, bias=bias)
+        self.v_proj = nn.Linear(d, num_kv_heads * head_d, bias=bias)
+        self.o_proj = nn.Linear(num_heads * head_d, d, bias=bias)
 
         self.causal = causal
         self.use_rope = rope_params is not None
@@ -136,9 +136,9 @@ class MHSA(nn.Module):
     def forward(self, x: T) -> T:
         batch_size, seq_length = x.shape[:2]
 
-        q: T = self.Q(x)
-        k: T = self.K(x)
-        v: T = self.V(x)
+        q: T = self.q_proj(x)
+        k: T = self.k_proj(x)
+        v: T = self.v_proj(x)
 
         # view tensors as [batch, num_heads, seq_length, head_d] to break into heads
         q = q.view(batch_size, seq_length, self.num_heads, self.head_d).transpose(2, 1)
@@ -162,7 +162,7 @@ class MHSA(nn.Module):
         ret = ret.transpose(1, 2).contiguous()
         ret = ret.view(batch_size, seq_length, -1)
 
-        return self.out_proj(ret)
+        return self.o_proj(ret)
 
 
 class GatedMLP(nn.Module):
@@ -201,7 +201,9 @@ class QwenDecoderLayer(nn.Module):
         self.MLP = GatedMLP(hidden_d=mlp_hidden_d)
 
     def forward(self, x):
-        pass
+        x = x + self.attention(self.pre_attn_norm(x))
+        x = x + self.MLP(self.post_attn_norm(x))
+        return x
 
 
 class Qwen(nn.Module):

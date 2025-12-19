@@ -31,9 +31,9 @@ def test_mhsa_not_causal_no_rope():
 
     torch_mhsa = nn.MultiheadAttention(d, num_heads=num_heads, bias=False)
     torch_mhsa.in_proj_weight = nn.Parameter(
-        torch.cat([mhsa.Q.weight, mhsa.K.weight, mhsa.V.weight], dim=0)
+        torch.cat([mhsa.q_proj.weight, mhsa.k_proj.weight, mhsa.v_proj.weight], dim=0)
     )
-    torch_mhsa.out_proj.weight = nn.Parameter(mhsa.out_proj.weight)
+    torch_mhsa.out_proj.weight = nn.Parameter(mhsa.o_proj.weight)
 
     y1 = mhsa(x)
 
@@ -101,20 +101,6 @@ def test_rope_cosine_sine_against_hf():
         )
 
         torch.testing.assert_close(ours[0], hfs[0])
-        # torch.testing.assert_close(
-        #     ours[0, :, torch.arange(0, d, 2)], hfs[0, :, : d // 2]
-        # )
-        # torch.testing.assert_close(
-        #     ours[0, :, torch.arange(1, d, 2)], hfs[0, :, d // 2 :]
-        # )
-
-    def transform_us_to_hf(y: torch.Tensor):
-        """permutes the components of the tensor by moving the odd indices to the second half and the
-        even indices to the first half
-        """
-        return torch.cat(
-            [y[:, :, :, torch.arange(0, d, 2)], y[:, :, :, torch.arange(1, d, 2)]], -1
-        )
 
     hf_x_with_pe, _ = apply_rotary_pos_emb(x, x, cos=hf_cos, sin=hf_sin)
     our_x_with_pe = apply_rope(x, sin=sin, cos=cos)
@@ -162,9 +148,7 @@ def test_attention_vs_hf_qwen():
         apply_rms_norm=True,
         rope_params=RopeBufferParams(l),
     )
-    our_att.load_state_dict(
-        convert_hf_att_weights_to_att_weights(hf_att.state_dict()), strict=False
-    )
+    our_att.load_state_dict(hf_att.state_dict(), strict=False)
 
     x = torch.rand(b, l, d)
     rot_emb = Qwen3RotaryEmbedding(conf)
