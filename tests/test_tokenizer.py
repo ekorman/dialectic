@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
-from tokenizers import Tokenizer, Encoding
 
 
 @dataclass

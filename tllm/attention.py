@@ -1,8 +1,7 @@
-from jaxtyping import Float
-from torch import Tensor
 import torch
 import torch.nn as nn
-
+from jaxtyping import Float
+from torch import Tensor
 
 T = Float[Tensor, "batch seq_length d"]
 

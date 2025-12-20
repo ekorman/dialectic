@@ -1,23 +1,22 @@
 import torch
 import torch.nn as nn
 from torch.nn.functional import scaled_dot_product_attention
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
-    apply_rotary_pos_emb,
     Qwen3Attention,
-    Qwen3RotaryEmbedding,
     Qwen3DecoderLayer,
     Qwen3MLP,
+    Qwen3RotaryEmbedding,
+    apply_rotary_pos_emb,
 )
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
-
 
 from tllm.attention import (
+    MHSA,
     GatedMLP,
     Qwen,
     QwenDecoderLayer,
     apply_rope,
     attention,
-    MHSA,
     create_rope_sine_cosine_tensors,
 )
 
