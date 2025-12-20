@@ -1,30 +1,7 @@
-from dataclasses import dataclass
-from typing import Literal
-
 from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
 
-
-@dataclass
-class Message:
-    role: Literal["user"]
-    content: str
-
-
-def get_input_text_from_messages(
-    messages: list[Message], add_generation_prompt: bool
-) -> str:
-    # TODO: implement other types of messages
-    t = ""
-    for message in messages:
-        if message.role == "user":
-            t += f"<|im_start|>user\n{message.content}<|im_end|>\n"
-        else:
-            raise ValueError
-    if add_generation_prompt:
-        t += "<|im_start|>assistant\n"
-
-    return t
+from dialectic.tokenizer import Message, get_input_text_from_messages
 
 
 def test_tokenizer():
@@ -40,8 +17,12 @@ def test_tokenizer():
         enable_thinking=True,  # Switches between thinking and non-thinking modes. Default is True.
     )
 
-    assert text == get_input_text_from_messages(
-        messages=[Message(**m) for m in messages], add_generation_prompt=True
+    assert (
+        text
+        == get_input_text_from_messages(
+            messages=[Message(**m) for m in messages], add_generation_prompt=True
+        )
+        == "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
     )
 
     x: Encoding = tokenizer.encode_batch([text])  # or could do .encode(text)
