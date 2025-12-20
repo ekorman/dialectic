@@ -10,7 +10,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
 )
 
-from tllm.attention import (
+from dialectic.attention import (
     MHSA,
     GatedMLP,
     Qwen,
