@@ -3,6 +3,8 @@ import torch.nn as nn
 from jaxtyping import Float
 from torch import Tensor
 
+from dialectic.tokenizer import Message
+
 T = Float[Tensor, "batch seq_length d"]
 
 TMH = Float[Tensor, "batch num_heads seq_length head_d"]
@@ -229,7 +231,7 @@ class Qwen(nn.Module):
             ]
         )
         self.norm = RMSNorm(d)
-        self.lm_head = nn.Linear(d, vocab_size)
+        self.lm_head = nn.Linear(d, vocab_size, bias=False)
 
     def forward(self, x):
         x = self.embed_tokens(x)
@@ -240,3 +242,20 @@ class Qwen(nn.Module):
         # just get last element of output sequence
         x = x[:, -1:]
         return self.lm_head(x)
+
+
+def load_qwen_06b() -> Qwen:
+    return Qwen(
+        d=1024,
+        vocab_size=151936,
+        n_decoder_layers=28,
+        attn_head_d=128,
+        attn_num_heads=16,
+        attn_num_kv_heads=8,
+        mlp_hidden_d=3072,
+        rope_base_value=10000,
+    )
+
+
+def generate(net: Qwen, prompt: str, messages: list[Message]):
+    pass

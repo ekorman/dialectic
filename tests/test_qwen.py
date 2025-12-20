@@ -1,6 +1,10 @@
+import os
+
+import pytest
 import torch
 import torch.nn as nn
 from torch.nn.functional import scaled_dot_product_attention
+from transformers import AutoModelForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
@@ -18,6 +22,7 @@ from dialectic.qwen import (
     apply_rope,
     attention,
     create_rope_sine_cosine_tensors,
+    load_qwen_06b,
 )
 
 
@@ -217,3 +222,22 @@ def test_qwen():
     )
 
     assert model(x).shape == torch.Size((b, 1, vocab_size))
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_load_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_load_qwen_06b():
+    model = load_qwen_06b()
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", torch_dtype="auto"
+    )
+
+    def map_key(k: str):
+        if k.startswith("model"):
+            return k[6:]
+        return k
+
+    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
