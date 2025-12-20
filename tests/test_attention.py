@@ -13,6 +13,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from tllm.attention import (
     GatedMLP,
+    Qwen,
     QwenDecoderLayer,
     apply_rope,
     attention,
@@ -196,3 +197,24 @@ def test_qwen_decoder_layer():
         d1(x),
         d2(x, position_embeddings=rot_emb(x, position_ids=position_ids)),
     )
+
+
+def test_qwen():
+    l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+    x = torch.randint(0, vocab_size, size=(b, l))
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    )
+
+    assert model(x).shape == torch.Size((b, 1, vocab_size))

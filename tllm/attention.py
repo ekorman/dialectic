@@ -205,6 +205,41 @@ class QwenDecoderLayer(nn.Module):
 
 
 class Qwen(nn.Module):
-    def __init__(self, vocab_size: int, token_embedding_dim: int):
+    def __init__(
+        self,
+        d: int,
+        vocab_size: int,
+        n_decoder_layers: int,
+        attn_head_d: int,
+        attn_num_heads: int,
+        attn_num_kv_heads: int,
+        mlp_hidden_d: int,
+        rope_base_value: float = None,
+    ):
         super().__init__()
-        self.embedder = nn.Embedding(vocab_size, token_embedding_dim)
+        self.embed_tokens = nn.Embedding(vocab_size, d)
+        self.layers = nn.ModuleList(
+            [
+                QwenDecoderLayer(
+                    d=d,
+                    attn_head_d=attn_head_d,
+                    attn_num_heads=attn_num_heads,
+                    attn_num_kv_heads=attn_num_kv_heads,
+                    mlp_hidden_d=mlp_hidden_d,
+                    rope_base_value=rope_base_value,
+                )
+                for _ in range(n_decoder_layers)
+            ]
+        )
+        self.norm = RMSNorm(d)
+        self.lm_head = nn.Linear(d, vocab_size)
+
+    def forward(self, x):
+        x = self.embed_tokens(x)
+
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        # just get last element of output sequence
+        x = x[:, -1:]
+        return self.lm_head(x)
