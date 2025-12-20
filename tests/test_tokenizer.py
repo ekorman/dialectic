@@ -44,7 +44,7 @@ def test_tokenizer():
         messages=[Message(**m) for m in messages], add_generation_prompt=True
     )
 
-    x: Encoding = tokenizer.encode_batch([text])  # or coudl do .encode(text)
+    x: Encoding = tokenizer.encode_batch([text])  # or could do .encode(text)
     y = auto_tokenizer([text], return_tensors="pt")
 
     assert y.tokens() == x[0].tokens

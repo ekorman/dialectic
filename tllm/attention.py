@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 from jaxtyping import Float
 from torch import Tensor
 import torch
