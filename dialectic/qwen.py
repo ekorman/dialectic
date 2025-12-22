@@ -7,7 +7,6 @@ from tokenizers import Tokenizer
 from torch import Tensor
 
 from dialectic.tokenizer import Message, get_input_text_from_messages
-from dialectic.utils import get_default_device
 
 T = Float[Tensor, "batch seq_length d"]
 
@@ -245,6 +244,7 @@ class Qwen(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
+
         # just get last element of output sequence
         x = x[:, -1:]
         return self.lm_head(x)
@@ -259,7 +259,7 @@ def load_qwen_06b() -> Qwen:
         attn_num_heads=16,
         attn_num_kv_heads=8,
         mlp_hidden_d=3072,
-        rope_base_value=10000,
+        rope_base_value=1000000,
     )
 
 
@@ -270,8 +270,10 @@ def generate_from_text(
     eos_token: str,
     sampling_strategy: Literal["greedy"] = "greedy",
     max_tokens_generated: int = float("inf"),
-    device: str = get_default_device(),
+    device: str | torch.device | None = None,
 ) -> list[str]:
+    if device is None:
+        device = next(net.parameters()).device
     assert sampling_strategy == "greedy"
 
     tokens = tokenizer.encode_batch(text_batch)
@@ -288,6 +290,7 @@ def generate_from_text(
             break
 
         token_ids = torch.cat([token_ids, next_token_id], 1)
+        tokens_generated += 1
 
     return [tokenizer.decode(batch.tolist()) for batch in token_ids]
 
@@ -298,7 +301,7 @@ def generate_from_chat(
     messages: list[Message],
     eos_token: str = "<|endoftext|>",
     max_tokens_generated: int = float("inf"),
-    device: str = get_default_device(),
+    device: str | torch.device | None = None,
 ):
     return generate_from_text(
         net=net,

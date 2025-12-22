@@ -10,6 +10,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
+    Qwen3ForCausalLM,
     Qwen3MLP,
     Qwen3RotaryEmbedding,
     apply_rotary_pos_emb,
@@ -27,7 +28,6 @@ from dialectic.qwen import (
     load_qwen_06b,
 )
 from dialectic.tokenizer import Message
-from dialectic.utils import get_default_device
 
 torch.manual_seed(18)
 
@@ -225,9 +225,36 @@ def test_qwen():
         attn_num_kv_heads=num_kv_heads,
         mlp_hidden_d=mlp_hidden_d,
         rope_base_value=rope_base_value,
-    )
+    ).eval()
 
     assert model(x).shape == torch.Size((b, 1, vocab_size))
+
+    # check against a huggingface defined net
+    conf = Qwen3Config()
+    conf.head_dim = head_d
+    conf.num_key_value_heads = num_kv_heads
+    conf.num_attention_heads = num_heads
+    conf.hidden_size = d
+    conf.num_hidden_layers = n_decoder_layers
+    conf.vocab_size = vocab_size
+    conf.intermediate_size = mlp_hidden_d
+    conf._attn_implementation = "sdpa"
+
+    hf_model = Qwen3ForCausalLM(conf).eval()
+
+    def map_key(k: str):
+        if not k.startswith("lm_head"):
+            return "model." + k
+
+        return k
+
+    hf_model.load_state_dict({map_key(k): v for k, v in model.state_dict().items()})
+
+    with torch.inference_mode():
+        out1 = model(x)
+        out2 = hf_model(x)
+
+    torch.testing.assert_close(out1, out2.logits[:, -1:])
 
 
 @pytest.mark.skipif(
@@ -237,7 +264,9 @@ def test_qwen():
 def test_load_qwen_06b():
     model = load_qwen_06b()
 
-    hf_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype="auto")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
 
     def map_key(k: str):
         if k.startswith("model"):
@@ -245,27 +274,27 @@ def test_load_qwen_06b():
         return k
 
     model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
-    model.to(get_default_device()).eval()
-    with torch.inference_mode():
-        tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    model.eval()
 
+    x = torch.randint(0, hf_model.config.vocab_size, size=(1, 10))
+
+    with torch.inference_mode():
+        torch.testing.assert_close(
+            model(x), hf_model(x).logits[:, -1:], atol=1e-4, rtol=1e-4
+        )
+
+        tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
         messages = [Message(role="user", content="Hello who are you?")]
         resp = generate_from_chat(model, tokenizer, messages)
-    assert (
-        resp[0]
-        == """user
+        assert (
+            resp[0]
+            == """user
 Hello who are you?
 assistant
 <think>
-Okay, the user asked, "Hello who are you?" Let me break this down.
-
-First, the user is greeting me. Then, they ask "who are you?" which is a bit more direct.
-
-So, the user is asking me to identify myself. My response should be friendly and informative.
-
-I should start with a greeting, then explain that I am a language model, and perhaps mention that I can assist with various tasks.
+Okay, the user asked, "Hello who are you?" I need to respond appropriately. First, I should acknowledge their greeting. Then, I should explain my role as a language model. I should mention that I can assist with various tasks like answering questions, providing information, or helping with specific needs. It's important to keep the response friendly and open-ended to encourage further interaction. I should also make sure the tone is helpful and not too technical. Let me put that together in a natural way.
 </think>
 
-Hello! I'm a language model, and I can assist with various tasks. Let me know how I can help!
+Hello! I'm a language model designed to assist with a wide range of tasks, from answering questions to providing information. How can I help you today?
 """
-    )
+        )
