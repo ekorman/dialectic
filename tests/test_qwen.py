@@ -3,6 +3,7 @@ import os
 import pytest
 import torch
 import torch.nn as nn
+from tokenizers import Tokenizer
 from torch.nn.functional import scaled_dot_product_attention
 from transformers import AutoModelForCausalLM
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -22,8 +23,13 @@ from dialectic.qwen import (
     apply_rope,
     attention,
     create_rope_sine_cosine_tensors,
+    generate_from_chat,
     load_qwen_06b,
 )
+from dialectic.tokenizer import Message
+from dialectic.utils import get_default_device
+
+torch.manual_seed(18)
 
 
 def test_mhsa_not_causal_no_rope():
@@ -231,9 +237,7 @@ def test_qwen():
 def test_load_qwen_06b():
     model = load_qwen_06b()
 
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", torch_dtype="auto"
-    )
+    hf_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype="auto")
 
     def map_key(k: str):
         if k.startswith("model"):
@@ -241,3 +245,27 @@ def test_load_qwen_06b():
         return k
 
     model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
+    model.to(get_default_device()).eval()
+    with torch.inference_mode():
+        tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+
+        messages = [Message(role="user", content="Hello who are you?")]
+        resp = generate_from_chat(model, tokenizer, messages)
+    assert (
+        resp[0]
+        == """user
+Hello who are you?
+assistant
+<think>
+Okay, the user asked, "Hello who are you?" Let me break this down.
+
+First, the user is greeting me. Then, they ask "who are you?" which is a bit more direct. 
+
+So, the user is asking me to identify myself. My response should be friendly and informative.
+
+I should start with a greeting, then explain that I am a language model, and perhaps mention that I can assist with various tasks.
+</think>
+
+Hello! I'm a language model, and I can assist with various tasks. Let me know how I can help!
+"""
+    )

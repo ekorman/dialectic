@@ -1,18 +1,19 @@
+from typing import Literal
 import torch
 import torch.nn as nn
 from jaxtyping import Float
+from tokenizers import Tokenizer
 from torch import Tensor
 
-from dialectic.tokenizer import Message
+from dialectic.tokenizer import Message, get_input_text_from_messages
+from dialectic.utils import get_default_device
 
 T = Float[Tensor, "batch seq_length d"]
 
 TMH = Float[Tensor, "batch num_heads seq_length head_d"]
 
 
-def attention(
-    q: TMH, k: TMH, v: TMH, causal: bool = False, scaling: float | None = None
-) -> TMH:
+def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
     # [batch, num_heads, seq_length, head_d]
     num_heads, seq_length, head_d = q.shape[-3:]
 
@@ -25,7 +26,10 @@ def attention(
     dot_prods = torch.matmul(q, k.transpose(3, 2)) / (head_d**0.5)
     if causal:
         dot_prods.masked_fill_(
-            torch.ones(seq_length, seq_length).triu(diagonal=1).bool(), -torch.inf
+            torch.ones(seq_length, seq_length, device=dot_prods.device)
+            .triu(diagonal=1)
+            .bool(),
+            -torch.inf,
         )
     soft_max_dot_prods = (dot_prods).softmax(-1)
 
@@ -48,7 +52,8 @@ def apply_rope(
     cos: Float[Tensor, "batch seq_length d"],
 ) -> Float[Tensor, "batch seq_length d"]:
     rot = torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
-
+    sin = sin.to(x.device)
+    cos = cos.to(x.device)
     return x * cos.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(
         1
     ) + rot * sin.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(1)
@@ -257,5 +262,48 @@ def load_qwen_06b() -> Qwen:
     )
 
 
-def generate(net: Qwen, prompt: str, messages: list[Message]):
-    pass
+def generate_from_text(
+    net: Qwen,
+    tokenizer: Tokenizer,
+    text_batch: list[str],
+    eos_token: str,
+    sampling_strategy: Literal["greedy"] = "greedy",
+    max_tokens_generated: int = float("inf"),
+    device: str = get_default_device(),
+) -> list[str]:
+    assert sampling_strategy == "greedy"
+
+    tokens = tokenizer.encode_batch(text_batch)
+    token_ids = torch.tensor([t.ids for t in tokens]).to(device)
+
+    eos_token_id = tokenizer.token_to_id(eos_token)
+
+    tokens_generated = 0
+    while tokens_generated < max_tokens_generated:
+        logits: torch.Tensor = net(token_ids)
+
+        next_token_id = logits.argmax(-1)
+        if (next_token_id == eos_token_id).all():
+            break
+
+        token_ids = torch.cat([token_ids, next_token_id], 1)
+
+    return [tokenizer.decode(batch.tolist()) for batch in token_ids]
+
+
+def generate_from_chat(
+    net: Qwen,
+    tokenizer: Tokenizer,
+    messages: list[Message],
+    eos_token: str = "<|endoftext|>",
+    max_tokens_generated: int = float("inf"),
+    device: str = get_default_device(),
+):
+    return generate_from_text(
+        net=net,
+        tokenizer=tokenizer,
+        text_batch=[get_input_text_from_messages(messages, add_generation_prompt=True)],
+        eos_token=eos_token,
+        max_tokens_generated=max_tokens_generated,
+        device=device,
+    )
