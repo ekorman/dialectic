@@ -259,7 +259,7 @@ assistant
 <think>
 Okay, the user asked, "Hello who are you?" Let me break this down.
 
-First, the user is greeting me. Then, they ask "who are you?" which is a bit more direct. 
+First, the user is greeting me. Then, they ask "who are you?" which is a bit more direct.
 
 So, the user is asking me to identify myself. My response should be friendly and informative.
 
