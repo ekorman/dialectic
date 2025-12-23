@@ -25,6 +25,7 @@ from dialectic.qwen import (
     attention,
     create_rope_sine_cosine_tensors,
     generate_from_chat,
+    generate_from_tokens,
     load_qwen_06b,
 )
 from dialectic.tokenizer import Message
@@ -99,10 +100,9 @@ def test_rope_cosine_sine_against_hf():
 
     dec_point_tol = 6
 
-    # our version is interweaved versus huggingface's two-halves approach
     for ours, hfs in [(sin, hf_sin), (cos, hf_cos)]:
         assert ours.shape == torch.Size((1, l, d))
-        assert hfs.shape == torch.Size((b, l, d))  # hf's is duplciated across batch
+        assert hfs.shape == torch.Size((b, l, d))  # hf's is duplicated across batch
 
         # sanity check hf duplicates
         for i in range(b):
@@ -255,6 +255,44 @@ def test_qwen():
         out2 = hf_model(x)
 
     torch.testing.assert_close(out1, out2.logits[:, -1:])
+
+
+def test_qwen_generate():
+    l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+    x = torch.randint(0, vocab_size, size=(b, l))
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    out_no_cache = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+    )
+
+    out_with_cache = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+    )
+
+    torch.testing.assert_close(out_no_cache, out_with_cache)
+    assert out_with_cache.shape == torch.Size((b, 24 + l))
 
 
 @pytest.mark.skipif(

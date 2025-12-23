@@ -13,6 +13,20 @@ T = Float[Tensor, "batch seq_length d"]
 TMH = Float[Tensor, "batch num_heads seq_length head_d"]
 
 
+class KVCache:
+    def __init__(self):
+        self._keys = torch.empty(0)
+        self._values = torch.empty(0)
+
+    def update_and_get_keys(self, k: torch.Tensor):
+        self._keys = torch.cat([self._keys, k], 1)
+        return self._keys
+
+    def update_and_get_values(self, v: torch.Tensor):
+        self._values = torch.cat([self._values, v], 1)
+        return self._values
+
+
 def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
     # [batch, num_heads, seq_length, head_d]
     num_heads, seq_length, head_d = q.shape[-3:]
@@ -105,7 +119,6 @@ class MHSA(nn.Module):
 
         self.num_heads = num_heads
         self.head_d = head_d
-        # kv_head_d = sum of dimensions of k, v heads
         if num_kv_heads is None:
             num_kv_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -119,30 +132,28 @@ class MHSA(nn.Module):
         self.rope_base_value = rope_base_value
         self.apply_rms_norm = apply_rms_norm
 
-        # if self.use_rope:
-        #     sin, cos = create_rope_sine_cosine_tensors(head_d, rope_params=rope_params)
-        # self.register_buffer("rope_sin", sin)
-        # self.register_buffer("rope_cos", cos)
-
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d)
             self.k_norm = RMSNorm(self.head_d)
 
-    def forward(self, x: T) -> T:
-        batch_size, seq_length = x.shape[:2]
-
+    def forward(self, x: T, kv_cache: KVCache | None = None) -> T:
         q: T = self.q_proj(x)
         k: T = self.k_proj(x)
         v: T = self.v_proj(x)
 
+        batch_size = x.shape[0]
+
+        if kv_cache is not None:
+            assert x.shape[1] == 1
+
+            k = kv_cache.update_and_get_keys(k)
+            v = kv_cache.update_and_get_values(v)
+
         # view tensors as [batch, num_heads, seq_length, head_d] to break into heads
-        q = q.view(batch_size, seq_length, self.num_heads, self.head_d).transpose(2, 1)
-        k = k.view(batch_size, seq_length, self.num_kv_heads, self.head_d).transpose(
-            2, 1
-        )
-        v = v.view(batch_size, seq_length, self.num_kv_heads, self.head_d).transpose(
-            2, 1
-        )
+
+        q = q.view(batch_size, -1, self.num_heads, self.head_d).transpose(2, 1)
+        k = k.view(batch_size, -1, self.num_kv_heads, self.head_d).transpose(2, 1)
+        v = v.view(batch_size, -1, self.num_kv_heads, self.head_d).transpose(2, 1)
 
         if self.apply_rms_norm:
             q = self.q_norm(q)
@@ -158,9 +169,10 @@ class MHSA(nn.Module):
 
         # move sequence length back to second position and join the heads
         ret = ret.transpose(1, 2).contiguous()
-        ret = ret.view(batch_size, seq_length, -1)
+        ret = ret.view(batch_size, x.shape[1], -1)
+        ret = self.o_proj(ret)
 
-        return self.o_proj(ret)
+        return ret
 
 
 class GatedMLP(nn.Module):
@@ -202,8 +214,8 @@ class QwenDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(d)
         self.mlp = GatedMLP(d=d, hidden_d=mlp_hidden_d)
 
-    def forward(self, x):
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(self, x, kv_cache: KVCache | None = None):
+        x = x + self.self_attn(self.input_layernorm(x), kv_cache=kv_cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -238,11 +250,13 @@ class Qwen(nn.Module):
         self.norm = RMSNorm(d)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, kv_caches: list[dict] | None = None):
         x = self.embed_tokens(x)
 
-        for layer in self.layers:
-            x = layer(x)
+        for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
+            if kv_cache is not None:
+                x = x[:, :1]
+            x = layer(x, kv_cache=kv_cache)
         x = self.norm(x)
 
         # just get last element of output sequence
@@ -263,6 +277,36 @@ def load_qwen_06b() -> Qwen:
     )
 
 
+@torch.inference_mode()
+def generate_from_tokens(
+    net: Qwen,
+    token_ids: torch.LongTensor,
+    eos_token_id: int,
+    sampling_strategy: Literal["greedy"] = "greedy",
+    max_tokens_generated: int = float("inf"),
+    use_kv_cache: bool = True,
+) -> torch.LongTensor:
+    assert sampling_strategy == "greedy"
+
+    if use_kv_cache:
+        kv_caches = [KVCache() for _ in range(len(net.layers))]
+    else:
+        kv_caches = None
+
+    tokens_generated = 0
+    while tokens_generated < max_tokens_generated:
+        logits: torch.Tensor = net(token_ids, kv_caches=kv_caches)
+
+        next_token_id = logits.argmax(-1)
+        if (next_token_id == eos_token_id).all():
+            break
+
+        token_ids = torch.cat([token_ids, next_token_id], 1)
+        tokens_generated += 1
+
+    return token_ids
+
+
 def generate_from_text(
     net: Qwen,
     tokenizer: Tokenizer,
@@ -271,26 +315,24 @@ def generate_from_text(
     sampling_strategy: Literal["greedy"] = "greedy",
     max_tokens_generated: int = float("inf"),
     device: str | torch.device | None = None,
+    use_kv_cache: bool = True,
 ) -> list[str]:
     if device is None:
         device = next(net.parameters()).device
-    assert sampling_strategy == "greedy"
 
     tokens = tokenizer.encode_batch(text_batch)
     token_ids = torch.tensor([t.ids for t in tokens]).to(device)
 
     eos_token_id = tokenizer.token_to_id(eos_token)
 
-    tokens_generated = 0
-    while tokens_generated < max_tokens_generated:
-        logits: torch.Tensor = net(token_ids)
-
-        next_token_id = logits.argmax(-1)
-        if (next_token_id == eos_token_id).all():
-            break
-
-        token_ids = torch.cat([token_ids, next_token_id], 1)
-        tokens_generated += 1
+    token_ids = generate_from_tokens(
+        net=net,
+        token_ids=token_ids,
+        eos_token_id=eos_token_id,
+        sampling_strategy=sampling_strategy,
+        max_tokens_generated=max_tokens_generated,
+        use_kv_cache=use_kv_cache,
+    )
 
     return [tokenizer.decode(batch.tolist()) for batch in token_ids]
 
