@@ -399,7 +399,7 @@ def generate_from_chat(
     tokenizer: Tokenizer,
     messages: list[Message],
     eos_token: str = "<|endoftext|>",
-    max_tokens_generated: int = float("inf"),
+    max_tokens_generated: int = 1000,
     device: str | torch.device | None = None,
 ):
     return generate_from_text(
