@@ -14,22 +14,48 @@ TMH = Float[Tensor, "batch num_heads seq_length head_d"]
 
 
 class KVCache:
-    def __init__(self):
-        self._keys = torch.empty(0)
-        self._values = torch.empty(0)
-        self._position_offset = 0
+    def __init__(self, max_seq_len, num_heads, head_dim, device):
+        self._max_seq_len = max_seq_len
+        self._num_heads = num_heads
+        self._head_dim = head_dim
+        self._device = device
+        self._keys = None
+        self._values = None
+        self._seq_len = 0
 
     def update_and_get_keys(self, k: torch.Tensor):
-        self._keys = torch.cat([self._keys, k], 2)
-        return self._keys
+        if self._keys is None:
+            batch_size = k.shape[0]
+            self._keys = torch.zeros(
+                batch_size,
+                self._num_heads,
+                self._max_seq_len,
+                self._head_dim,
+                device=self._device,
+                dtype=k.dtype,
+            )
+        seq_len = k.shape[2]
+        self._keys[:, :, self._seq_len : self._seq_len + seq_len] = k
+        return self._keys[:, :, : self._seq_len + seq_len]
 
     def update_and_get_values(self, v: torch.Tensor):
-        self._values = torch.cat([self._values, v], 2)
-        self._position_offset += v.shape[2]
-        return self._values
+        if self._values is None:
+            batch_size = v.shape[0]
+            self._values = torch.zeros(
+                batch_size,
+                self._num_heads,
+                self._max_seq_len,
+                self._head_dim,
+                device=self._device,
+                dtype=v.dtype,
+            )
+        seq_len = v.shape[2]
+        self._values[:, :, self._seq_len : self._seq_len + seq_len] = v
+        self._seq_len += seq_len
+        return self._values[:, :, : self._seq_len]
 
     def get_position_offset(self) -> int:
-        return self._position_offset
+        return self._seq_len
 
 
 def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
@@ -245,6 +271,10 @@ class Qwen(nn.Module):
         rope_base_value: float = None,
     ):
         super().__init__()
+        self.d = d
+        self.attn_num_heads = attn_num_heads
+        self.attn_num_kv_heads = attn_num_kv_heads
+        self.attn_head_d = attn_head_d
         self.vocab_size = vocab_size
         self.embed_tokens = nn.Embedding(vocab_size, d)
         self.layers = nn.ModuleList(
@@ -300,7 +330,15 @@ def generate_from_tokens(
     assert sampling_strategy == "greedy"
 
     if use_kv_cache:
-        kv_caches = [KVCache() for _ in range(len(net.layers))]
+        kv_caches = [
+            KVCache(
+                max_seq_len=max_tokens_generated + len(token_ids),
+                num_heads=net.attn_num_kv_heads,
+                head_dim=net.attn_head_d,
+                device=next(net.parameters()).device,
+            )
+            for _ in range(len(net.layers))
+        ]
     else:
         kv_caches = None
 

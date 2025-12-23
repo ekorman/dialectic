@@ -7,12 +7,12 @@ from dialectic.qwen import generate_from_tokens, load_qwen_06b
 n_iters = 10
 
 
-net = load_qwen_06b()
+net = load_qwen_06b().to("mps")
 
-n_input_tokens = 10
-n_output_tokens = 20
+n_input_tokens = 1
+n_output_tokens = 40
 
-x = torch.randint(0, net.vocab_size, size=(1, n_input_tokens))
+x = torch.randint(0, net.vocab_size, size=(1, n_input_tokens)).to("mps")
 
 
 def gen_with_cache():
