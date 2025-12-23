@@ -288,7 +288,7 @@ def test_qwen_generate():
         token_ids=x,
         eos_token_id=-1,
         max_tokens_generated=24,
-        use_kv_cache=False,
+        use_kv_cache=True,
     )
 
     torch.testing.assert_close(out_no_cache, out_with_cache)

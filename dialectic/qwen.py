@@ -17,14 +17,19 @@ class KVCache:
     def __init__(self):
         self._keys = torch.empty(0)
         self._values = torch.empty(0)
+        self._position_offset = 0
 
     def update_and_get_keys(self, k: torch.Tensor):
-        self._keys = torch.cat([self._keys, k], 1)
+        self._keys = torch.cat([self._keys, k], 2)
         return self._keys
 
     def update_and_get_values(self, v: torch.Tensor):
-        self._values = torch.cat([self._values, v], 1)
+        self._values = torch.cat([self._values, v], 2)
+        self._position_offset += v.shape[2]
         return self._values
+
+    def get_position_offset(self) -> int:
+        return self._position_offset
 
 
 def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
@@ -143,12 +148,6 @@ class MHSA(nn.Module):
 
         batch_size = x.shape[0]
 
-        if kv_cache is not None:
-            assert x.shape[1] == 1
-
-            k = kv_cache.update_and_get_keys(k)
-            v = kv_cache.update_and_get_values(v)
-
         # view tensors as [batch, num_heads, seq_length, head_d] to break into heads
 
         q = q.view(batch_size, -1, self.num_heads, self.head_d).transpose(2, 1)
@@ -160,11 +159,24 @@ class MHSA(nn.Module):
             k = self.k_norm(k)
 
         if self.use_rope:
+            position_offset = 0 if kv_cache is None else kv_cache.get_position_offset()
+
             sin, cos = create_rope_sine_cosine_tensors(
-                self.head_d, base_value=self.rope_base_value, context_length=x.shape[1]
+                self.head_d,
+                base_value=self.rope_base_value,
+                context_length=position_offset + x.shape[1],
             )
+
+            sin = sin[:, position_offset : position_offset + x.shape[1]]
+            cos = cos[:, position_offset : position_offset + x.shape[1]]
+
             q = apply_rope(q, sin=sin, cos=cos)
             k = apply_rope(k, sin=sin, cos=cos)
+
+        if kv_cache is not None:
+            k = kv_cache.update_and_get_keys(k)
+            v = kv_cache.update_and_get_values(v)
+
         ret = attention(q, k, v, causal=self.causal)
 
         # move sequence length back to second position and join the heads
@@ -233,6 +245,7 @@ class Qwen(nn.Module):
         rope_base_value: float = None,
     ):
         super().__init__()
+        self.vocab_size = vocab_size
         self.embed_tokens = nn.Embedding(vocab_size, d)
         self.layers = nn.ModuleList(
             [
@@ -254,8 +267,6 @@ class Qwen(nn.Module):
         x = self.embed_tokens(x)
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
-            if kv_cache is not None:
-                x = x[:, :1]
             x = layer(x, kv_cache=kv_cache)
         x = self.norm(x)
 
@@ -293,18 +304,26 @@ def generate_from_tokens(
     else:
         kv_caches = None
 
+    all_token_ids = token_ids  # Keep track of full sequence
+    input_ids = token_ids
+
     tokens_generated = 0
     while tokens_generated < max_tokens_generated:
-        logits: torch.Tensor = net(token_ids, kv_caches=kv_caches)
+        logits: torch.Tensor = net(input_ids, kv_caches=kv_caches)
 
         next_token_id = logits.argmax(-1)
         if (next_token_id == eos_token_id).all():
             break
 
-        token_ids = torch.cat([token_ids, next_token_id], 1)
+        all_token_ids = torch.cat([all_token_ids, next_token_id], 1)
         tokens_generated += 1
 
-    return token_ids
+        if use_kv_cache:
+            input_ids = next_token_id  # Only new token for next iteration
+        else:
+            input_ids = all_token_ids
+
+    return all_token_ids
 
 
 def generate_from_text(
