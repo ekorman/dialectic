@@ -11,6 +11,7 @@ dev = [
     "pytest>=9.0.2",
     "transformers>=4.57.3",
 ]
+rl = ["gymnasium[box2d,other]>=1.2.1", "wandb"]
 
 [build-system]
 requires = ["hatchling"]
