@@ -16,7 +16,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
 )
 
-from dialectic.qwen import (
+from dialectic.llm.qwen import (
     MHSA,
     GatedMLP,
     Qwen,
@@ -28,7 +28,7 @@ from dialectic.qwen import (
     generate_from_tokens,
     load_qwen_06b,
 )
-from dialectic.tokenizer import Message
+from dialectic.llm.tokenizer import Message
 
 torch.manual_seed(18)
 

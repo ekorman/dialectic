@@ -2,7 +2,7 @@ import timeit
 
 import torch
 
-from dialectic.qwen import generate_from_tokens, load_qwen_06b
+from dialectic.llm.qwen import generate_from_tokens, load_qwen_06b
 
 n_iters = 10
 

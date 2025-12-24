@@ -1,7 +1,7 @@
 from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
 
-from dialectic.tokenizer import (
+from dialectic.llm.tokenizer import (
     Message,
     ToolCall,
     get_input_text_from_messages,

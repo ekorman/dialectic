@@ -6,7 +6,7 @@ from jaxtyping import Float
 from tokenizers import Tokenizer
 from torch import Tensor
 
-from dialectic.tokenizer import Message, get_input_text_from_messages
+from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 
 T = Float[Tensor, "batch seq_length d"]
 
