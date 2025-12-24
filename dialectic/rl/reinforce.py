@@ -40,7 +40,6 @@ def rewards_to_go(rewards: torch.Tensor, discount_factor: float) -> torch.Tensor
     return ((rewards * d).flip(0)).cumsum(0).flip(0) / d
 
 
-# states from a single trajectory. TODO: allow different trajectories
 def grad_ascend_policy(
     policy_net: nn.Module,
     states: torch.Tensor,  # [n, d_s]
@@ -48,15 +47,16 @@ def grad_ascend_policy(
     opt: torch.optim.Optimizer,
     rewards: torch.Tensor,  # [n]
     discount_factor: float,
+    opt_step: bool,
 ) -> None:
-    opt.zero_grad()
     log_probs = log_prob_act(policy_net=policy_net, states=states, actions=actions)
     rtg = rewards_to_go(rewards, discount_factor)
     # negative since optimizer will do grad descent not ascent
-
     pg = -(log_probs * rtg).mean()
     pg.backward()
-    opt.step()
+    if opt_step:
+        opt.step()
+        opt.zero_grad()
     return -pg.item()
 
 
@@ -67,10 +67,13 @@ def reinforce_loop(
     env: gym.Env,
     discount_factor: float,
     max_episodes: int,
+    batch_size: int,
 ):
     n_episodes = 0
     state, _ = env.reset()
     actions, rewards, states = [], [], []
+    opt.zero_grad()  # safeguard; shouldn't be necessary
+
     while n_episodes < max_episodes:
         state = torch.from_numpy(state)
         states.append(state)
@@ -87,6 +90,8 @@ def reinforce_loop(
                 rewards=torch.tensor(rewards),
                 discount_factor=discount_factor,
                 opt=opt,
+                opt_step=((n_episodes + 1) % batch_size == 0)
+                or (n_episodes == max_episodes - 1),
             )
             n_episodes += 1
             run.log(
@@ -112,7 +117,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--max_episodes", type=int, required=True)
     parser.add_argument("--discount_factor", type=float, required=True)
-    parser.add_argument("--hidden_dims", type=json.loads)
+    parser.add_argument("--hidden_dims", type=json.loads, required=True)
+    parser.add_argument("--batch_size", type=int, required=True)
 
     args = parser.parse_args()
 
@@ -130,4 +136,5 @@ if __name__ == "__main__":
         env=env,
         discount_factor=args.discount_factor,
         max_episodes=args.max_episodes,
+        batch_size=args.batch_size,
     )
