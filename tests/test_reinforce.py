@@ -35,10 +35,17 @@ def test_policy_methods(policy_net: nn.Module, dim_state: int, n_actions: int):
 
 
 def test_reward_to_go():
-    rewards = torch.Tensor([1.5, 6.1, 7.8])
+    rewards = torch.Tensor([[1.5, 6.1, 7.8]])
     discount_factor = 0.6
 
-    rtg = rewards_to_go(rewards, discount_factor)
+    rtg = rewards_to_go(
+        batch_rewards=rewards,
+        discount_factor=discount_factor,
+        batch_states=None,
+        batch_actions=None,
+    )
+    assert len(rtg) == 1
+    rtg = rtg[0]
     expected = torch.Tensor(
         [
             1.5 + 6.1 * discount_factor + 7.8 * discount_factor**2,

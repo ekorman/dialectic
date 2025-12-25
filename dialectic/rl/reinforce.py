@@ -1,11 +1,29 @@
 import argparse
 import json
+from typing import Protocol
 
 import gymnasium as gym
 import torch
 import torch.nn as nn
 import wandb
 from torch.distributions.categorical import Categorical
+
+
+class Phi(Protocol):
+    """This is a protocol for the factor in the policy gradient that is
+    multiplied by the gradient of the logprobs. it is a function of a trajectory and
+    e.g. in basic policy gradient this would be the total (discounted) reward, repeated
+    for each state
+    """
+
+    def __call__(
+        self,
+        *,
+        batch_states: list[torch.Tensor],  # [b, n],
+        batch_rewards: list[torch.Tensor],
+        batch_actions: list[torch.Tensor],
+        discount_factor: float,
+    ) -> list[torch.Tensor]: ...
 
 
 def build_policy_net(
@@ -28,36 +46,65 @@ def sample_action(policy_net: nn.Module, state: torch.tensor) -> int:
     return dist.sample().item()
 
 
-def log_prob_act(
-    policy_net: nn.Module, states: torch.Tensor, actions: torch.Tensor
-) -> int:
+def log_prob_act(policy_net: nn.Module, states: torch.Tensor, actions: torch.Tensor):
     dist = Categorical(logits=policy_net(states))
     return dist.log_prob(actions)
 
 
-def rewards_to_go(rewards: torch.Tensor, discount_factor: float) -> torch.Tensor:
-    d = torch.Tensor([discount_factor**i for i in range(len(rewards))])
-    return ((rewards * d).flip(0)).cumsum(0).flip(0) / d
+def rewards_to_go(
+    *,
+    batch_states: list[torch.Tensor],  # [b, n],
+    batch_rewards: list[torch.Tensor],
+    batch_actions: list[torch.Tensor],
+    discount_factor: float,
+) -> list[torch.Tensor]:  # length of list is b, and each tensor has variable length
+    ret = []
+    for rewards in batch_rewards:
+        d = torch.Tensor([discount_factor**i for i in range(len(rewards))])
+        ret.append(((rewards * d).flip(0)).cumsum(0).flip(0) / d)
+
+    return ret
 
 
 def grad_ascend_policy(
+    *,
     policy_net: nn.Module,
-    states: torch.Tensor,  # [n, d_s]
-    actions: torch.Tensor,  # [n]
+    batch_states: list[torch.Tensor],  # list of tensors of shape [N, dim_state]
+    batch_rewards: list[torch.Tensor],
+    batch_actions: list[torch.Tensor],
     opt: torch.optim.Optimizer,
-    rewards: torch.Tensor,  # [n]
     discount_factor: float,
-    opt_step: bool,
+    phi: Phi,
 ) -> None:
-    log_probs = log_prob_act(policy_net=policy_net, states=states, actions=actions)
-    rtg = rewards_to_go(rewards, discount_factor)
-    # negative since optimizer will do grad descent not ascent
-    pg = -(log_probs * rtg).mean()
+    batch_states_tensor = torch.cat(batch_states, 0)
+    batch_action_tensor = torch.cat(batch_actions, 0)
+    log_probs = log_prob_act(
+        policy_net=policy_net, states=batch_states_tensor, actions=batch_action_tensor
+    )
+
+    phis = phi(
+        batch_actions=batch_actions,
+        batch_rewards=batch_rewards,
+        batch_states=batch_states,
+        discount_factor=discount_factor,
+    )
+
+    flat_phis = torch.cat(phis, 0)
+    pg = -(log_probs * flat_phis).mean()
+
+    # an alternative with slightly different weighting would be
+    # traj_lengths = [len(states) for states in batch_states]
+    # log_probs = torch.split(log_probs, traj_lengths, dim=0)
+    # pg = -sum([(lp * p).mean() for lp, p in zip(log_probs, phis)])
+    opt.zero_grad()
     pg.backward()
-    if opt_step:
-        opt.step()
-        opt.zero_grad()
+    opt.step()
+
     return -pg.item()
+
+
+def mean(a: list):
+    return sum(a) / len(a)
 
 
 def reinforce_loop(
@@ -68,11 +115,12 @@ def reinforce_loop(
     discount_factor: float,
     max_episodes: int,
     batch_size: int,
+    phi: Phi,
 ):
     n_episodes = 0
     state, _ = env.reset()
+    batch_actions, batch_rewards, batch_states = [], [], []
     actions, rewards, states = [], [], []
-    opt.zero_grad()  # safeguard; shouldn't be necessary
 
     while n_episodes < max_episodes:
         state = torch.from_numpy(state)
@@ -83,32 +131,50 @@ def reinforce_loop(
         rewards.append(reward)
 
         if terminated or truncated:
-            pg = grad_ascend_policy(
-                policy_net=policy_net,
-                states=torch.stack(states),
-                actions=torch.tensor(actions),
-                rewards=torch.tensor(rewards),
-                discount_factor=discount_factor,
-                opt=opt,
-                opt_step=((n_episodes + 1) % batch_size == 0)
-                or (n_episodes == max_episodes - 1),
-            )
+            batch_states.append(torch.stack(states))
+            batch_actions.append(torch.tensor(actions))
+            batch_rewards.append(torch.tensor(rewards))
+
             n_episodes += 1
-            run.log(
-                {
-                    "steps": len(states),
-                    "non_discounted_reward": sum(rewards),
-                    "discounted_reward": sum(
-                        [r * discount_factor**i for i, r in enumerate(rewards)]
-                    ),
-                    "policy_gradient": pg,
-                }
-            )
-            print(
-                f"Episode {n_episodes}: {len(states)} steps, total reward = {sum(rewards)}"
-            )
+
             state, _ = env.reset()
             actions, rewards, states = [], [], []
+
+            if (n_episodes % batch_size == 0) or (n_episodes == max_episodes):
+                pg = grad_ascend_policy(
+                    policy_net=policy_net,
+                    batch_states=batch_states,
+                    batch_actions=batch_actions,
+                    batch_rewards=batch_rewards,
+                    discount_factor=discount_factor,
+                    phi=phi,
+                    opt=opt,
+                )
+
+                run.log(
+                    {
+                        "ave_steps_in_batch": mean(
+                            [len(states) for states in batch_states]
+                        ),
+                        "ave_non_discounted_reward": mean(
+                            [sum(rewards) for rewards in batch_rewards]
+                        ),
+                        "discounted_reward": mean(
+                            [
+                                sum(
+                                    [
+                                        r * discount_factor**i
+                                        for i, r in enumerate(rewards)
+                                    ]
+                                )
+                                for rewards in batch_rewards
+                            ]
+                        ),
+                        "policy_gradient": pg,
+                    }
+                )
+
+                batch_actions, batch_rewards, batch_states = [], [], []
 
 
 if __name__ == "__main__":
@@ -137,4 +203,5 @@ if __name__ == "__main__":
         discount_factor=args.discount_factor,
         max_episodes=args.max_episodes,
         batch_size=args.batch_size,
+        phi=rewards_to_go,
     )
