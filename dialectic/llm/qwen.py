@@ -323,11 +323,11 @@ def generate_from_tokens(
     net: Qwen,
     token_ids: torch.LongTensor,
     eos_token_id: int,
-    sampling_strategy: Literal["greedy"] = "greedy",
+    sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = float("inf"),
     use_kv_cache: bool = True,
 ) -> torch.LongTensor:
-    assert sampling_strategy == "greedy"
+    assert sampling_strategy in ["greedy", "sample"]
 
     if use_kv_cache:
         kv_caches = [
@@ -349,7 +349,11 @@ def generate_from_tokens(
     while tokens_generated < max_tokens_generated:
         logits: torch.Tensor = net(input_ids, kv_caches=kv_caches)
 
-        next_token_id = logits.argmax(-1)
+        if sampling_strategy == "greedy":
+            next_token_id = logits.argmax(-1)
+        else:
+            next_token_id = torch.distributions.Categorical(logits=logits).sample()
+
         if (next_token_id == eos_token_id).all():
             break
 
@@ -369,7 +373,7 @@ def generate_from_text(
     tokenizer: Tokenizer,
     text_batch: list[str],
     eos_token: str,
-    sampling_strategy: Literal["greedy"] = "greedy",
+    sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = float("inf"),
     device: str | torch.device | None = None,
     use_kv_cache: bool = True,
@@ -399,12 +403,14 @@ def generate_from_chat(
     tokenizer: Tokenizer,
     messages: list[Message],
     eos_token: str = "<|endoftext|>",
+    sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = 1000,
     device: str | torch.device | None = None,
 ):
     return generate_from_text(
         net=net,
         tokenizer=tokenizer,
+        sampling_strategy=sampling_strategy,
         text_batch=[get_input_text_from_messages(messages, add_generation_prompt=True)],
         eos_token=eos_token,
         max_tokens_generated=max_tokens_generated,

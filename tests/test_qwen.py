@@ -281,6 +281,7 @@ def test_qwen_generate():
         eos_token_id=-1,
         max_tokens_generated=24,
         use_kv_cache=False,
+        sampling_strategy="greedy",
     )
 
     out_with_cache = generate_from_tokens(
@@ -289,6 +290,7 @@ def test_qwen_generate():
         eos_token_id=-1,
         max_tokens_generated=24,
         use_kv_cache=True,
+        sampling_strategy="greedy",
     )
 
     torch.testing.assert_close(out_no_cache, out_with_cache)
@@ -323,7 +325,9 @@ def test_load_qwen_06b():
 
         tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
         messages = [Message(role="user", content="Hello who are you?")]
-        resp = generate_from_chat(model, tokenizer, messages)
+        resp = generate_from_chat(
+            model, tokenizer, messages, sampling_strategy="greedy"
+        )
         assert (
             resp[0]
             == """user
