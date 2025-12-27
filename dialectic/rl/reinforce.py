@@ -66,6 +66,16 @@ def rewards_to_go(
     return ret
 
 
+def rloo(
+    *,
+    batch_states: list[torch.Tensor],  # [b, n],
+    batch_rewards: list[torch.Tensor],
+    batch_actions: list[torch.Tensor],
+    discount_factor: float,
+) -> list[torch.Tensor]:
+    pass
+
+
 def grad_ascend_policy(
     *,
     policy_net: nn.Module,
@@ -114,7 +124,7 @@ def reinforce_loop(
     env: gym.Env,
     discount_factor: float,
     max_episodes: int,
-    batch_size: int,
+    batch_size: int,  # need to have ability for batch to come from same initial state just different samples
     phi: Phi,
 ):
     n_episodes = 0
