@@ -1,3 +1,7 @@
 qwen-tokenizer
 __pycache__
 *.egg-info
+weights
+.DS_Store
+*.jsonl
+.vscode
