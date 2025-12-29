@@ -13,7 +13,10 @@ Usage:
 """
 
 import argparse
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 import torch
 from tokenizers import Tokenizer
@@ -21,7 +24,31 @@ from tqdm import tqdm
 
 from dialectic.llm.qwen import Qwen, generate_from_chat, load_qwen_06b
 from dialectic.llm.tokenizer import Message
-from dialectic.rl.env import ArithmeticEnv, GSM8kEnv
+from dialectic.rl.env import ArithmeticEnv, Env, GSM8kEnv
+
+
+@dataclass
+class EpisodeResult:
+    """Result from a single evaluation episode."""
+
+    question: str
+    correct_answer: str
+    model_response: str
+    extracted_answer: str | None
+    correct: bool
+
+
+@dataclass
+class EvalResult:
+    """Structured output from model evaluation."""
+
+    accuracy: float
+    correct: int
+    total: int
+    episodes: list[EpisodeResult] = field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return f"EvalResult(accuracy={self.accuracy:.2%}, correct={self.correct}/{self.total})"
 
 
 def load_model(weights_path: str, device: str) -> tuple[Qwen, Tokenizer]:
@@ -138,8 +165,6 @@ def extract_final_answer(text: str) -> str | None:
     str or None
         Extracted number or None if pattern not found.
     """
-    import re
-
     patterns = [
         r"####\s*(-?\d+(?:\.\d+)?)",  # GSM8k style: #### 42
         r"=\s*(-?\d+(?:\.\d+)?)\s*$",  # Trailing equals: = 42
@@ -154,6 +179,102 @@ def extract_final_answer(text: str) -> str | None:
     return None
 
 
+def evaluate(
+    env: Env[str, str],
+    generate: Callable[[str], str],
+    *,
+    num_episodes: int,
+    seed: int = 42,
+    extract_answer: Callable[[str], str | None] = extract_final_answer,
+    get_correct_answer: Callable[[dict[str, Any], dict[str, Any]], str] | None = None,
+    verbose: bool = True,
+) -> EvalResult:
+    """
+    Evaluate a model on an RL environment.
+
+    Parameters
+    ----------
+    env : Env[str, str]
+        Environment implementing reset() and step().
+    generate : Callable[[str], str]
+        Function that takes a question and returns the model's response.
+    num_episodes : int
+        Number of episodes to evaluate.
+    seed : int
+        Random seed for reproducibility.
+    extract_answer : Callable[[str], str | None]
+        Function to extract answer from model response.
+    get_correct_answer : Callable[[dict, dict], str] | None
+        Function to get correct answer from (reset_info, step_info).
+        If None, tries reset_info["answer"] then step_info["correct_answer"].
+    verbose : bool
+        Whether to print progress and results.
+
+    Returns
+    -------
+    EvalResult
+        Structured evaluation results.
+    """
+    correct = 0
+    total = 0
+    episodes: list[EpisodeResult] = []
+
+    iterator = range(num_episodes)
+    if verbose:
+        iterator = tqdm(iterator, desc="Evaluating")
+
+    for i in iterator:
+        episode_seed = seed + i if i == 0 else None
+        question, reset_info = env.reset(seed=episode_seed)
+
+        if verbose:
+            print("question:\n", question)
+
+        response = generate(question)
+
+        extracted = extract_answer(response)
+        action = extracted if extracted else response
+        _, reward, _, _, step_info = env.step(action)
+
+        if get_correct_answer:
+            correct_answer = get_correct_answer(reset_info, step_info)
+        else:
+            correct_answer = reset_info.get("answer") or step_info.get(
+                "correct_answer", ""
+            )
+
+        is_correct = reward == 1.0
+        correct += int(is_correct)
+        total += 1
+
+        episodes.append(
+            EpisodeResult(
+                question=question,
+                correct_answer=str(correct_answer),
+                model_response=response,
+                extracted_answer=extracted or step_info.get("proposed_answer"),
+                correct=is_correct,
+            )
+        )
+
+    accuracy = correct / total if total > 0 else 0.0
+
+    if verbose:
+        print(f"\n{'=' * 50}")
+        print("Evaluation Results")
+        print(f"{'=' * 50}")
+        print(f"Episodes: {total}")
+        print(f"Correct: {correct}")
+        print(f"Accuracy: {accuracy:.2%}")
+
+    return EvalResult(
+        accuracy=accuracy,
+        correct=correct,
+        total=total,
+        episodes=episodes,
+    )
+
+
 def evaluate_arithmetic(
     *,
     model: Qwen,
@@ -166,8 +287,8 @@ def evaluate_arithmetic(
     num_operands: int = 2,
     max_tokens: int = 64,
     seed: int = 42,
-    disable_thinking: bool,
-) -> dict:
+    disable_thinking: bool = False,
+) -> EvalResult:
     """Evaluate model on arithmetic environment."""
     env = ArithmeticEnv(
         min_value=min_value,
@@ -176,16 +297,8 @@ def evaluate_arithmetic(
         num_operands=num_operands,
     )
 
-    correct = 0
-    total = 0
-    results = []
-
-    for i in tqdm(range(num_episodes), desc="Evaluating"):
-        question, info = env.reset(seed=seed + i if i == 0 else None)
-        correct_answer = info["answer"]
-        print("question:\n", question)
-
-        response = get_model_response(
+    def generate(question: str) -> str:
+        return get_model_response(
             model=model,
             tokenizer=tokenizer,
             question=question,
@@ -195,39 +308,7 @@ def evaluate_arithmetic(
             disable_thinking=disable_thinking,
         )
 
-        extracted = extract_final_answer(response)
-        if extracted:
-            _, reward, _, _, step_info = env.step(extracted)
-        else:
-            _, reward, _, _, step_info = env.step(response)
-
-        correct += int(reward == 1.0)
-        total += 1
-
-        results.append(
-            {
-                "question": question,
-                "correct_answer": correct_answer,
-                "model_response": response,
-                "extracted_answer": extracted or step_info["proposed_answer"],
-                "correct": step_info["correct"],
-            }
-        )
-
-    accuracy = correct / total if total > 0 else 0
-    print(f"\n{'=' * 50}")
-    print("Arithmetic Evaluation Results")
-    print(f"{'=' * 50}")
-    print(f"Episodes: {total}")
-    print(f"Correct: {correct}")
-    print(f"Accuracy: {accuracy:.2%}")
-
-    return {
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
-        "results": results,
-    }
+    return evaluate(env, generate, num_episodes=num_episodes, seed=seed)
 
 
 def evaluate_gsm8k(
@@ -240,21 +321,15 @@ def evaluate_gsm8k(
     max_tokens: int = 512,
     seed: int = 42,
     disable_thinking: bool = False,
-) -> dict:
+) -> EvalResult:
     """Evaluate model on GSM8k environment."""
     env = GSM8kEnv(data_path=data_path, shuffle=True)
 
     if num_episodes is None:
         num_episodes = len(env.problems)
 
-    correct = 0
-    total = 0
-    results = []
-
-    for i in tqdm(range(num_episodes), desc="Evaluating"):
-        question, _ = env.reset(seed=seed + i if i == 0 else None)
-
-        response = get_model_response(
+    def generate(question: str) -> str:
+        return get_model_response(
             model=model,
             tokenizer=tokenizer,
             question=question,
@@ -264,39 +339,13 @@ def evaluate_gsm8k(
             disable_thinking=disable_thinking,
         )
 
-        extracted = extract_final_answer(response)
-        if extracted:
-            _, reward, _, _, step_info = env.step(extracted)
-        else:
-            _, reward, _, _, step_info = env.step(response)
-
-        correct += int(reward == 1.0)
-        total += 1
-
-        results.append(
-            {
-                "question": question,
-                "correct_answer": step_info["correct_answer"],
-                "model_response": response,
-                "extracted_answer": extracted or step_info["proposed_answer"],
-                "correct": step_info["correct"],
-            }
-        )
-
-    accuracy = correct / total if total > 0 else 0
-    print(f"\n{'=' * 50}")
-    print("GSM8k Evaluation Results")
-    print(f"{'=' * 50}")
-    print(f"Episodes: {total}")
-    print(f"Correct: {correct}")
-    print(f"Accuracy: {accuracy:.2%}")
-
-    return {
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
-        "results": results,
-    }
+    return evaluate(
+        env,
+        generate,
+        num_episodes=num_episodes,
+        seed=seed,
+        get_correct_answer=lambda _, step_info: step_info["correct_answer"],
+    )
 
 
 def main():

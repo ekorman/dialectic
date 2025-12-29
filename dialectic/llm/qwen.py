@@ -1,3 +1,13 @@
+"""Type conventions:
+
+- 'B': batch size
+- 'L': sequence length
+- 'D': vector dimension
+- 'NH': number of (query) attention heads
+- 'NKVH': number of key/value attention heads
+- 'DHead': dimension of each head
+"""
+
 from typing import Literal
 
 import torch
@@ -8,13 +18,15 @@ from torch import Tensor
 
 from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 
-T = Float[Tensor, "batch seq_length d"]
-
-TMH = Float[Tensor, "batch num_heads seq_length head_d"]
-
 
 class KVCache:
-    def __init__(self, max_seq_len, num_heads, head_dim, device):
+    def __init__(
+        self,
+        max_seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        device: str | torch.device,
+    ):
         self._max_seq_len = max_seq_len
         self._num_heads = num_heads
         self._head_dim = head_dim
@@ -58,8 +70,12 @@ class KVCache:
         return self._seq_len
 
 
-def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
-    # [batch, num_heads, seq_length, head_d]
+def attention(
+    q: Float[Tensor, "B NH L DHead"],
+    k: Float[Tensor, "B NKVH L DHead"],
+    v: Float[Tensor, "B NKVH L DHead"],
+    causal: bool = False,
+) -> Float[Tensor, "B NH L DHead"]:
     num_heads, seq_length, head_d = q.shape[-3:]
 
     num_kv_heads = k.shape[1]
@@ -92,10 +108,10 @@ def attention(q: TMH, k: TMH, v: TMH, causal: bool = False) -> TMH:
 
 
 def apply_rope(
-    x: Float[Tensor, "batch num_heads seq_length d"],
-    sin: Float[Tensor, "batch seq_length d"],
-    cos: Float[Tensor, "batch seq_length d"],
-) -> Float[Tensor, "batch seq_length d"]:
+    x: Float[Tensor, "B NH L D"],
+    sin: Float[Tensor, "B L D"],
+    cos: Float[Tensor, "B L D"],
+) -> Float[Tensor, "B NH L D"]:
     rot = torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
     sin = sin.to(x.device)
     cos = cos.to(x.device)
@@ -106,7 +122,7 @@ def apply_rope(
 
 def create_rope_sine_cosine_tensors(
     dim: int, base_value: float, context_length: int
-) -> tuple[Float[Tensor, "dim length"], Float[Tensor, "dim length"]]:
+) -> tuple[Float[Tensor, "1 L D"], Float[Tensor, "dim length"]]:
     sin = torch.zeros([context_length, dim], dtype=torch.float32)
     cos = torch.zeros([context_length, dim], dtype=torch.float32)
 
@@ -167,15 +183,16 @@ class MHSA(nn.Module):
             self.q_norm = RMSNorm(self.head_d)
             self.k_norm = RMSNorm(self.head_d)
 
-    def forward(self, x: T, kv_cache: KVCache | None = None) -> T:
-        q: T = self.q_proj(x)
-        k: T = self.k_proj(x)
-        v: T = self.v_proj(x)
+    def forward(
+        self, x: Float[Tensor, "B L D"], kv_cache: KVCache | None = None
+    ) -> Float[Tensor, "B L D"]:
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
         batch_size = x.shape[0]
 
         # view tensors as [batch, num_heads, seq_length, head_d] to break into heads
-
         q = q.view(batch_size, -1, self.num_heads, self.head_d).transpose(2, 1)
         k = k.view(batch_size, -1, self.num_kv_heads, self.head_d).transpose(2, 1)
         v = v.view(batch_size, -1, self.num_kv_heads, self.head_d).transpose(2, 1)
@@ -220,7 +237,7 @@ class GatedMLP(nn.Module):
         self.up_proj = nn.Linear(d, hidden_d, bias=False)
         self.down_proj = nn.Linear(hidden_d, d, bias=False)
 
-    def forward(self, x: T) -> T:
+    def forward(self, x: Float[Tensor, "... d"]) -> Float[Tensor, "... d"]:
         return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -293,7 +310,7 @@ class Qwen(nn.Module):
         self.norm = RMSNorm(d)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
 
-    def forward(self, x, kv_caches: list[dict] | None = None):
+    def forward(self, x, kv_caches: list[KVCache] | None = None):
         x = self.embed_tokens(x)
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
