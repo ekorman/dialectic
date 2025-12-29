@@ -3,7 +3,9 @@
     "allow": [
       "Bash(uv run python:*)",
       "Bash(uv run pytest:*)",
-      "Bash(TEST_LLM_AGAINST_HF=1 uv run pytest:*)"
+      "Bash(TEST_LLM_AGAINST_HF=1 uv run pytest:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

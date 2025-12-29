@@ -210,14 +210,14 @@ class GSM8kEnv(Env[str, str]):
             raise RuntimeError("Must call reset() before step()")
 
         correct_answer = self._extract_answer(self.current_problem["answer"])
-        proposed_answer = self._extract_answer(action)
+        proposed = action.strip()
 
-        correct = proposed_answer is not None and proposed_answer == correct_answer
+        correct = proposed == correct_answer
         reward = 1.0 if correct else 0.0
 
         info = {
             "correct_answer": correct_answer,
-            "proposed_answer": proposed_answer,
+            "proposed_answer": proposed,
             "correct": correct,
             "question": self.current_problem["question"],
             "full_solution": self.current_problem["answer"],
@@ -308,25 +308,6 @@ class ArithmeticEnv(Env[str, str]):
         question = f"What is {expression}?"
         return question, result
 
-    def _extract_answer(self, text: str) -> str | None:
-        """
-        Extract numerical answer from response text.
-
-        Parameters
-        ----------
-        text : str
-            Text to extract answer from.
-
-        Returns
-        -------
-        str or None
-            Extracted number or None if not found.
-        """
-        match = re.search(r"(-?\d+(?:\.\d+)?)", text)
-        if match:
-            return match.group(1)
-        return None
-
     def reset(self, seed: int | None = None) -> tuple[str, dict[str, Any]]:
         """
         Reset the environment with a new problem.
@@ -370,17 +351,13 @@ class ArithmeticEnv(Env[str, str]):
         if self.current_question is None:
             raise RuntimeError("Must call reset() before step()")
 
-        proposed = self._extract_answer(action)
-        correct_str = str(self.current_answer)
+        proposed = action.strip()
+        correct_num = float(self.current_answer)
 
-        if proposed is not None:
-            try:
-                proposed_num = float(proposed)
-                correct_num = float(correct_str)
-                correct = abs(proposed_num - correct_num) < 1e-6
-            except ValueError:
-                correct = False
-        else:
+        try:
+            proposed_num = float(proposed)
+            correct = abs(proposed_num - correct_num) < 1e-6
+        except ValueError:
             correct = False
 
         reward = 1.0 if correct else 0.0

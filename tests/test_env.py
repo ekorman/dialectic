@@ -57,7 +57,7 @@ class TestGSM8kEnv:
         # Find which problem we got and answer correctly
         correct_answer = env._extract_answer(env.current_problem["answer"])
 
-        obs, reward, terminated, truncated, info = env.step(f"#### {correct_answer}")
+        obs, reward, terminated, truncated, info = env.step(correct_answer)
 
         assert reward == 1.0
         assert terminated is True
@@ -69,7 +69,7 @@ class TestGSM8kEnv:
         """Test that incorrect answers get reward 0.0."""
         env.reset(seed=42)
 
-        obs, reward, terminated, truncated, info = env.step("#### 999999")
+        obs, reward, terminated, truncated, info = env.step("999999")
 
         assert reward == 0.0
         assert terminated is True
@@ -238,14 +238,14 @@ class TestArithmeticEnv:
         assert obs1 == obs2
         assert info1["answer"] == info2["answer"]
 
-    def test_answer_extraction_with_text(self):
-        """Test that answers can be extracted from text responses."""
+    def test_answer_as_string(self):
+        """Test that answers can be passed as strings."""
         env = ArithmeticEnv()
         _, info = env.reset(seed=42)
         correct = info["answer"]
 
-        # Answer embedded in text
-        _, reward, _, _, _ = env.step(f"The answer is {correct}")
+        # Answer passed as string
+        _, reward, _, _, _ = env.step(str(correct))
         assert reward == 1.0
 
     def test_negative_results(self):
