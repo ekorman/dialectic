@@ -48,12 +48,14 @@ def get_model_response(
     tokenizer: Tokenizer,
     question: str,
     device: str,
-    disable_thinking: bool,
     max_tokens: int = 256,
     system_prompt: str | None = None,
+    disable_thinking: bool = False,
 ) -> str:
     """Get model's response to a question."""
-    messages = [Message(role="system", content=ARITHMETIC_SYSTEM_PROMPT)]
+    messages = []
+    if system_prompt:
+        messages.append(Message(role="system", content=system_prompt))
 
     if disable_thinking:
         question += " /no_think"
@@ -104,6 +106,20 @@ Assistant: 2 + 3 = 5
 #### 5
 
 Always end with "#### " followed by just the number."""
+
+
+GSM8K_SYSTEM_PROMPT = """\
+You are a helpful math tutor. Solve the word problem step by step, then give the final numerical answer.
+
+Format your response exactly like this example:
+User: John has 5 apples. He buys 3 more. How many apples does he have?
+Assistant: John starts with 5 apples.
+He buys 3 more apples.
+Total apples = 5 + 3 = 8
+
+#### 8
+
+Always end with "#### " followed by just the final number."""
 
 
 def extract_final_answer(text: str) -> str | None:
@@ -175,6 +191,7 @@ def evaluate_arithmetic(
             question=question,
             device=device,
             max_tokens=max_tokens,
+            system_prompt=ARITHMETIC_SYSTEM_PROMPT,
             disable_thinking=disable_thinking,
         )
 
@@ -214,6 +231,7 @@ def evaluate_arithmetic(
 
 
 def evaluate_gsm8k(
+    *,
     model: Qwen,
     tokenizer: Tokenizer,
     device: str,
@@ -221,6 +239,7 @@ def evaluate_gsm8k(
     num_episodes: int | None = None,
     max_tokens: int = 512,
     seed: int = 42,
+    disable_thinking: bool = False,
 ) -> dict:
     """Evaluate model on GSM8k environment."""
     env = GSM8kEnv(data_path=data_path, shuffle=True)
@@ -241,9 +260,15 @@ def evaluate_gsm8k(
             question=question,
             device=device,
             max_tokens=max_tokens,
+            system_prompt=GSM8K_SYSTEM_PROMPT,
+            disable_thinking=disable_thinking,
         )
 
-        _, reward, _, _, step_info = env.step(response)
+        extracted = extract_final_answer(response)
+        if extracted:
+            _, reward, _, _, step_info = env.step(extracted)
+        else:
+            _, reward, _, _, step_info = env.step(response)
 
         correct += int(reward == 1.0)
         total += 1
@@ -253,7 +278,7 @@ def evaluate_gsm8k(
                 "question": question,
                 "correct_answer": step_info["correct_answer"],
                 "model_response": response,
-                "extracted_answer": step_info["proposed_answer"],
+                "extracted_answer": extracted or step_info["proposed_answer"],
                 "correct": step_info["correct"],
             }
         )
@@ -355,6 +380,7 @@ def main():
             num_episodes=args.num_episodes,
             max_tokens=args.max_tokens,
             seed=args.seed,
+            disable_thinking=args.disable_thinking,
         )
 
 
