@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from dialectic.rl.env import ArithmeticEnv, GSM8kEnv
+from dialectic.rl.env import ArithmeticEnv, EpisodeIsDoneError, GSM8kEnv
 
 
 @pytest.fixture
@@ -271,3 +271,14 @@ class TestArithmeticEnv:
             numbers = [int(n) for n in obs.replace("?", "").split() if n.isdigit()]
             for n in numbers:
                 assert 10 <= n <= 20
+
+
+def test_arithmetic_env():
+    env = ArithmeticEnv()
+    s = env.reset()
+    assert s.is_done
+    assert s.data.question.startswith("What is")
+    assert isinstance(s.data.answer, float)
+
+    with pytest.raises(EpisodeIsDoneError):
+        env.step()

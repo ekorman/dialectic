@@ -1,12 +1,10 @@
-import argparse
-import json
 from typing import Protocol
 
-import gymnasium as gym
 import torch
 import torch.nn as nn
-import wandb
 from torch.distributions.categorical import Categorical
+
+from dialectic.rl.env import Env
 
 
 class Phi(Protocol):
@@ -121,14 +119,14 @@ def reinforce_loop(
     *,
     policy_net: nn.Module,
     opt: torch.optim.Optimizer,
-    env: gym.Env,
+    env: Env,
     discount_factor: float,
     max_episodes: int,
     batch_size: int,  # need to have ability for batch to come from same initial state just different samples
     phi: Phi,
 ):
     n_episodes = 0
-    state, _ = env.reset()
+    state = env.reset()
     batch_actions, batch_rewards, batch_states = [], [], []
     actions, rewards, states = [], [], []
 
@@ -160,58 +158,58 @@ def reinforce_loop(
                     phi=phi,
                     opt=opt,
                 )
-
-                run.log(
-                    {
-                        "ave_steps_in_batch": mean(
-                            [len(states) for states in batch_states]
-                        ),
-                        "ave_non_discounted_reward": mean(
-                            [sum(rewards) for rewards in batch_rewards]
-                        ),
-                        "discounted_reward": mean(
-                            [
-                                sum(
-                                    [
-                                        r * discount_factor**i
-                                        for i, r in enumerate(rewards)
-                                    ]
-                                )
-                                for rewards in batch_rewards
-                            ]
-                        ),
-                        "policy_gradient": pg,
-                    }
-                )
+                pg
+                # run.log(
+                #     {
+                #         "ave_steps_in_batch": mean(
+                #             [len(states) for states in batch_states]
+                #         ),
+                #         "ave_non_discounted_reward": mean(
+                #             [sum(rewards) for rewards in batch_rewards]
+                #         ),
+                #         "discounted_reward": mean(
+                #             [
+                #                 sum(
+                #                     [
+                #                         r * discount_factor**i
+                #                         for i, r in enumerate(rewards)
+                #                     ]
+                #                 )
+                #                 for rewards in batch_rewards
+                #             ]
+                #         ),
+                #         "policy_gradient": pg,
+                #     }
+                # )
 
                 batch_actions, batch_rewards, batch_states = [], [], []
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, required=True)
-    parser.add_argument("--lr", type=float, required=True)
-    parser.add_argument("--max_episodes", type=int, required=True)
-    parser.add_argument("--discount_factor", type=float, required=True)
-    parser.add_argument("--hidden_dims", type=json.loads, required=True)
-    parser.add_argument("--batch_size", type=int, required=True)
+# if __name__ == "__main__":
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--env", type=str, required=True)
+#     parser.add_argument("--lr", type=float, required=True)
+#     parser.add_argument("--max_episodes", type=int, required=True)
+#     parser.add_argument("--discount_factor", type=float, required=True)
+#     parser.add_argument("--hidden_dims", type=json.loads, required=True)
+#     parser.add_argument("--batch_size", type=int, required=True)
 
-    args = parser.parse_args()
+#     args = parser.parse_args()
 
-    env = gym.make(args.env)
+#     env = gym.make(args.env)
 
-    policy_net = build_policy_net(
-        args.hidden_dims, env.observation_space.shape[0], int(env.action_space.n)
-    )
-    opt = torch.optim.Adam(policy_net.parameters(), lr=args.lr)
+#     policy_net = build_policy_net(
+#         args.hidden_dims, env.observation_space.shape[0], int(env.action_space.n)
+#     )
+#     opt = torch.optim.Adam(policy_net.parameters(), lr=args.lr)
 
-    run = wandb.init(project="rl", config=vars(args))
-    reinforce_loop(
-        policy_net=policy_net,
-        opt=opt,
-        env=env,
-        discount_factor=args.discount_factor,
-        max_episodes=args.max_episodes,
-        batch_size=args.batch_size,
-        phi=rewards_to_go,
-    )
+#     run = wandb.init(project="rl", config=vars(args))
+#     reinforce_loop(
+#         policy_net=policy_net,
+#         opt=opt,
+#         env=env,
+#         discount_factor=args.discount_factor,
+#         max_episodes=args.max_episodes,
+#         batch_size=args.batch_size,
+#         phi=rewards_to_go,
+#     )
