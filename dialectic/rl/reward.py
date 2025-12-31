@@ -11,11 +11,11 @@ class RewardFn(ABC, Generic[T, E]):
         *,
         env_response: EnvResponse[T],
         raw_model_output: str | None = None,
-        extracted_model_output: E | None = None,
+        extracted_model_output: E,
     ) -> float: ...
 
 
-class ArithmeticRewardFn:
+class ArithmeticRewardFn(RewardFn[QA[float], float]):
     def __init__(self, tolerance: float = 1e-6):
         self.tolerance = tolerance
 

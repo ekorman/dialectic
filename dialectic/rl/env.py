@@ -1,5 +1,8 @@
+import json
 import random
+import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Generic
 
 from dialectic.rl.types import QA, A, EnvResponse, T
@@ -10,9 +13,10 @@ class EpisodeIsDoneError(RuntimeError):
 
 
 class Env(ABC, Generic[T, A]):
-    # internally keep track of done or not and throw error if step is called...
+    eval_mode: bool = False
+
     @abstractmethod
-    def reset(self, seed: int | None = None) -> EnvResponse[T]: ...
+    def reset(self, seed: int | None = None) -> EnvResponse[T] | None: ...
 
     @abstractmethod
     def step(self, action: A) -> EnvResponse[T] | None: ...
@@ -99,5 +103,46 @@ class ArithmeticEnv(Env[QA[float], None]):
         raise EpisodeIsDoneError
 
 
-# for some enviornments we should have an `eval` mode where reset runs iteratively through
-# all possible episodes
+class GSM8kEnv(Env[QA[float], None]):
+    def __init__(
+        self,
+        *,
+        path: str | Path,
+        eval_mode: bool,
+    ):
+        self.eval_mode = eval_mode
+        self.path = path
+        with open(path) as f:
+            self.data = [json.loads(line) for line in f]
+        if eval_mode:
+            self._idx = 0
+        else:
+            self.rng = random.Random()
+
+    def _get_question_and_answer(self, index: int) -> QA[float]:
+        q = self.data[index]["question"]
+        a = self.data[index]["answer"]
+        m = re.search(r"####\s*([^\n]+)", a)
+        if m is None:
+            raise RuntimeError(f"Error extracting answer from {a}")
+        a = float(m.group(1).strip())
+        return QA(question=q, answer=a)
+
+    # maybe should change name from `reset` to something else (e.g. `new_episode`) since `reset` makes it
+    # sound like all internal state will be reset which is not true.
+    def reset(self, seed: int | None = None) -> EnvResponse[QA[float]]:
+        if self.eval_mode and seed is not None:
+            raise ValueError("Should not pass a seed when in eval mode")
+
+        if self.eval_mode:
+            index = self._idx
+            self._idx += 1
+        else:
+            self.rng = random.Random(seed)
+            index = self.rng.randint(0, len(self.data) - 1)
+
+        qa = self._get_question_and_answer(index)
+        return EnvResponse(is_done=True, data=qa)
+
+    def step(self, action: None):
+        raise EpisodeIsDoneError
