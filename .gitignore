@@ -2,6 +2,5 @@ qwen-tokenizer
 __pycache__
 *.egg-info
 .DS_Store
-.vscode
 data
 weights
