@@ -88,10 +88,10 @@ def attention(
     dot_prods: torch.Tensor = torch.matmul(q, k.transpose(3, 2)) / (head_d**0.5)
 
     if attention_mask is not None:
-        attention_mask = ~torch.einsum(
-            "ij,ik->ijk", ~attention_mask, ~attention_mask
-        ).unsqueeze(1)
-        dot_prods.masked_fill_(attention_mask, -torch.inf)
+        # attention_mask shape: (B, k_len), True = masked/padding
+        # expand to (B, 1, 1, k_len) for broadcasting with (B, NH, q_len, k_len)
+        key_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        dot_prods.masked_fill_(key_mask, -torch.inf)
 
     if causal:
         dot_prods.masked_fill_(
@@ -101,9 +101,8 @@ def attention(
             -torch.inf,
         )
     soft_max_dot_prods = (dot_prods).softmax(-1)
-    if attention_mask is not None:
-        # soft max can have NaNs since entire rows could have been -torch.inf
-        soft_max_dot_prods.masked_fill_(attention_mask, 0)
+    # NaNs can occur when entire rows are -inf (all keys masked for a query)
+    soft_max_dot_prods = torch.nan_to_num(soft_max_dot_prods, nan=0.0)
 
     return torch.matmul(soft_max_dot_prods, v)
 
@@ -378,7 +377,7 @@ def generate_from_tokens(
     if use_kv_cache:
         kv_caches = [
             KVCache(
-                max_seq_len=max_tokens_generated + len(token_ids),
+                max_seq_len=max_tokens_generated + token_ids.shape[1],
                 num_heads=net.attn_num_kv_heads,
                 head_dim=net.attn_head_d,
                 device=next(net.parameters()).device,
