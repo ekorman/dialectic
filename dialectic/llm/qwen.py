@@ -12,7 +12,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 from tokenizers import Tokenizer
 from torch import Tensor
 
@@ -75,7 +75,7 @@ def attention(
     k: Float[Tensor, "B NKVH L DHead"],
     v: Float[Tensor, "B NKVH L DHead"],
     causal: bool = False,
-    attention_mask: Float[Tensor, "B L"] | None = None,
+    attention_mask: Bool[Tensor, "B L"] | None = None,
 ) -> Float[Tensor, "B NH L DHead"]:
     num_heads, seq_length, head_d = q.shape[-3:]
 
@@ -436,10 +436,12 @@ def generate_from_text(
         device = next(net.parameters()).device
 
     pad_token_id = tokenizer.token_to_id(pad_token)
-    tokenizer.enable_padding(pad_id=pad_token_id, pad_token=pad_token)
+    tokenizer.enable_padding(pad_id=pad_token_id, pad_token=pad_token, direction="left")
     tokens = tokenizer.encode_batch(text_batch)
     token_ids = torch.tensor([t.ids for t in tokens]).to(device)
-    attention_mask = torch.tensor([t.attention_mask for t in tokens])
+    attention_mask = (
+        torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool) == 0
+    ).to(device)
 
     eos_token_id = tokenizer.token_to_id(eos_token)
 
