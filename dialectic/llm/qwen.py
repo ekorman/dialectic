@@ -13,7 +13,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
@@ -366,15 +366,19 @@ def load_qwen_06b() -> Qwen:
 @torch.inference_mode()
 def generate_from_tokens(
     net: Qwen,
-    token_ids: torch.LongTensor,
+    token_ids: Int[Tensor, "B L"],
     eos_token_id: int,
+    pad_token_id: int | None = None,
     sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
-    attention_mask: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,  # should be left-padded
     temperature: float = 1.0,
-) -> torch.LongTensor:
+) -> Int[Tensor, "B L"]:
     assert sampling_strategy in ["greedy", "sample"]
+
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
 
     if use_kv_cache:
         kv_caches = [
@@ -389,7 +393,11 @@ def generate_from_tokens(
     else:
         kv_caches = None
 
-    all_token_ids = token_ids  # Keep track of full sequence
+    batch_size = token_ids.shape[0]
+    device = token_ids.device
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    all_token_ids = token_ids
     input_ids = token_ids
 
     tokens_generated = 0
@@ -406,21 +414,28 @@ def generate_from_tokens(
                 logits=scaled_logits
             ).sample()
 
-        if (next_token_id == eos_token_id).all():
+        finished = finished | (next_token_id.squeeze(-1) == eos_token_id)
+
+        next_token_id = torch.where(
+            finished.unsqueeze(-1),
+            torch.full_like(next_token_id, pad_token_id),
+            next_token_id,
+        )
+
+        if finished.all():
             break
 
         all_token_ids = torch.cat([all_token_ids, next_token_id], 1)
         tokens_generated += 1
 
         if use_kv_cache:
-            input_ids = next_token_id  # Only new token for next iteration
+            input_ids = next_token_id
         else:
             input_ids = all_token_ids
+
         if attention_mask is not None:
-            attention_mask = torch.cat(
-                [attention_mask, torch.zeros(input_ids.shape[0], 1, dtype=torch.bool)],
-                1,
-            )
+            new_mask = finished.unsqueeze(-1)
+            attention_mask = torch.cat([attention_mask, new_mask], 1)
 
     return all_token_ids
 
@@ -454,6 +469,7 @@ def generate_from_text(
         net=net,
         token_ids=token_ids,
         eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
         sampling_strategy=sampling_strategy,
         max_tokens_generated=max_tokens_generated,
         use_kv_cache=use_kv_cache,
@@ -467,7 +483,7 @@ def generate_from_text(
 def generate_from_chat(
     net: Qwen,
     tokenizer: Tokenizer,
-    messages: list[Message],
+    batch_messages: list[list[Message]],
     eos_token: str = "<|endoftext|>",
     pad_token: str = "<|endoftext|>",
     sampling_strategy: Literal["greedy", "sample"] = "sample",
@@ -479,7 +495,10 @@ def generate_from_chat(
         net=net,
         tokenizer=tokenizer,
         sampling_strategy=sampling_strategy,
-        text_batch=[get_input_text_from_messages(messages, add_generation_prompt=True)],
+        text_batch=[
+            get_input_text_from_messages(message, add_generation_prompt=True)
+            for message in batch_messages
+        ],
         eos_token=eos_token,
         pad_token=pad_token,
         max_tokens_generated=max_tokens_generated,

@@ -497,9 +497,15 @@ def test_load_qwen_06b():
         )
 
         tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-        messages = [Message(role="user", content="Hello who are you?")]
+        messages1 = [Message(role="user", content="Hello who are you?")]
+        messages2 = [
+            Message(role="user", content="What is the capital of France? /nothink")
+        ]
         resp = generate_from_chat(
-            model, tokenizer, messages, sampling_strategy="greedy"
+            model,
+            tokenizer,
+            [messages1, messages2],
+            sampling_strategy="greedy",
         )
         assert (
             resp[0]
@@ -511,5 +517,18 @@ Okay, the user asked, "Hello who are you?" I need to respond appropriately. Firs
 </think>
 
 Hello! I'm a language model designed to assist with a wide range of tasks, from answering questions to providing information. How can I help you today?
+"""
+        )
+
+        assert (
+            resp[1]
+            == """user
+What is the capital of France? /nothink
+assistant
+<think>
+Okay, the user is asking for the capital of France. I need to make sure I recall the correct answer. France's capital is Paris. Let me think... Yes, Paris is the capital city. I should confirm that there isn't any other city that's considered the capital. For example, maybe some other city has a similar name, but I don't think so. Also, checking my memory, the capital is indeed Paris. I should state that clearly and maybe add a brief note if needed, like mentioning that it's the largest city in France. That should cover the user's question.
+</think>
+
+The capital of France is **Paris**.
 """
         )
