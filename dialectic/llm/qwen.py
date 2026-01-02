@@ -372,6 +372,7 @@ def generate_from_tokens(
     max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
     attention_mask: torch.Tensor | None = None,
+    temperature: float = 1.0,
 ) -> torch.LongTensor:
     assert sampling_strategy in ["greedy", "sample"]
 
@@ -400,7 +401,10 @@ def generate_from_tokens(
         if sampling_strategy == "greedy":
             next_token_id = logits.argmax(-1)
         else:
-            next_token_id = torch.distributions.Categorical(logits=logits).sample()
+            scaled_logits = logits / temperature
+            next_token_id = torch.distributions.Categorical(
+                logits=scaled_logits
+            ).sample()
 
         if (next_token_id == eos_token_id).all():
             break
@@ -431,6 +435,7 @@ def generate_from_text(
     max_tokens_generated: int = sys.maxsize,
     device: str | torch.device | None = None,
     use_kv_cache: bool = True,
+    temperature: float = 1.0,
 ) -> list[str]:
     if device is None:
         device = next(net.parameters()).device
@@ -453,6 +458,7 @@ def generate_from_text(
         max_tokens_generated=max_tokens_generated,
         use_kv_cache=use_kv_cache,
         attention_mask=attention_mask,
+        temperature=temperature,
     )
 
     return [tokenizer.decode(batch.tolist()) for batch in token_ids]
@@ -467,6 +473,7 @@ def generate_from_chat(
     sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = 1000,
     device: str | torch.device | None = None,
+    temperature: float = 1.0,
 ):
     return generate_from_text(
         net=net,
@@ -477,4 +484,5 @@ def generate_from_chat(
         pad_token=pad_token,
         max_tokens_generated=max_tokens_generated,
         device=device,
+        temperature=temperature,
     )

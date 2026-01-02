@@ -430,6 +430,46 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     assert (out2 == out_batched[1:]).all()
 
 
+def test_qwen_generate_temperature():
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    x = torch.randint(0, vocab_size, size=(1, 4))
+
+    out_greedy = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=10,
+        sampling_strategy="greedy",
+    )
+
+    # very low temperature should approximate greedy
+    out_low_temp = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=10,
+        sampling_strategy="sample",
+        temperature=0.001,
+    )
+
+    torch.testing.assert_close(out_greedy, out_low_temp)
+
+
 @pytest.mark.skipif(
     os.getenv("TEST_LLM_AGAINST_HF") is None,
     reason="skipping `test_load_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
