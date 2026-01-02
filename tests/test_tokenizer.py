@@ -8,20 +8,31 @@ def get_auto_tokenizer():
     return AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 
-def test_tokenizer_batch():
+def test_tokenizer_batch_right_pad():
     tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     tokenizer.enable_padding(pad_id=151643)
     tokens = tokenizer.encode_batch(
         ["short prompt", "this is a much longer prompt for testing"]
     )
-    """
-    tensor([[1, 1, 0, 0, 0, 0, 0, 0],
-            [1, 1, 1, 1, 1, 1, 1, 1]])
-    """
-    import pdb
+    # short prompt has two tokens
 
-    pdb.set_trace()
     assert len(tokens[0]) == len(tokens[1]) == max([len(t) for t in tokens])
+    assert tokens[0].ids[2:] == [151643] * (len(tokens[0].ids) - 2)
+    for i in range(2):
+        assert tokens[0].ids[i] != 151643
+
+
+def test_tokenizer_batch_left_pad():
+    tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    tokenizer.enable_padding(pad_id=151643, direction="left")
+    tokens = tokenizer.encode_batch(
+        ["short prompt", "this is a much longer prompt for testing"]
+    )
+    # short prompt has two tokens
+    assert len(tokens[0]) == len(tokens[1]) == max([len(t) for t in tokens])
+    assert tokens[0].ids[:-2] == [151643] * (len(tokens[0].ids) - 2)
+    for i in range(2):
+        assert tokens[0].ids[-i - 1] != 151643
 
 
 def test_tokenizer_against_hf():
