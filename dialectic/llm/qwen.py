@@ -8,6 +8,7 @@
 - 'DHead': dimension of each head
 """
 
+import sys
 from typing import Literal
 
 import torch
@@ -305,7 +306,7 @@ class Qwen(nn.Module):
         attn_num_heads: int,
         attn_num_kv_heads: int,
         mlp_hidden_d: int,
-        rope_base_value: float = None,
+        rope_base_value: float | None = None,
     ):
         super().__init__()
         self.d = d
@@ -368,7 +369,7 @@ def generate_from_tokens(
     token_ids: torch.LongTensor,
     eos_token_id: int,
     sampling_strategy: Literal["greedy", "sample"] = "sample",
-    max_tokens_generated: int = float("inf"),
+    max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
     attention_mask: torch.Tensor | None = None,
 ) -> torch.LongTensor:
@@ -427,7 +428,7 @@ def generate_from_text(
     eos_token: str,
     pad_token: str,
     sampling_strategy: Literal["greedy", "sample"] = "sample",
-    max_tokens_generated: int = float("inf"),
+    max_tokens_generated: int = sys.maxsize,
     device: str | torch.device | None = None,
     use_kv_cache: bool = True,
 ) -> list[str]:
