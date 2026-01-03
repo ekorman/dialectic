@@ -336,6 +336,7 @@ class Qwen(nn.Module):
         x,
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
+        return_all_logits: bool = False,
     ):
         x = self.embed_tokens(x)
 
@@ -346,7 +347,8 @@ class Qwen(nn.Module):
 
         # just get last element of output sequence
         # important: if attention_mask is not None then we assume left padding!
-        x = x[:, -1:]
+        if not return_all_logits:
+            x = x[:, -1:]
         return self.lm_head(x)
 
 
@@ -367,8 +369,8 @@ def load_qwen_06b() -> Qwen:
 def generate_from_tokens(
     net: Qwen,
     token_ids: Int[Tensor, "B L"],
-    eos_token_id: int,
-    pad_token_id: int,
+    eos_token_id: int = 151645,
+    pad_token_id: int = 151643,
     sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
@@ -444,8 +446,8 @@ def generate_from_text(
     net: Qwen,
     tokenizer: Tokenizer,
     text_batch: list[str],
-    eos_token: str,
-    pad_token: str,
+    eos_token: str = "<|im_end|>",
+    pad_token: str = "<|endoftext|>",
     sampling_strategy: Literal["greedy", "sample"] = "sample",
     max_tokens_generated: int = sys.maxsize,
     device: str | torch.device | None = None,

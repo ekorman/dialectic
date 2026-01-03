@@ -228,6 +228,7 @@ def test_qwen():
     ).eval()
 
     assert model(x).shape == torch.Size((b, 1, vocab_size))
+    assert model(x, return_all_logits=True).shape == torch.Size((b, l, vocab_size))
 
     # check against a huggingface defined net
     conf = Qwen3Config()
