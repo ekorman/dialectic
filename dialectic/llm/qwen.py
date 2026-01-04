@@ -6,6 +6,7 @@
 - 'NH': number of (query) attention heads
 - 'NKVH': number of key/value attention heads
 - 'DHead': dimension of each head
+- 'VC': vocab size
 """
 
 import sys
@@ -461,6 +462,7 @@ def generate_from_text(
     tokenizer.enable_padding(pad_id=pad_token_id, pad_token=pad_token, direction="left")
     tokens = tokenizer.encode_batch(text_batch)
     token_ids = torch.tensor([t.ids for t in tokens]).to(device)
+    # attention mask is True where we want to mask (i.e. ignore)
     attention_mask = (
         torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool) == 0
     ).to(device)

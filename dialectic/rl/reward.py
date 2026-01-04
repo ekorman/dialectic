@@ -5,6 +5,7 @@ from dialectic.rl.types import QA, E, EnvResponse, T
 
 
 class RewardFn(ABC, Generic[T, E]):
+    # might need to include other things here, such as logits if doing KL in reward
     @abstractmethod
     def __call__(
         self,
