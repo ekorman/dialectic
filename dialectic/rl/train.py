@@ -229,7 +229,7 @@ def train_grpo(
         ]
 
         output_strs = [tokenizer.decode_batch(c.tolist()) for c in completion_token_ids]
-        rewards: Float[torch.Tensor, "G B"] = torch.Tensor(
+        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
             [
                 [
                     reward_fn(
@@ -240,7 +240,8 @@ def train_grpo(
                     for s, env_response in zip(group_batch, env_responses)
                 ]
                 for group_batch in output_strs
-            ]
+            ],
+            device=device,
         )
 
         with torch.inference_mode():
