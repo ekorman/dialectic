@@ -117,21 +117,17 @@ def compute_advantages(
     return rewards - mean
 
 
-def get_batch(
-    env: Env, batch_size: int, state_to_str: Callable[[T], str]
-) -> tuple[list[str], list[EnvResponse]]:
-    prompts = []
+def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
     env_responses = []
     for _ in range(batch_size):
         env_response = env.reset()
         if env_response is not None:
-            prompts.append(state_to_str(env_response.data))
             env_responses.append(env_response)
             if not env_response.is_done:
                 raise RuntimeError("Only single step environments supported for now")
         else:
             warnings.warn("Got None response from `env.reset`")
-    return prompts, env_responses
+    return env_responses
 
 
 def grpo_step(
@@ -202,7 +198,8 @@ def train_grpo(
         if n_batches % update_ref_net_batch_cadence == 0:
             ref_net = deepcopy(net)
 
-        prompts, env_responses = get_batch(env, batch_size, state_to_str)
+        env_responses = get_batch(env, batch_size)
+        prompts = [state_to_str(resp.data) for resp in env_responses]
         device = next(net.parameters()).device
 
         tokenizer.enable_padding(direction="left")
