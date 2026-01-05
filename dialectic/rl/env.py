@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generic
 
+from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 from dialectic.rl.types import QA, A, Countdown, EnvResponse, T
 
 
@@ -188,11 +189,16 @@ class CountdownEnv(Env[Countdown, None]):
         ]
         target = self.rng.randint(1, self.max_target)
 
-        prompt = (
+        user_content = (
             f"Using the numbers {numbers}, create an equation that equals {target}. "
             f"You can use +, -, *, / and each number at most once. "
             f"Show your reasoning in <think></think> tags. "
             f"Put your final equation in <answer></answer> tags."
+        )
+
+        prompt = get_input_text_from_messages(
+            messages=[Message(role="user", content=user_content)],
+            add_generation_prompt=True,
         )
 
         return EnvResponse(

@@ -75,3 +75,70 @@ class CountdownRewardFn(RewardFn[Countdown, str | None]):
             return abs(result - target) < 1e-6
         except Exception:
             return False
+
+
+class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
+    """
+    Reward with format shaping to ensure learning signal.
+
+    Base rewards:
+    - 1.0: Correct answer
+    - 0.3: Has <answer> tags with parseable expression (wrong result)
+    - 0.1: Has <answer> tags (unparseable)
+    - 0.05: Has <think> tags only
+    - 0.0: No structure
+
+    Plus small length bonus (up to 0.05) to create variance between similar outputs.
+    """
+
+    def __call__(
+        self,
+        *,
+        env_response: EnvResponse[Countdown],
+        raw_model_output: str | None = None,
+        extracted_model_output: str | None,
+    ) -> float:
+        if raw_model_output is None:
+            return 0.0
+
+        target = env_response.data.target
+        numbers = env_response.data.numbers
+
+        base_reward = 0.0
+
+        if extracted_model_output is not None:
+            try:
+                if self._evaluate_and_verify(extracted_model_output, numbers, target):
+                    return 1.0
+            except Exception:
+                pass
+
+            if self._is_parseable_expression(extracted_model_output):
+                base_reward = 0.3
+            else:
+                base_reward = 0.1
+        elif "<think>" in raw_model_output and "</think>" in raw_model_output:
+            base_reward = 0.05
+
+        length_bonus = min(len(raw_model_output) / 500.0, 0.05)
+        return base_reward + length_bonus
+
+    def _evaluate_and_verify(self, expr: str, numbers: list[int], target: int) -> bool:
+        used_numbers = [int(n) for n in re.findall(r"\d+", expr)]
+
+        available = numbers.copy()
+        for n in used_numbers:
+            if n in available:
+                available.remove(n)
+            else:
+                return False
+
+        result = eval(expr, {"__builtins__": {}}, {})
+        return abs(result - target) < 1e-6
+
+    def _is_parseable_expression(self, expr: str) -> bool:
+        try:
+            eval(expr, {"__builtins__": {}}, {})
+            return True
+        except Exception:
+            return False

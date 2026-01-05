@@ -17,7 +17,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.qwen import load_qwen_06b
 from dialectic.rl.env import CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn
+from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
 from dialectic.rl.types import Countdown
 
@@ -40,8 +40,8 @@ def main():
     parser.add_argument(
         "--max-episodes", type=int, default=50, help="Max training episodes"
     )
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument("--group-size", type=int, default=4, help="Group size for GRPO")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
+    parser.add_argument("--group-size", type=int, default=2, help="Group size for GRPO")
     parser.add_argument(
         "--max-tokens", type=int, default=100, help="Max tokens to generate"
     )
@@ -51,6 +51,11 @@ def main():
     )
     parser.add_argument(
         "--weights", default="weights/qwen3-0.6b.pth", help="Path to model weights"
+    )
+    parser.add_argument(
+        "--binary-reward",
+        action="store_true",
+        help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
     )
     args = parser.parse_args()
 
@@ -84,6 +89,13 @@ def main():
 
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
+    if args.binary_reward:
+        reward_fn = CountdownRewardFn()
+        reward_type = "binary (1.0 correct, 0.0 otherwise)"
+    else:
+        reward_fn = CountdownWithFormatRewardFn()
+        reward_type = "format-shaped (partial credit for structure)"
+
     print()
     print("=" * 60)
     print("GRPO Training on Countdown Task")
@@ -94,6 +106,7 @@ def main():
     print(f"Max tokens: {args.max_tokens}")
     print(f"Learning rate: {args.lr}")
     print(f"KL beta: {args.beta}")
+    print(f"Reward: {reward_type}")
     print("Task: Easy countdown (3 numbers, 1-10, target 1-20)")
     print("=" * 60)
     print()
@@ -102,10 +115,10 @@ def main():
         net=net,
         opt=opt,
         env=env,
-        reward_fn=CountdownRewardFn(),
+        reward_fn=reward_fn,
         state_to_str=countdown_state_to_str,
         tokenizer=tokenizer,
-        eos_token_id=151643,
+        eos_token_id=151645,  # <|im_end|>
         pad_token_id=151643,
         extractor=extract_from_answer_tags,
         beta=args.beta,

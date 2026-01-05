@@ -205,14 +205,16 @@ def train_grpo(
         tokenizer.enable_padding(direction="left")
         tokens = tokenizer.encode_batch(prompts)
         # shape [B, L]
-        attention_mask = torch.tensor(
-            [t.attention_mask for t in tokens], device=device
-        ).bool()
+        # Model expects True = masked/padding, tokenizer gives 1 = attend, so invert
+        attention_mask = (
+            torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+        )
 
         token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
         # generate `group_size` many completions for each batch
         # list of length `group_size`
+        net.eval()
         completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
             generate_from_tokens(
                 net=net,
@@ -227,8 +229,13 @@ def train_grpo(
             )
             for _ in range(group_size)
         ]
+        net.train()
 
-        output_strs = [tokenizer.decode_batch(c.tolist()) for c in completion_token_ids]
+        prompt_len = token_ids.shape[1]
+        output_strs = [
+            tokenizer.decode_batch(c[:, prompt_len:].tolist())
+            for c in completion_token_ids
+        ]
         rewards: Float[torch.Tensor, "G B"] = torch.tensor(
             [
                 [
@@ -287,5 +294,16 @@ def train_grpo(
                 f"mean_reward={metrics.mean_rewards[-1]:.4f}, "
                 f"episodes={n_episodes}/{max_episodes}"
             )
+            sample_prompt = (
+                prompts[0][:100] + "..." if len(prompts[0]) > 100 else prompts[0]
+            )
+            sample_output = output_strs[0][0]
+            sample_reward = rewards[0, 0].item()
+            print(f"  Prompt: {sample_prompt}")
+            print(
+                f"  Output: {sample_output[:200]}{'...' if len(sample_output) > 200 else ''}"
+            )
+            print(f"  Reward: {sample_reward:.2f}")
+            print()
 
     return metrics
