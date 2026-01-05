@@ -299,9 +299,12 @@ def train_grpo(
             )
             sample_output = output_strs[0][0]
             sample_reward = rewards[0, 0].item()
+            sample_gen_len = completion_token_ids[0].shape[1] - prompt_len
+            hit_max = sample_gen_len >= max_tokens_generated
             print(f"  Prompt: {sample_prompt}")
             print(
-                f"  Output: {sample_output[:200]}{'...' if len(sample_output) > 200 else ''}"
+                f"  Output ({sample_gen_len} tokens{', HIT MAX' if hit_max else ''}): "
+                f"{sample_output[:200]}{'...' if len(sample_output) > 200 else ''}"
             )
             print(f"  Reward: {sample_reward:.2f}")
             print()
