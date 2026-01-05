@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generic
 
-from dialectic.rl.types import QA, A, EnvResponse, T
+from dialectic.rl.types import QA, A, Countdown, EnvResponse, T
 
 
 class EpisodeIsDoneError(RuntimeError):
@@ -143,6 +143,62 @@ class GSM8kEnv(Env[QA[float], None]):
 
         qa = self._get_question_and_answer(index)
         return EnvResponse(is_done=True, data=qa)
+
+    def step(self, action: None):
+        raise EpisodeIsDoneError
+
+
+class CountdownEnv(Env[Countdown, None]):
+    """
+    Countdown game environment.
+
+    Given N numbers and a target, find an arithmetic expression
+    using each number at most once that equals the target.
+
+    Parameters
+    ----------
+    num_operands : int
+        Number of operands to use. Default is 4.
+    min_number : int
+        Minimum value for operands. Default is 1.
+    max_number : int
+        Maximum value for operands. Default is 25.
+    max_target : int
+        Maximum target value. Default is 100.
+    """
+
+    def __init__(
+        self,
+        num_operands: int = 4,
+        min_number: int = 1,
+        max_number: int = 25,
+        max_target: int = 100,
+    ):
+        self.num_operands = num_operands
+        self.min_number = min_number
+        self.max_number = max_number
+        self.max_target = max_target
+        self.rng = random.Random()
+
+    def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
+        self.rng.seed(seed)
+        numbers = [
+            self.rng.randint(self.min_number, self.max_number)
+            for _ in range(self.num_operands)
+        ]
+        target = self.rng.randint(1, self.max_target)
+
+        prompt = (
+            f"Using the numbers {numbers}, create an equation that equals {target}. "
+            f"You can use +, -, *, / and each number at most once. "
+            f"Show your reasoning in <think></think> tags. "
+            f"Put your final equation in <answer></answer> tags."
+        )
+
+        return EnvResponse(
+            is_done=True,
+            data=Countdown(prompt=prompt, numbers=numbers, target=target),
+        )
 
     def step(self, action: None):
         raise EpisodeIsDoneError

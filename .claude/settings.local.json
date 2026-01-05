@@ -5,7 +5,14 @@
       "Bash(uv run pytest:*)",
       "Bash(TEST_LLM_AGAINST_HF=1 uv run pytest:*)",
       "WebSearch",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:verl.readthedocs.io)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:joschu.net)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:epichka.com)",
+      "WebFetch(domain:hlfshell.ai)",
+      "WebFetch(domain:cameronrwolfe.substack.com)"
     ]
   }
 }

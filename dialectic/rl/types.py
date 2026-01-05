@@ -17,3 +17,10 @@ class EnvResponse(Generic[T]):
 class QA[R]:
     question: str
     answer: R
+
+
+@dataclass
+class Countdown:
+    prompt: str
+    numbers: list[int]
+    target: int

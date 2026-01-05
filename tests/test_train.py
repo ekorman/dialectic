@@ -84,7 +84,7 @@ def test_compute_log_probs():
     ]
     attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.long)
 
-    result = compute_log_probs(
+    result, completion_mask = compute_log_probs(
         net=net,
         attention_mask=attention_mask,
         completion_token_ids=completion_token_ids,
@@ -92,6 +92,7 @@ def test_compute_log_probs():
     )
 
     assert result.shape == (batch_size, group_size, completion_len)
+    assert completion_mask.shape == (batch_size, group_size, completion_len)
 
     stacked = stack_and_pad(completion_token_ids, pad_token_id)
     all_logits = net.logits.view(batch_size, group_size, total_len, vocab_size)
@@ -108,3 +109,45 @@ def test_compute_log_probs():
                 expected[b, g, t] += all_log_probs[b, g, logit_pos, token_id]
 
     torch.testing.assert_close(result, expected)
+
+    expected_mask = stacked[:, :, prompt_len:] != pad_token_id
+    torch.testing.assert_close(completion_mask, expected_mask)
+
+
+def test_compute_logits_of_group_attention_mask_extended():
+    """Test that attention mask is correctly extended from prompt length to full sequence length."""
+    vocab_size = 10
+    d = 16
+    batch_size = 2
+    group_size = 3
+    prompt_len = 4
+    total_len = 7
+
+    class MockNetWithMaskCheck(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(vocab_size, d)
+            self.linear = nn.Linear(d, vocab_size)
+            self.received_mask_shape = None
+
+        def forward(self, x, return_all_logits=False, attention_mask=None):
+            self.received_mask_shape = (
+                attention_mask.shape if attention_mask is not None else None
+            )
+            emb = self.embed(x)
+            logits = self.linear(emb)
+            if not return_all_logits:
+                logits = logits[:, -1:]
+            return logits
+
+    net = MockNetWithMaskCheck()
+    input_ids = torch.randint(0, vocab_size, (batch_size, group_size, total_len))
+    attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.bool)
+    attention_mask[0, 0] = False
+
+    compute_logits_of_group(net=net, input_ids=input_ids, attention_mask=attention_mask)
+
+    expected_mask_shape = (batch_size * group_size, total_len)
+    assert net.received_mask_shape == expected_mask_shape, (
+        f"Expected mask shape {expected_mask_shape}, got {net.received_mask_shape}"
+    )
