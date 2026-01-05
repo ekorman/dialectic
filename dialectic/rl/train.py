@@ -1,0 +1,239 @@
+import warnings
+from copy import deepcopy
+from typing import Callable
+
+import torch
+import torch.nn as nn
+from jaxtyping import Bool, Float, Integer
+from tokenizers import Tokenizer
+
+from dialectic.llm.qwen import Qwen, generate_from_tokens
+from dialectic.rl.env import Env
+from dialectic.rl.reward import RewardFn
+from dialectic.rl.types import A, E, EnvResponse, T
+
+
+def rewards_to_go(
+    *,
+    batch_states: list[torch.Tensor],  # [b, n],
+    batch_rewards: list[torch.Tensor],
+    batch_actions: list[torch.Tensor],
+    discount_factor: float,
+) -> list[torch.Tensor]:  # length of list is b, and each tensor has variable length
+    ret = []
+    for rewards in batch_rewards:
+        d = torch.Tensor([discount_factor**i for i in range(len(rewards))])
+        ret.append(((rewards * d).flip(0)).cumsum(0).flip(0) / d)
+
+    return ret
+
+
+def compute_logits_of_group(
+    *,
+    net: nn.Module,
+    input_ids: Integer[torch.Tensor, "B G L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+) -> Float[torch.Tensor, "B G L VC"]:
+    batch_size, group_size, seq_len = input_ids.shape[:3]
+    input_ids = input_ids.view(batch_size * group_size, seq_len)
+    out = net(input_ids, return_all_logits=True, attention_mask=attention_mask)
+    out = out.view(batch_size, group_size, seq_len, -1)
+    return out
+
+
+def compute_log_probs(
+    *,
+    net: nn.Module,
+    attention_mask: Integer[torch.Tensor, "B L_prompt"],
+    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
+    pad_token_id: int,
+) -> Float[torch.Tensor, "B G L_new"]:
+    l_prompt = attention_mask.shape[1]
+    stacked = stack_and_pad(tensors=completion_token_ids, pad_token_id=pad_token_id)
+    logits: Float[torch.Tensor, "B G L_completion VC"] = compute_logits_of_group(
+        net=net,
+        input_ids=stacked,
+        attention_mask=attention_mask,
+    )
+
+    # get only the new part
+    logits = logits[:, :, l_prompt - 1 : -1]
+    log_probs = logits.log_softmax(-1)
+    only_completion = stacked[:, :, l_prompt:]
+    log_probs = log_probs.take_along_dim(only_completion.unsqueeze(-1), -1).squeeze(-1)
+
+    return log_probs
+
+
+def stack_and_pad(
+    tensors: list[Integer[torch.Tensor, "B G *"]], pad_token_id: int
+) -> Integer[torch.Tensor, "B G L"]:
+    max_len = max([t.shape[1] for t in tensors])
+    batch_size = tensors[0].shape[0]
+    group_size = len(tensors)
+    ret = torch.full(
+        (batch_size, group_size, max_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=tensors[0].device,
+    )
+    for g, t in enumerate(tensors):
+        ret[:, g, : t.shape[1]] = t
+    return ret
+
+
+def compute_advantages(
+    rewards: Float[torch.Tensor, "G B"], eps=1e-8
+) -> Float[torch.Tensor, "G B"]:
+    return (rewards - rewards.mean(0, keepdim=True)) / (
+        rewards.std(0, keepdim=True) + eps
+    )
+
+
+def get_batch(
+    env: Env, batch_size: int, state_to_str: Callable[[T], str]
+) -> list[EnvResponse]:
+    batch = []
+    for _ in range(batch_size):
+        env_response = env.reset()
+        if env_response is not None:
+            batch.append(state_to_str(env_response.data))
+            if not env_response.is_done:
+                # TODO: support multistep
+                raise RuntimeError("Only single step environments supported for now")
+        else:
+            warnings.warn("Got None response from `env.reset`")
+    return batch
+
+
+def grpo_step(
+    *,
+    opt: torch.optim.Optimizer,
+    log_probs: Float[torch.Tensor, "B G L_new"],
+    old_log_probs: Float[torch.Tensor, "B G L_new"] | None,
+    ref_log_probs: Float[torch.Tensor, "B G L_new"],
+    beta: float,
+    eps: float,
+    rewards: Float[torch.Tensor, "G B L_new"],
+):
+    batch_size, g = log_probs.shape[:2]
+    old_log_probs = old_log_probs or log_probs.detach()
+
+    advs: Float[torch.Tensor, "B G"] = compute_advantages(rewards).T.view(
+        batch_size, g, 1
+    )
+    ratio = (log_probs - old_log_probs).exp()
+    unclipped = ratio * advs
+    clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
+
+    ppo_loss = torch.min(unclipped, clipped)
+
+    kl = (log_probs - ref_log_probs).exp() - 1
+
+    loss = (-ppo_loss + beta * kl).mean()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+
+# TODO: also need a ref model
+def train_grpo(
+    *,
+    net: Qwen,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],  # assume single step
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[str], E],
+    beta: float,
+    eps: float,
+    mu: int,  # number of optimizations per batch
+    max_tokens_generated: int,
+    max_episodes: int,
+    update_ref_net_batch_cadence: int,
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+):
+    n_episodes = 0
+    n_batches = 0
+
+    while n_episodes < max_episodes:
+        if n_batches % update_ref_net_batch_cadence == 0:
+            ref_net = deepcopy(net)
+
+        batch = get_batch(env, batch_size, state_to_str)
+        # TODO: need a specific token id for padding if using an attention mask?
+        tokenizer.enable_padding(direction="left")
+        tokens = tokenizer.encode_batch(batch)
+        # shape [B, L]
+        attention_mask = torch.stack([t.attention_mask for t in tokens]).bool()
+
+        token_ids = torch.stack([t.ids for t in tokens])
+
+        # generate `group_size` many completions for each batch
+        # list of length `group_size`
+        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
+            generate_from_tokens(
+                net=net,
+                token_ids=token_ids,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                sampling_strategy="sample",
+                temperature=temperature,
+                attention_mask=attention_mask,
+                use_kv_cache=True,
+                max_tokens_generated=max_tokens_generated,
+            )
+            for _ in range(group_size)
+        ]
+
+        output_strs = [tokenizer.decode_batch(c.tolist()) for c in completion_token_ids]
+        rewards: Float[torch.Tensor, "G B"] = torch.Tensor(
+            [
+                [
+                    reward_fn(
+                        env_response=env_response,
+                        raw_model_output=s,
+                        extracted_model_output=extractor(s),
+                    )
+                    for s, env_response in zip(group_batch, batch)
+                ]
+                for group_batch in output_strs
+            ]
+        )
+
+        with torch.inference_mode():
+            ref_log_probs = compute_log_probs(
+                net=ref_net,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_token_ids,
+                pad_token_id=pad_token_id,
+            )
+
+        old_log_probs = None
+        for _ in range(mu):
+            log_probs = compute_log_probs(
+                net=net,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_token_ids,
+                pad_token_id=pad_token_id,
+            )
+
+            grpo_step(
+                opt=opt,
+                log_probs=log_probs,
+                old_log_probs=old_log_probs,
+                ref_log_probs=ref_log_probs,
+                beta=beta,
+                eps=eps,
+                rewards=rewards,
+            )
+
+            old_log_probs = log_probs.detach()
+
+        n_batches += 1
+        n_episodes += len(batch)
