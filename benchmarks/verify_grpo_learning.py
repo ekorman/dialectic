@@ -11,6 +11,7 @@ Usage:
 import argparse
 from pathlib import Path
 
+import extty
 import torch
 from tokenizers import Tokenizer
 
@@ -110,6 +111,8 @@ def main():
     print("Task: Easy countdown (3 numbers, 1-10, target 1-20)")
     print("=" * 60)
     print()
+
+    extty.init("grpo-learning", config=vars(args))
 
     metrics = train_grpo(
         net=net,

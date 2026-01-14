@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Callable
 
+import extty
 import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
@@ -232,7 +233,9 @@ def train_grpo(
         net.train()
 
         prompt_len = token_ids.shape[1]
-        output_strs = [
+
+        # outer list has length G, inner last has length B
+        output_strs: list[list[str]] = [
             tokenizer.decode_batch(c[:, prompt_len:].tolist())
             for c in completion_token_ids
         ]
@@ -261,6 +264,7 @@ def train_grpo(
         completion_mask = completion_mask.clone()
 
         old_log_probs = None
+        total_loss = 0
         for _ in range(mu):
             log_probs, _ = compute_log_probs(
                 net=net,
@@ -269,7 +273,7 @@ def train_grpo(
                 pad_token_id=pad_token_id,
             )
 
-            loss = grpo_step(
+            total_loss += grpo_step(
                 opt=opt,
                 log_probs=log_probs,
                 old_log_probs=old_log_probs,
@@ -280,7 +284,7 @@ def train_grpo(
                 rewards=rewards,
                 normalize_advantages=normalize_advantages,
             )
-            metrics.losses.append(loss)
+            # metrics.losses.append(loss)
 
             old_log_probs = log_probs.detach()
 
@@ -288,25 +292,25 @@ def train_grpo(
         n_batches += 1
         n_episodes += len(prompts)
 
-        if verbose:
-            print(
-                f"Batch {n_batches}: loss={metrics.losses[-1]:.4f}, "
-                f"mean_reward={metrics.mean_rewards[-1]:.4f}, "
-                f"episodes={n_episodes}/{max_episodes}"
-            )
-            sample_prompt = (
-                prompts[0][:100] + "..." if len(prompts[0]) > 100 else prompts[0]
-            )
-            sample_output = output_strs[0][0]
-            sample_reward = rewards[0, 0].item()
-            sample_gen_len = completion_token_ids[0].shape[1] - prompt_len
-            hit_max = sample_gen_len >= max_tokens_generated
-            print(f"  Prompt: {sample_prompt}")
-            print(
-                f"  Output ({sample_gen_len} tokens{', HIT MAX' if hit_max else ''}): "
-                f"{sample_output[:200]}{'...' if len(sample_output) > 200 else ''}"
-            )
-            print(f"  Reward: {sample_reward:.2f}")
-            print()
+        completion_len_mean = sum(
+            [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
+        ) / (len(output_strs) * len(output_strs[0]))
+
+        extty.log(
+            {
+                "train/loss": total_loss / mu,
+                "train/reward_mean": rewards.mean().item(),
+                "train/reward_std": rewards.std().item(),
+                "train/completion_len_mean": completion_len_mean,
+                **{
+                    "train/example_{i}": {
+                        "prompt": prompts[i],
+                        "response": output_strs[i],
+                    }
+                    for i in range(len(prompts))
+                },
+            },
+            step=n_episodes,
+        )
 
     return metrics
