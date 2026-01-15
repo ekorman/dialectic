@@ -167,7 +167,6 @@ def grpo_step(
     return loss.item()
 
 
-# TODO: also need a ref model
 def train_grpo(
     *,
     net: Qwen,
@@ -189,12 +188,10 @@ def train_grpo(
     group_size: int,
     temperature: float,
     normalize_advantages: bool = True,
-    verbose: bool = False,
-) -> GRPOMetrics:
-    metrics = GRPOMetrics()
+) -> None:
+    # metrics = GRPOMetrics()
     n_episodes = 0
     n_batches = 0
-
     while n_episodes < max_episodes:
         if n_batches % update_ref_net_batch_cadence == 0:
             ref_net = deepcopy(net)
@@ -261,9 +258,15 @@ def train_grpo(
                 completion_token_ids=completion_token_ids,
                 pad_token_id=pad_token_id,
             )
+            old_log_probs, _ = compute_log_probs(
+                net=net,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_token_ids,
+                pad_token_id=pad_token_id,
+            )
+        old_log_probs = old_log_probs.detach()
         completion_mask = completion_mask.clone()
 
-        old_log_probs = None
         total_loss = 0
         for _ in range(mu):
             log_probs, _ = compute_log_probs(
@@ -284,11 +287,7 @@ def train_grpo(
                 rewards=rewards,
                 normalize_advantages=normalize_advantages,
             )
-            # metrics.losses.append(loss)
 
-            old_log_probs = log_probs.detach()
-
-        metrics.mean_rewards.append(rewards.mean().item())
         n_batches += 1
         n_episodes += len(prompts)
 
@@ -303,7 +302,7 @@ def train_grpo(
                 "train/reward_std": rewards.std().item(),
                 "train/completion_len_mean": completion_len_mean,
                 **{
-                    "train/example_{i}": {
+                    f"train/example_{i}": {
                         "prompt": prompts[i],
                         "response": output_strs[i],
                     }
@@ -312,5 +311,3 @@ def train_grpo(
             },
             step=n_episodes,
         )
-
-    return metrics
