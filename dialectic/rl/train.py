@@ -1,6 +1,7 @@
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 import extty
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
@@ -190,103 +192,125 @@ def train_grpo(
     temperature: float,
     normalize_advantages: bool = True,
     verbose: bool = False,
+    profile_dir: str | Path | None = None,
+    profile_wait: int = 1,
+    profile_warmup: int = 1,
+    profile_active: int = 3,
+    profile_repeat: int = 1,
 ) -> GRPOMetrics:
     metrics = GRPOMetrics()
     n_episodes = 0
     n_batches = 0
+    ref_net: Qwen | None = None
 
-    while n_episodes < max_episodes:
-        if n_batches % update_ref_net_batch_cadence == 0:
-            ref_net = deepcopy(net)
+    def _train_step(prof: profile | None = None) -> bool:
+        """Run a single training step. Returns True if training should continue."""
+        nonlocal n_episodes, n_batches, metrics, ref_net
 
-        env_responses = get_batch(env, batch_size)
-        prompts = [state_to_str(resp.data) for resp in env_responses]
-        device = next(net.parameters()).device
+        if n_episodes >= max_episodes:
+            return False
 
-        tokenizer.enable_padding(direction="left")
-        tokens = tokenizer.encode_batch(prompts)
-        # shape [B, L]
-        # Model expects True = masked/padding, tokenizer gives 1 = attend, so invert
-        attention_mask = (
-            torch.tensor([t.attention_mask for t in tokens], device=device) == 0
-        )
+        with record_function("update_ref_net"):
+            if n_batches % update_ref_net_batch_cadence == 0:
+                ref_net = deepcopy(net)
+        assert ref_net is not None
 
-        token_ids = torch.tensor([t.ids for t in tokens], device=device)
+        with record_function("get_batch"):
+            env_responses = get_batch(env, batch_size)
+            prompts = [state_to_str(resp.data) for resp in env_responses]
+            device = next(net.parameters()).device
+
+        with record_function("tokenize"):
+            tokenizer.enable_padding(direction="left")
+            tokens = tokenizer.encode_batch(prompts)
+            # shape [B, L]
+            # Model expects True = masked/padding, tokenizer gives 1 = attend, so invert
+            attention_mask = (
+                torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+            )
+
+            token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
         # generate `group_size` many completions for each batch
         # list of length `group_size`
-        net.eval()
-        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
-            generate_from_tokens(
-                net=net,
-                token_ids=token_ids,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-                sampling_strategy="sample",
-                temperature=temperature,
-                attention_mask=attention_mask,
-                use_kv_cache=True,
-                max_tokens_generated=max_tokens_generated,
-            )
-            for _ in range(group_size)
-        ]
-        net.train()
+        with record_function("generate_completions"):
+            net.eval()
+            completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
+                generate_from_tokens(
+                    net=net,
+                    token_ids=token_ids,
+                    pad_token_id=pad_token_id,
+                    eos_token_id=eos_token_id,
+                    sampling_strategy="sample",
+                    temperature=temperature,
+                    attention_mask=attention_mask,
+                    use_kv_cache=True,
+                    max_tokens_generated=max_tokens_generated,
+                )
+                for _ in range(group_size)
+            ]
+            net.train()
 
         prompt_len = token_ids.shape[1]
 
-        # outer list has length G, inner last has length B
-        output_strs: list[list[str]] = [
-            tokenizer.decode_batch(c[:, prompt_len:].tolist())
-            for c in completion_token_ids
-        ]
-        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
-            [
+        with record_function("decode_and_compute_rewards"):
+            # outer list has length G, inner last has length B
+            output_strs: list[list[str]] = [
+                tokenizer.decode_batch(c[:, prompt_len:].tolist())
+                for c in completion_token_ids
+            ]
+            rewards: Float[torch.Tensor, "G B"] = torch.tensor(
                 [
-                    reward_fn(
-                        env_response=env_response,
-                        raw_model_output=s,
-                        extracted_model_output=extractor(s),
-                    )
-                    for s, env_response in zip(group_batch, env_responses)
-                ]
-                for group_batch in output_strs
-            ],
-            device=device,
-        )
-
-        with torch.inference_mode():
-            ref_log_probs, completion_mask = compute_log_probs(
-                net=ref_net,
-                attention_mask=attention_mask,
-                completion_token_ids=completion_token_ids,
-                pad_token_id=pad_token_id,
+                    [
+                        reward_fn(
+                            env_response=env_response,
+                            raw_model_output=s,
+                            extracted_model_output=extractor(s),
+                        )
+                        for s, env_response in zip(group_batch, env_responses)
+                    ]
+                    for group_batch in output_strs
+                ],
+                device=device,
             )
-        completion_mask = completion_mask.clone()
+
+        with record_function("compute_ref_log_probs"):
+            with torch.inference_mode():
+                ref_log_probs, completion_mask = compute_log_probs(
+                    net=ref_net,
+                    attention_mask=attention_mask,
+                    completion_token_ids=completion_token_ids,
+                    pad_token_id=pad_token_id,
+                )
+            completion_mask = completion_mask.clone()
 
         old_log_probs = None
         total_loss = 0
-        for _ in range(mu):
-            log_probs, _ = compute_log_probs(
-                net=net,
-                attention_mask=attention_mask,
-                completion_token_ids=completion_token_ids,
-                pad_token_id=pad_token_id,
-            )
+        for mu_step in range(mu):
+            with record_function(f"optimization_step_{mu_step}"):
+                with record_function("compute_log_probs"):
+                    log_probs, _ = compute_log_probs(
+                        net=net,
+                        attention_mask=attention_mask,
+                        completion_token_ids=completion_token_ids,
+                        pad_token_id=pad_token_id,
+                    )
 
-            total_loss += grpo_step(
-                opt=opt,
-                log_probs=log_probs,
-                old_log_probs=old_log_probs,
-                ref_log_probs=ref_log_probs,
-                completion_mask=completion_mask,
-                beta=beta,
-                eps=eps,
-                rewards=rewards,
-                normalize_advantages=normalize_advantages,
-            )
-            # metrics.losses.append(loss)
+                with record_function("grpo_step"):
+                    total_loss += grpo_step(
+                        opt=opt,
+                        log_probs=log_probs,
+                        old_log_probs=old_log_probs,
+                        ref_log_probs=ref_log_probs,
+                        completion_mask=completion_mask,
+                        beta=beta,
+                        eps=eps,
+                        rewards=rewards,
+                        normalize_advantages=normalize_advantages,
+                    )
+                # metrics.losses.append(loss)
 
-            old_log_probs = log_probs.detach()
+                old_log_probs = log_probs.detach()
 
         metrics.mean_rewards.append(rewards.mean().item())
         n_batches += 1
@@ -312,5 +336,87 @@ def train_grpo(
             },
             step=n_episodes,
         )
+
+        if prof is not None:
+            prof.step()
+
+        return True
+
+    if profile_dir is not None:
+        profile_dir = Path(profile_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        prof_schedule = schedule(
+            wait=profile_wait,
+            warmup=profile_warmup,
+            active=profile_active,
+            repeat=profile_repeat,
+        )
+
+        def trace_handler(p: profile) -> None:
+            output_path = profile_dir / f"trace_{p.step_num}.json"
+            p.export_chrome_trace(str(output_path))
+
+            # Also export memory timeline if CUDA is available
+            if torch.cuda.is_available():
+                try:
+                    memory_path = profile_dir / f"memory_{p.step_num}.html"
+                    p.export_memory_timeline(str(memory_path))
+                except Exception as e:
+                    warnings.warn(f"Failed to export memory timeline: {e}")
+
+            # Print summary table
+            print(f"\n{'='*60}")
+            print(f"Profiler Step {p.step_num}")
+            print(f"{'='*60}")
+
+            # CPU/CUDA time table
+            print("\nTime Summary (sorted by CUDA time):")
+            print(
+                p.key_averages().table(
+                    sort_by="cuda_time_total", row_limit=20, max_name_column_width=50
+                )
+            )
+
+            # Memory summary if available
+            if torch.cuda.is_available():
+                print("\nMemory Summary (sorted by CUDA memory):")
+                print(
+                    p.key_averages().table(
+                        sort_by="cuda_memory_usage",
+                        row_limit=20,
+                        max_name_column_width=50,
+                    )
+                )
+
+            # Stacks summary for memory
+            print("\nMemory by Source (top allocations):")
+            print(
+                p.key_averages(group_by_stack_n=5).table(
+                    sort_by="self_cuda_memory_usage",
+                    row_limit=10,
+                    max_name_column_width=50,
+                )
+            )
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        with profile(
+            activities=activities,
+            schedule=prof_schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        ) as prof:
+            while _train_step(prof):
+                pass
+    else:
+        while _train_step():
+            pass
 
     return metrics
