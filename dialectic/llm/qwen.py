@@ -79,34 +79,64 @@ def attention(
     causal: bool = False,
     attention_mask: Bool[Tensor, "B L"] | None = None,
 ) -> Float[Tensor, "B NH L DHead"]:
-    num_heads, seq_length, head_d = q.shape[-3:]
-
-    num_kv_heads = k.shape[1]
-
-    if num_kv_heads != num_heads:
-        k = k.repeat_interleave(num_heads // num_kv_heads, 1)
-        v = v.repeat_interleave(num_heads // num_kv_heads, 1)
-
-    dot_prods: torch.Tensor = torch.matmul(q, k.transpose(3, 2)) / (head_d**0.5)
-
+    sdpa_mask = None
     if attention_mask is not None:
-        # attention_mask shape: (B, k_len), True = masked/padding
-        # expand to (B, 1, 1, k_len) for broadcasting with (B, NH, q_len, k_len)
-        key_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        dot_prods.masked_fill_(key_mask, -torch.inf)
+        # Invert and reshape to (B, 1, 1, L) for broadcasting
+        sdpa_mask = ~attention_mask.view(
+            attention_mask.shape[0], 1, 1, attention_mask.shape[1]
+        )
+
+    use_sdpa_causal = False
+
+    seq_length = q.shape[-2]
 
     if causal:
-        dot_prods.masked_fill_(
-            torch.ones(seq_length, seq_length, device=dot_prods.device)
-            .triu(diagonal=1)
-            .bool(),
-            -torch.inf,
-        )
-    soft_max_dot_prods = (dot_prods).softmax(-1)
-    # NaNs can occur when entire rows are -inf (all keys masked for a query)
-    soft_max_dot_prods = torch.nan_to_num(soft_max_dot_prods, nan=0.0)
+        if seq_length > 1:
+            # Training / Prefill case
+            if sdpa_mask is not None:
+                causal_mask = torch.ones(
+                    seq_length, seq_length, device=q.device, dtype=torch.bool
+                ).tril()
+                sdpa_mask = sdpa_mask & causal_mask
+            else:
+                use_sdpa_causal = True
+    return nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=sdpa_mask,  # SDPA handles causal masking automatically via is_causal=True
+        dropout_p=0.0,
+        is_causal=use_sdpa_causal,
+        enable_gqa=True,
+    )
+    # num_heads, seq_length, head_d = q.shape[-3:]
 
-    return torch.matmul(soft_max_dot_prods, v)
+    # num_kv_heads = k.shape[1]
+
+    # if num_kv_heads != num_heads:
+    #     k = k.repeat_interleave(num_heads // num_kv_heads, 1)
+    #     v = v.repeat_interleave(num_heads // num_kv_heads, 1)
+
+    # dot_prods: torch.Tensor = torch.matmul(q, k.transpose(3, 2)) / (head_d**0.5)
+
+    # if attention_mask is not None:
+    #     # attention_mask shape: (B, k_len), True = masked/padding
+    #     # expand to (B, 1, 1, k_len) for broadcasting with (B, NH, q_len, k_len)
+    #     key_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+    #     dot_prods.masked_fill_(key_mask, -torch.inf)
+
+    # if causal:
+    #     dot_prods.masked_fill_(
+    #         torch.ones(seq_length, seq_length, device=dot_prods.device)
+    #         .triu(diagonal=1)
+    #         .bool(),
+    #         -torch.inf,
+    #     )
+    # soft_max_dot_prods = (dot_prods).softmax(-1)
+    # # NaNs can occur when entire rows are -inf (all keys masked for a query)
+    # soft_max_dot_prods = torch.nan_to_num(soft_max_dot_prods, nan=0.0)
+
+    # return torch.matmul(soft_max_dot_prods, v)
 
 
 # for our RoPE implementation we follow huggingface where they split the vector into first and second half
