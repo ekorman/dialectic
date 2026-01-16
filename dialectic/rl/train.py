@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
-from torch.profiler import ProfilerActivity, profile, record_function, schedule
+from torch.profiler import ProfilerActivity, profile, schedule
 
 from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
@@ -201,26 +201,81 @@ def train_grpo(
     metrics = GRPOMetrics()
     n_episodes = 0
     n_batches = 0
-    ref_net: Qwen | None = None
 
-    def _train_step(prof: profile | None = None) -> bool:
-        """Run a single training step. Returns True if training should continue."""
-        nonlocal n_episodes, n_batches, metrics, ref_net
+    # Setup profiler if requested
+    prof: profile | None = None
+    if profile_dir is not None:
+        profile_path = Path(profile_dir)
+        profile_path.mkdir(parents=True, exist_ok=True)
 
-        if n_episodes >= max_episodes:
-            return False
+        def trace_handler(p: profile) -> None:
+            output_path = profile_path / f"trace_{p.step_num}.json"
+            p.export_chrome_trace(str(output_path))
 
-        with record_function("update_ref_net"):
+            if torch.cuda.is_available():
+                try:
+                    memory_path = profile_path / f"memory_{p.step_num}.html"
+                    p.export_memory_timeline(str(memory_path))
+                except Exception as e:
+                    warnings.warn(f"Failed to export memory timeline: {e}")
+
+            print(f"\n{'='*60}")
+            print(f"Profiler Step {p.step_num}")
+            print(f"{'='*60}")
+            print("\nTime Summary (sorted by CUDA time):")
+            print(
+                p.key_averages().table(
+                    sort_by="cuda_time_total", row_limit=20, max_name_column_width=50
+                )
+            )
+            if torch.cuda.is_available():
+                print("\nMemory Summary (sorted by CUDA memory):")
+                print(
+                    p.key_averages().table(
+                        sort_by="cuda_memory_usage",
+                        row_limit=20,
+                        max_name_column_width=50,
+                    )
+                )
+            print("\nMemory by Source (top allocations):")
+            print(
+                p.key_averages(group_by_stack_n=5).table(
+                    sort_by="self_cuda_memory_usage",
+                    row_limit=10,
+                    max_name_column_width=50,
+                )
+            )
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        prof = profile(
+            activities=activities,
+            schedule=schedule(
+                wait=profile_wait,
+                warmup=profile_warmup,
+                active=profile_active,
+                repeat=profile_repeat,
+            ),
+            on_trace_ready=trace_handler,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        )
+        prof.__enter__()
+
+    try:
+        while n_episodes < max_episodes:
             if n_batches % update_ref_net_batch_cadence == 0:
                 ref_net = deepcopy(net)
-        assert ref_net is not None
 
-        with record_function("get_batch"):
             env_responses = get_batch(env, batch_size)
             prompts = [state_to_str(resp.data) for resp in env_responses]
             device = next(net.parameters()).device
 
-        with record_function("tokenize"):
             tokenizer.enable_padding(direction="left")
             tokens = tokenizer.encode_batch(prompts)
             # shape [B, L]
@@ -231,9 +286,8 @@ def train_grpo(
 
             token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
-        # generate `group_size` many completions for each batch
-        # list of length `group_size`
-        with record_function("generate_completions"):
+            # generate `group_size` many completions for each batch
+            # list of length `group_size`
             net.eval()
             completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
                 generate_from_tokens(
@@ -251,9 +305,8 @@ def train_grpo(
             ]
             net.train()
 
-        prompt_len = token_ids.shape[1]
+            prompt_len = token_ids.shape[1]
 
-        with record_function("decode_and_compute_rewards"):
             # outer list has length G, inner last has length B
             output_strs: list[list[str]] = [
                 tokenizer.decode_batch(c[:, prompt_len:].tolist())
@@ -274,7 +327,6 @@ def train_grpo(
                 device=device,
             )
 
-        with record_function("compute_ref_log_probs"):
             with torch.inference_mode():
                 ref_log_probs, completion_mask = compute_log_probs(
                     net=ref_net,
@@ -284,139 +336,60 @@ def train_grpo(
                 )
             completion_mask = completion_mask.clone()
 
-        old_log_probs = None
-        total_loss = 0
-        for mu_step in range(mu):
-            with record_function(f"optimization_step_{mu_step}"):
-                with record_function("compute_log_probs"):
-                    log_probs, _ = compute_log_probs(
-                        net=net,
-                        attention_mask=attention_mask,
-                        completion_token_ids=completion_token_ids,
-                        pad_token_id=pad_token_id,
-                    )
+            old_log_probs = None
+            total_loss = 0
+            for _ in range(mu):
+                log_probs, _ = compute_log_probs(
+                    net=net,
+                    attention_mask=attention_mask,
+                    completion_token_ids=completion_token_ids,
+                    pad_token_id=pad_token_id,
+                )
 
-                with record_function("grpo_step"):
-                    total_loss += grpo_step(
-                        opt=opt,
-                        log_probs=log_probs,
-                        old_log_probs=old_log_probs,
-                        ref_log_probs=ref_log_probs,
-                        completion_mask=completion_mask,
-                        beta=beta,
-                        eps=eps,
-                        rewards=rewards,
-                        normalize_advantages=normalize_advantages,
-                    )
+                total_loss += grpo_step(
+                    opt=opt,
+                    log_probs=log_probs,
+                    old_log_probs=old_log_probs,
+                    ref_log_probs=ref_log_probs,
+                    completion_mask=completion_mask,
+                    beta=beta,
+                    eps=eps,
+                    rewards=rewards,
+                    normalize_advantages=normalize_advantages,
+                )
                 # metrics.losses.append(loss)
 
                 old_log_probs = log_probs.detach()
 
-        metrics.mean_rewards.append(rewards.mean().item())
-        n_batches += 1
-        n_episodes += len(prompts)
+            metrics.mean_rewards.append(rewards.mean().item())
+            n_batches += 1
+            n_episodes += len(prompts)
 
-        completion_len_mean = sum(
-            [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
-        ) / (len(output_strs) * len(output_strs[0]))
+            completion_len_mean = sum(
+                [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
+            ) / (len(output_strs) * len(output_strs[0]))
 
-        extty.log(
-            {
-                "train/loss": total_loss / mu,
-                "train/reward_mean": rewards.mean().item(),
-                "train/reward_std": rewards.std().item(),
-                "train/completion_len_mean": completion_len_mean,
-                **{
-                    "train/example_{i}": {
-                        "prompt": prompts[i],
-                        "response": output_strs[i],
-                    }
-                    for i in range(len(prompts))
+            extty.log(
+                {
+                    "train/loss": total_loss / mu,
+                    "train/reward_mean": rewards.mean().item(),
+                    "train/reward_std": rewards.std().item(),
+                    "train/completion_len_mean": completion_len_mean,
+                    **{
+                        "train/example_{i}": {
+                            "prompt": prompts[i],
+                            "response": output_strs[i],
+                        }
+                        for i in range(len(prompts))
+                    },
                 },
-            },
-            step=n_episodes,
-        )
+                step=n_episodes,
+            )
 
+            if prof is not None:
+                prof.step()
+    finally:
         if prof is not None:
-            prof.step()
-
-        return True
-
-    if profile_dir is not None:
-        profile_dir = Path(profile_dir)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
-        prof_schedule = schedule(
-            wait=profile_wait,
-            warmup=profile_warmup,
-            active=profile_active,
-            repeat=profile_repeat,
-        )
-
-        def trace_handler(p: profile) -> None:
-            output_path = profile_dir / f"trace_{p.step_num}.json"
-            p.export_chrome_trace(str(output_path))
-
-            # Also export memory timeline if CUDA is available
-            if torch.cuda.is_available():
-                try:
-                    memory_path = profile_dir / f"memory_{p.step_num}.html"
-                    p.export_memory_timeline(str(memory_path))
-                except Exception as e:
-                    warnings.warn(f"Failed to export memory timeline: {e}")
-
-            # Print summary table
-            print(f"\n{'='*60}")
-            print(f"Profiler Step {p.step_num}")
-            print(f"{'='*60}")
-
-            # CPU/CUDA time table
-            print("\nTime Summary (sorted by CUDA time):")
-            print(
-                p.key_averages().table(
-                    sort_by="cuda_time_total", row_limit=20, max_name_column_width=50
-                )
-            )
-
-            # Memory summary if available
-            if torch.cuda.is_available():
-                print("\nMemory Summary (sorted by CUDA memory):")
-                print(
-                    p.key_averages().table(
-                        sort_by="cuda_memory_usage",
-                        row_limit=20,
-                        max_name_column_width=50,
-                    )
-                )
-
-            # Stacks summary for memory
-            print("\nMemory by Source (top allocations):")
-            print(
-                p.key_averages(group_by_stack_n=5).table(
-                    sort_by="self_cuda_memory_usage",
-                    row_limit=10,
-                    max_name_column_width=50,
-                )
-            )
-
-        activities = [ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(ProfilerActivity.CUDA)
-
-        with profile(
-            activities=activities,
-            schedule=prof_schedule,
-            on_trace_ready=trace_handler,
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            with_flops=True,
-            with_modules=True,
-        ) as prof:
-            while _train_step(prof):
-                pass
-    else:
-        while _train_step():
-            pass
+            prof.__exit__(None, None, None)
 
     return metrics
