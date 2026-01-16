@@ -232,28 +232,39 @@ def train_grpo(
                 mem_sort_key = "cpu_memory_usage"
                 self_mem_sort_key = "self_cpu_memory_usage"
 
-            print(f"\nTime Summary (sorted by {time_sort_key}):")
-            print(
-                p.key_averages().table(
-                    sort_by=time_sort_key, row_limit=20, max_name_column_width=50
+            try:
+                print(f"\nTime Summary (sorted by {time_sort_key}):")
+                print(
+                    p.key_averages().table(
+                        sort_by=time_sort_key, row_limit=20, max_name_column_width=50
+                    )
                 )
-            )
-            print(f"\nMemory Summary (sorted by {mem_sort_key}):")
-            print(
-                p.key_averages().table(
-                    sort_by=mem_sort_key,
-                    row_limit=20,
-                    max_name_column_width=50,
+            except Exception as e:
+                print(f"Failed to print time summary: {e}")
+
+            try:
+                print(f"\nMemory Summary (sorted by {mem_sort_key}):")
+                print(
+                    p.key_averages().table(
+                        sort_by=mem_sort_key,
+                        row_limit=20,
+                        max_name_column_width=50,
+                    )
                 )
-            )
-            print("\nMemory by Source (top allocations):")
-            print(
-                p.key_averages(group_by_stack_n=5).table(
-                    sort_by=self_mem_sort_key,
-                    row_limit=10,
-                    max_name_column_width=50,
+            except Exception as e:
+                print(f"Failed to print memory summary: {e}")
+
+            try:
+                print("\nMemory by Source (top allocations):")
+                print(
+                    p.key_averages(group_by_stack_n=5).table(
+                        sort_by=self_mem_sort_key,
+                        row_limit=10,
+                        max_name_column_width=50,
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"Failed to print memory by source: {e}")
 
         activities = [ProfilerActivity.CPU]
         if torch.cuda.is_available():
