@@ -222,25 +222,34 @@ def train_grpo(
             print(f"\n{'=' * 60}")
             print(f"Profiler Step {p.step_num}")
             print(f"{'=' * 60}")
-            print("\nTime Summary (sorted by CUDA time):")
+
+            if torch.cuda.is_available():
+                time_sort_key = "cuda_time_total"
+                mem_sort_key = "cuda_memory_usage"
+                self_mem_sort_key = "self_cuda_memory_usage"
+            else:
+                time_sort_key = "cpu_time_total"
+                mem_sort_key = "cpu_memory_usage"
+                self_mem_sort_key = "self_cpu_memory_usage"
+
+            print(f"\nTime Summary (sorted by {time_sort_key}):")
             print(
                 p.key_averages().table(
-                    sort_by="cuda_time_total", row_limit=20, max_name_column_width=50
+                    sort_by=time_sort_key, row_limit=20, max_name_column_width=50
                 )
             )
-            if torch.cuda.is_available():
-                print("\nMemory Summary (sorted by CUDA memory):")
-                print(
-                    p.key_averages().table(
-                        sort_by="cuda_memory_usage",
-                        row_limit=20,
-                        max_name_column_width=50,
-                    )
+            print(f"\nMemory Summary (sorted by {mem_sort_key}):")
+            print(
+                p.key_averages().table(
+                    sort_by=mem_sort_key,
+                    row_limit=20,
+                    max_name_column_width=50,
                 )
+            )
             print("\nMemory by Source (top allocations):")
             print(
                 p.key_averages(group_by_stack_n=5).table(
-                    sort_by="self_cuda_memory_usage",
+                    sort_by=self_mem_sort_key,
                     row_limit=10,
                     max_name_column_width=50,
                 )
