@@ -142,7 +142,7 @@ def grpo_step(
     eps: float,
     rewards: Float[torch.Tensor, "G B"],
     normalize_advantages: bool = True,
-) -> float:
+) -> tuple[float, float, float]:
     batch_size, g = log_probs.shape[:2]
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
@@ -155,16 +155,18 @@ def grpo_step(
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
     ppo_loss = torch.min(unclipped, clipped)
+    kl_loss = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
 
-    kl = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+    mask_sum = completion_mask.sum()
+    ppo_loss = -(ppo_loss * completion_mask).sum() / mask_sum
+    kl_loss = (kl_loss * completion_mask).sum() / mask_sum
 
-    per_token_loss = -ppo_loss + beta * kl
-    loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+    loss = ppo_loss + beta * kl_loss
     opt.zero_grad()
     loss.backward()
     opt.step()
 
-    return loss.item()
+    return loss.item(), ppo_loss.item(), kl_loss.item()
 
 
 def train_grpo(
@@ -268,6 +270,8 @@ def train_grpo(
         completion_mask = completion_mask.clone()
 
         total_loss = 0
+        total_ppo_loss = 0
+        total_kl_loss = 0
         for _ in range(mu):
             log_probs, _ = compute_log_probs(
                 net=net,
@@ -276,7 +280,7 @@ def train_grpo(
                 pad_token_id=pad_token_id,
             )
 
-            total_loss += grpo_step(
+            step_loss, step_ppo_loss, step_kl_loss = grpo_step(
                 opt=opt,
                 log_probs=log_probs,
                 old_log_probs=old_log_probs,
@@ -287,6 +291,9 @@ def train_grpo(
                 rewards=rewards,
                 normalize_advantages=normalize_advantages,
             )
+            total_loss += step_loss
+            total_ppo_loss += step_ppo_loss
+            total_kl_loss += step_kl_loss
 
         n_batches += 1
         n_episodes += len(prompts)
@@ -295,19 +302,18 @@ def train_grpo(
             [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
         ) / (len(output_strs) * len(output_strs[0]))
 
+        # TODO: swap B and G to get right shape
+        # examples = extty.BatchExample(prompts=prompts, responses=output_strs)
+
         extty.log(
             {
                 "train/loss": total_loss / mu,
+                "train/ppo_loss": total_ppo_loss / mu,
+                "train/kl_loss": total_kl_loss / mu,
                 "train/reward_mean": rewards.mean().item(),
                 "train/reward_std": rewards.std().item(),
                 "train/completion_len_mean": completion_len_mean,
-                **{
-                    f"train/example_{i}": {
-                        "prompt": prompts[i],
-                        "response": output_strs[i],
-                    }
-                    for i in range(len(prompts))
-                },
+                # "train/example": examples,
             },
             step=n_episodes,
         )

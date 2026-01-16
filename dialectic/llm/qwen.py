@@ -428,7 +428,6 @@ def generate_from_tokens(
 
     batch_size = token_ids.shape[0]
     device = token_ids.device
-    print("device inside generate_from_tokens:", device)
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     all_token_ids = token_ids
