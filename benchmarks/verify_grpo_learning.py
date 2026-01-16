@@ -8,78 +8,94 @@ Usage:
     uv run python benchmarks/verify_grpo_learning.py --max-episodes 100
 """
 
-import argparse
-from pathlib import Path
-
 import extty
+import modal
 import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
+from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
 from dialectic.rl.types import Countdown
 
+bucket_name = "model-weights"
+r2_account_id = "a64c6da180648dd944675d311c296763"
 
-def get_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+app = modal.App()
+secret = modal.Secret.from_name(
+    "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+)
+
+image = modal.Image.debian_slim().uv_sync().add_local_python_source("dialectic")
 
 
 def countdown_state_to_str(data: Countdown) -> str:
     return data.prompt
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
-    parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
-    parser.add_argument(
-        "--max-episodes", type=int, default=50, help="Max training episodes"
-    )
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
-    parser.add_argument("--group-size", type=int, default=2, help="Group size for GRPO")
-    parser.add_argument(
-        "--max-tokens", type=int, default=100, help="Max tokens to generate"
-    )
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument(
-        "--beta", type=float, default=0.04, help="KL penalty coefficient"
-    )
-    parser.add_argument(
-        "--weights", default="weights/qwen3-0.6b.pth", help="Path to model weights"
-    )
-    parser.add_argument(
-        "--binary-reward",
-        action="store_true",
-        help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
-    )
-    args = parser.parse_args()
+TIMEOUT_HOURS = 1
 
-    device = args.device or get_device()
-    print(f"Device: {device}")
 
-    weights_path = Path(args.weights)
-    if not weights_path.exists():
-        print(f"Error: Weights not found at {weights_path}")
-        print("Download or generate weights first.")
-        return
+@app.function(
+    image=image,
+    gpu="A100-80GB",
+    volumes={
+        "/weights": modal.CloudBucketMount(
+            bucket_name=bucket_name,
+            bucket_endpoint_url=f"https://{r2_account_id}.r2.cloudflarestorage.com",
+            secret=secret,
+            read_only=True,
+        )
+    },
+    timeout=60 * 60 * TIMEOUT_HOURS,
+)
+def train(
+    *,
+    device: str | None = None,
+    max_episodes: int = 1000,
+    batch_size: int = 8,
+    group_size: int = 4,
+    max_tokens: int = 1000,
+    lr: float = 1e-5,
+    beta: float = 0.04,
+    weights_path: str = "/weights/qwen3-0.6b.pth",
+    tokenizer_path: str = "/weights/tokenizer.json",
+    binary_reward: bool = False,
+):
+    extty.init(
+        "grpo-learning",
+        config={
+            "max_episodes": max_episodes,
+            "batch_size": batch_size,
+            "group_size": group_size,
+            "max_tokens": max_tokens,
+            "lr": lr,
+            "beta": beta,
+            "binary_reward": binary_reward,
+        },
+        server=True,
+    )
 
-    print("Loading Qwen-0.6B...")
     net = load_qwen_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
     )
-    net = net.to(device)
+
     print(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
     )
 
-    tokenizer = Tokenizer.from_file("qwen-tokenizer/tokenizer.json")
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+
+    if binary_reward:
+        reward_fn = CountdownRewardFn()
+    else:
+        reward_fn = CountdownWithFormatRewardFn()
+
+    tokenizer = Tokenizer.from_file(tokenizer_path)
 
     env = CountdownEnv(
         num_operands=3,
@@ -87,34 +103,11 @@ def main():
         max_number=10,
         max_target=20,
     )
+    device = device or get_default_device()
+    print(f"device: {device}")
+    net = net.to(device)
 
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-
-    if args.binary_reward:
-        reward_fn = CountdownRewardFn()
-        reward_type = "binary (1.0 correct, 0.0 otherwise)"
-    else:
-        reward_fn = CountdownWithFormatRewardFn()
-        reward_type = "format-shaped (partial credit for structure)"
-
-    print()
-    print("=" * 60)
-    print("GRPO Training on Countdown Task")
-    print("=" * 60)
-    print(f"Batch size: {args.batch_size}")
-    print(f"Group size: {args.group_size}")
-    print(f"Max episodes: {args.max_episodes}")
-    print(f"Max tokens: {args.max_tokens}")
-    print(f"Learning rate: {args.lr}")
-    print(f"KL beta: {args.beta}")
-    print(f"Reward: {reward_type}")
-    print("Task: Easy countdown (3 numbers, 1-10, target 1-20)")
-    print("=" * 60)
-    print()
-
-    extty.init("grpo-learning", config=vars(args))
-
-    metrics = train_grpo(
+    train_grpo(
         net=net,
         opt=opt,
         env=env,
@@ -124,48 +117,61 @@ def main():
         eos_token_id=151645,  # <|im_end|>
         pad_token_id=151643,
         extractor=extract_from_answer_tags,
-        beta=args.beta,
+        beta=beta,
         eps=0.2,
         mu=1,
-        max_tokens_generated=args.max_tokens,
-        max_episodes=args.max_episodes,
+        max_tokens_generated=max_tokens,
+        max_episodes=max_episodes,
         update_ref_net_batch_cadence=10,
-        batch_size=args.batch_size,
-        group_size=args.group_size,
+        batch_size=batch_size,
+        group_size=group_size,
         temperature=0.7,
-        verbose=True,
     )
 
-    print()
-    print("=" * 60)
-    print("Summary")
-    print("=" * 60)
 
-    n_batches = len(metrics.mean_rewards)
-    print(f"Completed {n_batches} batches")
+# def main():
+#     parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
+#     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
+#     parser.add_argument(
+#         "--max-episodes", type=int, default=50, help="Max training episodes"
+#     )
+#     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
+#     parser.add_argument("--group-size", type=int, default=2, help="Group size for GRPO")
+#     parser.add_argument(
+#         "--max-tokens", type=int, default=100, help="Max tokens to generate"
+#     )
+#     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+#     parser.add_argument(
+#         "--beta", type=float, default=0.04, help="KL penalty coefficient"
+#     )
+#     parser.add_argument(
+#         "--weights", default="weights/qwen3-0.6b.pth", help="Path to model weights"
+#     )
+#     parser.add_argument(
+#         "--tokenizer",
+#         default="qwen-tokenizer/tokenizer.json",
+#         help="Path to model weights",
+#     )
+#     parser.add_argument(
+#         "--binary-reward",
+#         action="store_true",
+#         help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
+#     )
+#     args = parser.parse_args()
 
-    if n_batches >= 10:
-        early_rewards = metrics.mean_rewards[:5]
-        late_rewards = metrics.mean_rewards[-5:]
-        early_mean = sum(early_rewards) / len(early_rewards)
-        late_mean = sum(late_rewards) / len(late_rewards)
-
-        print(f"Early mean reward (first 5 batches): {early_mean:.4f}")
-        print(f"Late mean reward (last 5 batches): {late_mean:.4f}")
-        print(f"Improvement: {late_mean - early_mean:+.4f}")
-
-        if late_mean > early_mean:
-            print("\nLearning detected: rewards improved over training")
-        else:
-            print("\nNo clear learning signal detected")
-    elif n_batches > 0:
-        print(
-            f"Mean reward: {sum(metrics.mean_rewards) / len(metrics.mean_rewards):.4f}"
-        )
-        print("(Run with more episodes for learning comparison)")
-    else:
-        print("No batches completed")
+#     train(
+#         device=args.device,
+#         max_episodes=args.max_episodes,
+#         batch_size=args.batch_size,
+#         group_size=args.group_size,
+#         max_tokens=args.max_tokens,
+#         lr=args.lr,
+#         beta=args.beta,
+#         weights_path=args.weights,
+#         tokenizer_path=args.tokenizer,
+#         binary_reward=args.binary_reward,
+#     )
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

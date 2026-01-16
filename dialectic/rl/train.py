@@ -1,6 +1,5 @@
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
 from typing import Callable
 
 import extty
@@ -13,12 +12,6 @@ from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, T
-
-
-@dataclass
-class GRPOMetrics:
-    losses: list[float] = field(default_factory=list)
-    mean_rewards: list[float] = field(default_factory=list)
 
 
 def rewards_to_go(
@@ -191,7 +184,6 @@ def train_grpo(
     temperature: float,
     normalize_advantages: bool = True,
 ) -> None:
-    # metrics = GRPOMetrics()
     n_episodes = 0
     n_batches = 0
     while n_episodes < max_episodes:
