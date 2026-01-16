@@ -155,23 +155,22 @@ def apply_rope(
     cos: Float[Tensor, "B L D"],
 ) -> Float[Tensor, "B NH L D"]:
     rot = torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
-    sin = sin.to(x.device)
-    cos = cos.to(x.device)
+    # sin/cos should already be on correct device (cached as buffers)
     return x * cos.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(
         1
     ) + rot * sin.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(1)
 
 
 def create_rope_sine_cosine_tensors(
-    dim: int, base_value: float, context_length: int
+    dim: int,
+    base_value: float,
+    context_length: int,
+    device: str | torch.device | None = None,
 ) -> tuple[Float[Tensor, "1 L D"], Float[Tensor, "dim length"]]:
-    sin = torch.zeros([context_length, dim], dtype=torch.float32)
-    cos = torch.zeros([context_length, dim], dtype=torch.float32)
-
-    thetas = base_value ** (-2 * (torch.arange(dim // 2)) / dim)
+    thetas = base_value ** (-2 * (torch.arange(dim // 2, device=device)) / dim)
     thetas = thetas.repeat(2)
 
-    freqs = torch.outer(torch.arange(context_length), thetas)
+    freqs = torch.outer(torch.arange(context_length, device=device), thetas)
 
     sin = freqs.sin().view(1, context_length, dim)
     cos = freqs.cos().view(1, context_length, dim)
@@ -203,6 +202,7 @@ class MHSA(nn.Module):
         causal: bool = False,
         rope_base_value: float | None = None,
         apply_rms_norm: bool = False,
+        max_position_embeddings: int = 32768,
     ):
         super().__init__()
 
@@ -218,12 +218,21 @@ class MHSA(nn.Module):
 
         self.causal = causal  # ty: ignore[unresolved-attribute]
         self.use_rope = rope_base_value is not None  # ty: ignore[unresolved-attribute]
-        self.rope_base_value = rope_base_value  # ty: ignore[unresolved-attribute]
         self.apply_rms_norm = apply_rms_norm  # ty: ignore[unresolved-attribute]
 
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d)
             self.k_norm = RMSNorm(self.head_d)
+
+        # Precompute and cache RoPE sin/cos tensors
+        if self.use_rope and rope_base_value is not None:
+            sin, cos = create_rope_sine_cosine_tensors(
+                head_d,
+                base_value=rope_base_value,
+                context_length=max_position_embeddings,
+            )
+            self.register_buffer("rope_sin", sin, persistent=False)
+            self.register_buffer("rope_cos", cos, persistent=False)
 
     def forward(
         self,
@@ -248,15 +257,11 @@ class MHSA(nn.Module):
 
         if self.use_rope:
             position_offset = 0 if kv_cache is None else kv_cache.get_position_offset()
+            end_pos = position_offset + x.shape[1]
 
-            sin, cos = create_rope_sine_cosine_tensors(
-                self.head_d,
-                base_value=self.rope_base_value,
-                context_length=position_offset + x.shape[1],
-            )
-
-            sin = sin[:, position_offset : position_offset + x.shape[1]]
-            cos = cos[:, position_offset : position_offset + x.shape[1]]
+            # Slice from precomputed cached tensors
+            sin = self.rope_sin[:, position_offset:end_pos]
+            cos = self.rope_cos[:, position_offset:end_pos]
 
             q = apply_rope(q, sin=sin, cos=cos)
             k = apply_rope(k, sin=sin, cos=cos)
