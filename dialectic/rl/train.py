@@ -219,9 +219,9 @@ def train_grpo(
                 except Exception as e:
                     warnings.warn(f"Failed to export memory timeline: {e}")
 
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Profiler Step {p.step_num}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             print("\nTime Summary (sorted by CUDA time):")
             print(
                 p.key_averages().table(
@@ -364,6 +364,8 @@ def train_grpo(
             metrics.mean_rewards.append(rewards.mean().item())
             n_batches += 1
             n_episodes += len(prompts)
+
+            print("finished batch")
 
             completion_len_mean = sum(
                 [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
