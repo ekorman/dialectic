@@ -391,23 +391,26 @@ def train_grpo(
                 [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
             ) / (len(output_strs) * len(output_strs[0]))
 
+            # need to flip B/G for responses
+            examples = extty.BatchExample(
+                prompts=prompts,
+                responses=[
+                    [output_strs[j][i] for j in range(len(output_strs))]
+                    for i in range(len(output_strs[0]))
+                ],
+            )
+
             extty.log(
                 {
                     "train/loss": total_loss / mu,
                     "train/reward_mean": rewards.mean().item(),
                     "train/reward_std": rewards.std().item(),
                     "train/completion_len_mean": completion_len_mean,
-                    **{
-                        "train/example_{i}": {
-                            "prompt": prompts[i],
-                            "response": output_strs[i],
-                        }
-                        for i in range(len(prompts))
-                    },
+                    "train/example": examples,
                 },
                 step=n_episodes,
             )
-
+            print("done with episode")
             if prof is not None:
                 prof.step()
     finally:
