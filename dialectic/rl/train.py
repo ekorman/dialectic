@@ -302,8 +302,14 @@ def train_grpo(
             [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
         ) / (len(output_strs) * len(output_strs[0]))
 
-        # TODO: swap B and G to get right shape
-        # examples = extty.BatchExample(prompts=prompts, responses=output_strs)
+        # need to flip B/G for responses
+        examples = extty.BatchExample(
+            prompts=prompts,
+            responses=[
+                [output_strs[j][i] for j in range(len(output_strs))]
+                for i in range(len(output_strs[0]))
+            ],
+        )
 
         extty.log(
             {
@@ -313,7 +319,7 @@ def train_grpo(
                 "train/reward_mean": rewards.mean().item(),
                 "train/reward_std": rewards.std().item(),
                 "train/completion_len_mean": completion_len_mean,
-                # "train/example": examples,
+                "train/example": examples,
             },
             step=n_episodes,
         )
