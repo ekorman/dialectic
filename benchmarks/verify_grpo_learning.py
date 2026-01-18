@@ -114,7 +114,7 @@ def main():
 
     extty.init("grpo-learning", config=vars(args))
 
-    metrics = train_grpo(
+    train_grpo(
         net=net,
         opt=opt,
         env=env,
@@ -136,36 +136,6 @@ def main():
         verbose=True,
         profile_dir="./torch-profile",
     )
-
-    print()
-    print("=" * 60)
-    print("Summary")
-    print("=" * 60)
-
-    n_batches = len(metrics.mean_rewards)
-    print(f"Completed {n_batches} batches")
-
-    if n_batches >= 10:
-        early_rewards = metrics.mean_rewards[:5]
-        late_rewards = metrics.mean_rewards[-5:]
-        early_mean = sum(early_rewards) / len(early_rewards)
-        late_mean = sum(late_rewards) / len(late_rewards)
-
-        print(f"Early mean reward (first 5 batches): {early_mean:.4f}")
-        print(f"Late mean reward (last 5 batches): {late_mean:.4f}")
-        print(f"Improvement: {late_mean - early_mean:+.4f}")
-
-        if late_mean > early_mean:
-            print("\nLearning detected: rewards improved over training")
-        else:
-            print("\nNo clear learning signal detected")
-    elif n_batches > 0:
-        print(
-            f"Mean reward: {sum(metrics.mean_rewards) / len(metrics.mean_rewards):.4f}"
-        )
-        print("(Run with more episodes for learning comparison)")
-    else:
-        print("No batches completed")
 
 
 if __name__ == "__main__":

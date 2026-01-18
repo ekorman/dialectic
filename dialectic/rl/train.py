@@ -1,7 +1,6 @@
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
 
 import extty
@@ -190,11 +189,6 @@ def train_grpo(
     temperature: float,
     normalize_advantages: bool = True,
     verbose: bool = False,
-    profile_dir: str | Path | None = None,
-    profile_wait: int = 1,
-    profile_warmup: int = 1,
-    profile_active: int = 3,
-    profile_repeat: int = 1,
 ) -> None:
     n_episodes = 0
     n_batches = 0
