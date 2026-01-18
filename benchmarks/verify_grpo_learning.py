@@ -122,26 +122,29 @@ def main():
 
     extty.init("grpo-learning", config=vars(args))
 
-    train_grpo(
-        net=net,
-        opt=opt,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=countdown_state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=151645,  # <|im_end|>
-        pad_token_id=151643,
-        extractor=extract_from_answer_tags,
-        beta=args.beta,
-        eps=args.eps,
-        mu=args.mu,
-        max_tokens_generated=args.max_tokens,
-        max_episodes=args.max_episodes,
-        update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
-        batch_size=args.batch_size,
-        group_size=args.group_size,
-        temperature=args.temperature,
-    )
+    try:
+        train_grpo(
+            net=net,
+            opt=opt,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151645,  # <|im_end|>
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=args.beta,
+            eps=args.eps,
+            mu=args.mu,
+            max_tokens_generated=args.max_tokens,
+            max_episodes=args.max_episodes,
+            update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
+            batch_size=args.batch_size,
+            group_size=args.group_size,
+            temperature=args.temperature,
+        )
+    finally:
+        extty.finish()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,11 @@
       "WebFetch(domain:medium.com)",
       "WebFetch(domain:epichka.com)",
       "WebFetch(domain:hlfshell.ai)",
-      "WebFetch(domain:cameronrwolfe.substack.com)"
+      "WebFetch(domain:cameronrwolfe.substack.com)",
+      "WebFetch(domain:docs.pytorch.org)",
+      "Bash(python3:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:xihuai18.github.io)"
     ]
   }
 }
