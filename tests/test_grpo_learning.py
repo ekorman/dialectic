@@ -59,7 +59,6 @@ class TestGRPOMechanics:
             num_operands=2,
             min_number=1,
             max_number=5,
-            max_target=10,
         )
 
     def test_training_loop_completes(self, tiny_model, tokenizer, env):

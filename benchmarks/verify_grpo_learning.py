@@ -101,7 +101,6 @@ def train(
         num_operands=3,
         min_number=1,
         max_number=10,
-        max_target=20,
     )
     device = device or get_default_device()
     print(f"device: {device}")
