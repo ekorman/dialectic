@@ -79,14 +79,17 @@ def compute_log_probs(
         attention_mask=attention_mask,
     )
 
-    # get only the new part
     logits = logits[:, :, l_prompt - 1 : -1]
-    log_probs = logits.log_softmax(-1)
     only_completion = stacked[:, :, l_prompt:]
-    log_probs = log_probs.take_along_dim(only_completion.unsqueeze(-1), -1).squeeze(-1)
+
+    B, G, L, V = logits.shape
+    log_probs = -torch.nn.functional.cross_entropy(
+        logits.reshape(B * G * L, V),
+        only_completion.reshape(B * G * L),
+        reduction="none",
+    ).reshape(B, G, L)
 
     completion_mask = only_completion != pad_token_id
-
     return log_probs, completion_mask
 
 
@@ -197,9 +200,9 @@ def train_grpo(
 ) -> None:
     # metrics = GRPOMetrics()
     n_episodes = 0
-    n_batches = 0
+    step = 0
     while n_episodes < max_episodes:
-        if n_batches % update_ref_net_batch_cadence == 0:
+        if step % update_ref_net_batch_cadence == 0:
             ref_net = deepcopy(net)
 
         env_responses = get_batch(env, batch_size)
@@ -299,7 +302,7 @@ def train_grpo(
             total_ppo_loss += step_ppo_loss
             total_kl_loss += step_kl_loss
 
-        n_batches += 1
+        step += 1
         n_episodes += len(prompts)
 
         completion_len_mean = sum(
@@ -325,5 +328,5 @@ def train_grpo(
                 "train/completion_len_mean": completion_len_mean,
                 "train/example": examples,
             },
-            step=n_episodes,
+            step=step,
         )
