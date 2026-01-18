@@ -107,26 +107,29 @@ def train(
     print(f"device: {device}")
     net = net.to(device)
 
-    train_grpo(
-        net=net,
-        opt=opt,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=countdown_state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=151645,  # <|im_end|>
-        pad_token_id=151643,
-        extractor=extract_from_answer_tags,
-        beta=beta,
-        eps=0.2,
-        mu=1,
-        max_tokens_generated=max_tokens,
-        max_episodes=max_episodes,
-        update_ref_net_batch_cadence=10,
-        batch_size=batch_size,
-        group_size=group_size,
-        temperature=0.7,
-    )
+    try:
+        train_grpo(
+            net=net,
+            opt=opt,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151645,  # <|im_end|>
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=beta,
+            eps=0.2,
+            mu=1,
+            max_tokens_generated=max_tokens,
+            max_episodes=max_episodes,
+            update_ref_net_batch_cadence=10,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=0.7,
+        )
+    finally:
+        extty.finish()
 
 
 # def main():

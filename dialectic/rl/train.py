@@ -72,14 +72,17 @@ def compute_log_probs(
         attention_mask=attention_mask,
     )
 
-    # get only the new part
     logits = logits[:, :, l_prompt - 1 : -1]
-    log_probs = logits.log_softmax(-1)
     only_completion = stacked[:, :, l_prompt:]
-    log_probs = log_probs.take_along_dim(only_completion.unsqueeze(-1), -1).squeeze(-1)
+
+    B, G, L, V = logits.shape
+    log_probs = -torch.nn.functional.cross_entropy(
+        logits.reshape(B * G * L, V),
+        only_completion.reshape(B * G * L),
+        reduction="none",
+    ).reshape(B, G, L)
 
     completion_mask = only_completion != pad_token_id
-
     return log_probs, completion_mask
 
 
@@ -137,6 +140,7 @@ def grpo_step(
     normalize_advantages: bool = True,
 ) -> tuple[float, float, float]:
     batch_size, g = log_probs.shape[:2]
+    # will old_log_probs ever be None?
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
 
@@ -148,7 +152,10 @@ def grpo_step(
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
     ppo_loss = torch.min(unclipped, clipped)
-    kl_loss = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+    kl_diff = ref_log_probs - log_probs
+    kl_diff = torch.clamp(kl_diff, min=-20, max=20)
+    kl_loss = torch.exp(kl_diff) - kl_diff - 1
+    kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
     mask_sum = completion_mask.sum()
     ppo_loss = -(ppo_loss * completion_mask).sum() / mask_sum
@@ -185,9 +192,9 @@ def train_grpo(
     normalize_advantages: bool = True,
 ) -> None:
     n_episodes = 0
-    n_batches = 0
+    step = 0
     while n_episodes < max_episodes:
-        if n_batches % update_ref_net_batch_cadence == 0:
+        if step % update_ref_net_batch_cadence == 0:
             ref_net = deepcopy(net)
 
         env_responses = get_batch(env, batch_size)
@@ -287,15 +294,21 @@ def train_grpo(
             total_ppo_loss += step_ppo_loss
             total_kl_loss += step_kl_loss
 
-        n_batches += 1
+        step += 1
         n_episodes += len(prompts)
 
         completion_len_mean = sum(
             [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
         ) / (len(output_strs) * len(output_strs[0]))
 
-        # TODO: swap B and G to get right shape
-        # examples = extty.BatchExample(prompts=prompts, responses=output_strs)
+        # need to flip B/G for responses
+        examples = extty.BatchExample(
+            prompts=prompts,
+            responses=[
+                [output_strs[j][i] for j in range(len(output_strs))]
+                for i in range(len(output_strs[0]))
+            ],
+        )
 
         extty.log(
             {
@@ -305,7 +318,7 @@ def train_grpo(
                 "train/reward_mean": rewards.mean().item(),
                 "train/reward_std": rewards.std().item(),
                 "train/completion_len_mean": completion_len_mean,
-                # "train/example": examples,
+                "train/example": examples,
             },
-            step=n_episodes,
+            step=step,
         )
