@@ -133,8 +133,6 @@ def main():
         batch_size=args.batch_size,
         group_size=args.group_size,
         temperature=0.7,
-        verbose=True,
-        profile_dir="./torch-profile",
     )
 
 

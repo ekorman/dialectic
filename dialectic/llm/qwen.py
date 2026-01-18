@@ -166,7 +166,7 @@ def create_rope_sine_cosine_tensors(
     base_value: float,
     context_length: int,
     device: str | torch.device | None = None,
-) -> tuple[Float[Tensor, "1 L D"], Float[Tensor, "dim length"]]:
+) -> tuple[Float[Tensor, "1 L D"], Float[Tensor, "1 L D"]]:
     thetas = base_value ** (-2 * (torch.arange(dim // 2, device=device)) / dim)
     thetas = thetas.repeat(2)
 
