@@ -188,7 +188,6 @@ def train_grpo(
     group_size: int,
     temperature: float,
     normalize_advantages: bool = True,
-    verbose: bool = False,
 ) -> None:
     n_episodes = 0
     n_batches = 0
