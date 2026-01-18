@@ -144,6 +144,7 @@ def grpo_step(
     normalize_advantages: bool = True,
 ) -> tuple[float, float, float]:
     batch_size, g = log_probs.shape[:2]
+    # will old_log_probs ever be None?
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
 
@@ -155,7 +156,10 @@ def grpo_step(
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
     ppo_loss = torch.min(unclipped, clipped)
-    kl_loss = torch.exp(ref_log_probs - log_probs) - (ref_log_probs - log_probs) - 1
+    kl_diff = ref_log_probs - log_probs
+    kl_diff = torch.clamp(kl_diff, min=-20, max=20)
+    kl_loss = torch.exp(kl_diff) - kl_diff - 1
+    kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
     mask_sum = completion_mask.sum()
     ppo_loss = -(ppo_loss * completion_mask).sum() / mask_sum

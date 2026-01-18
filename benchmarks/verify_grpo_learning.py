@@ -51,8 +51,16 @@ def main():
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
     parser.add_argument(
+        "--mu", type=int, default=1, help="number of optimization steps"
+    )
+    parser.add_argument("--eps", type=float, default=0.2, help="clipping ratio")
+    parser.add_argument(
+        "--temperature", type=float, default=0.7, help="temperature for sampling"
+    )
+    parser.add_argument(
         "--weights", default="weights/qwen3-0.6b.pth", help="Path to model weights"
     )
+    parser.add_argument("--update_ref_net_batch_cadence", type=int, default=10)
     parser.add_argument(
         "--binary-reward",
         action="store_true",
@@ -125,14 +133,14 @@ def main():
         pad_token_id=151643,
         extractor=extract_from_answer_tags,
         beta=args.beta,
-        eps=0.2,
-        mu=1,
+        eps=args.eps,
+        mu=args.mu,
         max_tokens_generated=args.max_tokens,
         max_episodes=args.max_episodes,
-        update_ref_net_batch_cadence=10,
+        update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
         batch_size=args.batch_size,
         group_size=args.group_size,
-        temperature=0.7,
+        temperature=args.temperature,
     )
 
 
