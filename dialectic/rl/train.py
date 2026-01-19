@@ -11,7 +11,19 @@ from tokenizers import Tokenizer
 from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.types import A, E, EnvResponse, T
+from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
+
+
+def aggregate_reward_components(
+    results: list[list[RewardResult]],
+) -> dict[str, float]:
+    """Compute mean of each component across all results."""
+    all_components: dict[str, list[float]] = {}
+    for row in results:
+        for r in row:
+            for name, value in r.components.items():
+                all_components.setdefault(name, []).append(value)
+    return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
 
 
 def rewards_to_go(
@@ -232,23 +244,25 @@ def train_grpo(
 
         prompt_len = token_ids.shape[1]
 
-        # outer list has length G, inner last has length B
+        # outer list has length G, inner list has length B
         output_strs: list[list[str]] = [
             tokenizer.decode_batch(c[:, prompt_len:].tolist())
             for c in completion_token_ids
         ]
-        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        reward_results: list[list[RewardResult]] = [
             [
-                [
-                    reward_fn(
-                        env_response=env_response,
-                        raw_model_output=s,
-                        extracted_model_output=extractor(s),
-                    )
-                    for s, env_response in zip(group_batch, env_responses)
-                ]
-                for group_batch in output_strs
-            ],
+                reward_fn(
+                    env_response=env_response,
+                    raw_model_output=s,
+                    extracted_model_output=extractor(s),
+                )
+                for s, env_response in zip(group_batch, env_responses)
+            ]
+            for group_batch in output_strs
+        ]
+
+        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+            [[r.total for r in row] for row in reward_results],
             device=device,
         )
 
@@ -310,15 +324,22 @@ def train_grpo(
             ],
         )
 
-        extty.log(
-            {
-                "train/loss": total_loss / mu,
-                "train/ppo_loss": total_ppo_loss / mu,
-                "train/kl_loss": total_kl_loss / mu,
-                "train/reward_mean": rewards.mean().item(),
-                "train/reward_std": rewards.std().item(),
-                "train/completion_len_mean": completion_len_mean,
-                "train/example": examples,
-            },
-            step=step,
-        )
+        component_means = aggregate_reward_components(reward_results)
+
+        if extty._active_run is not None:
+            extty.log(
+                {
+                    "train/loss": total_loss / mu,
+                    "train/ppo_loss": total_ppo_loss / mu,
+                    "train/kl_loss": total_kl_loss / mu,
+                    "train/reward_mean": rewards.mean().item(),
+                    "train/reward_std": rewards.std().item(),
+                    "train/completion_len_mean": completion_len_mean,
+                    "train/example": examples,
+                    **{
+                        f"train/reward/{name}": mean
+                        for name, mean in component_means.items()
+                    },
+                },
+                step=step,
+            )

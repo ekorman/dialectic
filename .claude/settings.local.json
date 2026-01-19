@@ -16,7 +16,8 @@
       "WebFetch(domain:docs.pytorch.org)",
       "Bash(python3:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:xihuai18.github.io)"
+      "WebFetch(domain:xihuai18.github.io)",
+      "Bash(python:*)"
     ]
   }
 }
