@@ -247,7 +247,8 @@ class CountdownEnv(Env[Countdown, None]):
             f"Using the numbers {numbers}, create an equation that equals {target}. "
             f"You can use +, -, *, / and each number at most once. "
             f"Show your reasoning in <think></think> tags. "
-            f"Put your final equation in <answer></answer> tags."
+            f"Put your final equation in <answer></answer> tags. "
+            f"For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
         )
 
         prompt = get_input_text_from_messages(
