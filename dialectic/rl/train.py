@@ -224,26 +224,33 @@ def train_grpo(
 
         token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
-        # generate `group_size` many completions for each batch
-        # list of length `group_size`
+        # generate `group_size` completions for each prompt in parallel
+        # expand batch: [B, L] -> [B * G, L] by repeating each prompt G times
+        expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
+        expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+
         net.eval()
         t_gen_start = time.perf_counter()
-        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
-            generate_from_tokens(
-                net=net,
-                token_ids=token_ids,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-                sampling_strategy="sample",
-                temperature=temperature,
-                attention_mask=attention_mask,
-                use_kv_cache=True,
-                max_tokens_generated=max_tokens_generated,
-            )
-            for _ in range(group_size)
-        ]
+        all_completions = generate_from_tokens(
+            net=net,
+            token_ids=expanded_token_ids,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            sampling_strategy="sample",
+            temperature=temperature,
+            attention_mask=expanded_attention_mask,
+            use_kv_cache=True,
+            max_tokens_generated=max_tokens_generated,
+        )
         t_gen = time.perf_counter() - t_gen_start
         net.train()
+
+        # reshape [B * G, L] -> [B, G, L] -> [G, B, L] -> list of G tensors [B, L]
+        all_completions = all_completions.view(batch_size, group_size, -1)
+        all_completions = all_completions.permute(1, 0, 2)
+        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
+            all_completions.unbind(0)
+        )
 
         prompt_len = token_ids.shape[1]
 
