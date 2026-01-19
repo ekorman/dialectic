@@ -64,6 +64,7 @@ def train(
     weights_path: str = "/weights/qwen3-0.6b.pth",
     tokenizer_path: str = "/weights/tokenizer.json",
     binary_reward: bool = False,
+    num_operands: int = 2,
 ):
     extty.init(
         "grpo-learning",
@@ -98,7 +99,7 @@ def train(
     tokenizer = Tokenizer.from_file(tokenizer_path)
 
     env = CountdownEnv(
-        num_operands=3,
+        num_operands=num_operands,
         min_number=1,
         max_number=10,
     )
