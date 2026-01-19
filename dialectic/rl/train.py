@@ -1,3 +1,4 @@
+import time
 import warnings
 from copy import deepcopy
 from typing import Callable
@@ -226,6 +227,7 @@ def train_grpo(
         # generate `group_size` many completions for each batch
         # list of length `group_size`
         net.eval()
+        t_gen_start = time.perf_counter()
         completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
             generate_from_tokens(
                 net=net,
@@ -240,6 +242,7 @@ def train_grpo(
             )
             for _ in range(group_size)
         ]
+        t_gen = time.perf_counter() - t_gen_start
         net.train()
 
         prompt_len = token_ids.shape[1]
@@ -266,6 +269,7 @@ def train_grpo(
             device=device,
         )
 
+        t_logprobs_start = time.perf_counter()
         with torch.inference_mode():
             ref_log_probs, completion_mask = compute_log_probs(
                 net=ref_net,
@@ -281,7 +285,9 @@ def train_grpo(
             )
         old_log_probs = old_log_probs.detach()
         completion_mask = completion_mask.clone()
+        t_logprobs = time.perf_counter() - t_logprobs_start
 
+        t_opt_start = time.perf_counter()
         total_loss = 0
         total_ppo_loss = 0
         total_kl_loss = 0
@@ -307,6 +313,7 @@ def train_grpo(
             total_loss += step_loss
             total_ppo_loss += step_ppo_loss
             total_kl_loss += step_kl_loss
+        t_opt = time.perf_counter() - t_opt_start
 
         step += 1
         n_episodes += len(prompts)
@@ -336,6 +343,9 @@ def train_grpo(
                     "train/reward_std": rewards.std().item(),
                     "train/completion_len_mean": completion_len_mean,
                     "train/example": examples,
+                    "time/generation": t_gen,
+                    "time/logprobs": t_logprobs,
+                    "time/optimization": t_opt,
                     **{
                         f"train/reward/{name}": mean
                         for name, mean in component_means.items()
