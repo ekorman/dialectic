@@ -3,7 +3,7 @@ import tempfile
 
 import pytest
 
-from dialectic.rl.env import ArithmeticEnv, EpisodeIsDoneError, GSM8kEnv
+from dialectic.rl.env import ArithmeticEnv, CountdownEnv, EpisodeIsDoneError, GSM8kEnv
 from dialectic.rl.types import EnvResponse
 
 
@@ -86,6 +86,48 @@ class TestArithmeticEnv:
         assert s.is_done
         assert s.data.question.startswith("What is")
         assert isinstance(s.data.answer, float)
+
+        with pytest.raises(EpisodeIsDoneError):
+            env.step(None)
+
+
+class TestCountdownEnv:
+    def test_reset_returns_valid_response(self):
+        env = CountdownEnv()
+        resp = env.reset()
+
+        assert resp.is_done
+        assert isinstance(resp.data.numbers, list)
+        assert len(resp.data.numbers) == 4
+        assert isinstance(resp.data.target, int)
+        assert "prompt" in resp.data.__dict__
+
+    def test_custom_num_operands(self):
+        env = CountdownEnv(num_operands=6)
+        resp = env.reset()
+
+        assert len(resp.data.numbers) == 6
+
+    def test_number_range(self):
+        env = CountdownEnv(min_number=10, max_number=20)
+        resp = env.reset()
+
+        for num in resp.data.numbers:
+            assert 10 <= num <= 20
+
+    def test_seed_reproducibility(self):
+        env1 = CountdownEnv()
+        env2 = CountdownEnv()
+
+        resp1 = env1.reset(seed=42)
+        resp2 = env2.reset(seed=42)
+
+        assert resp1.data.numbers == resp2.data.numbers
+        assert resp1.data.target == resp2.data.target
+
+    def test_step_raises_error(self):
+        env = CountdownEnv()
+        env.reset()
 
         with pytest.raises(EpisodeIsDoneError):
             env.step(None)

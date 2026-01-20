@@ -1,6 +1,6 @@
+import time
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
 from typing import Callable
 
 import extty
@@ -12,13 +12,19 @@ from tokenizers import Tokenizer
 from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.types import A, E, EnvResponse, T
+from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
 
 
-@dataclass
-class GRPOMetrics:
-    losses: list[float] = field(default_factory=list)
-    mean_rewards: list[float] = field(default_factory=list)
+def aggregate_reward_components(
+    results: list[list[RewardResult]],
+) -> dict[str, float]:
+    """Compute mean of each component across all results."""
+    all_components: dict[str, list[float]] = {}
+    for row in results:
+        for r in row:
+            for name, value in r.components.items():
+                all_components.setdefault(name, []).append(value)
+    return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
 
 
 def rewards_to_go(
@@ -145,9 +151,10 @@ def grpo_step(
     eps: float,
     rewards: Float[torch.Tensor, "G B"],
     normalize_advantages: bool = True,
+    clip_ratio_c: float = 3.0,
+    max_grad_norm: float = 1.0,
 ) -> tuple[float, float, float]:
     batch_size, g = log_probs.shape[:2]
-    # will old_log_probs ever be None?
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
 
@@ -158,19 +165,24 @@ def grpo_step(
     unclipped = ratio * advs
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
-    ppo_loss = torch.min(unclipped, clipped)
+    ppo_obj = torch.min(unclipped, clipped)
+    dual_clip_obj = clip_ratio_c * advs
+    ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
     kl_diff = ref_log_probs - log_probs
     kl_diff = torch.clamp(kl_diff, min=-20, max=20)
     kl_loss = torch.exp(kl_diff) - kl_diff - 1
     kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
     mask_sum = completion_mask.sum()
-    ppo_loss = -(ppo_loss * completion_mask).sum() / mask_sum
+    ppo_loss = -(ppo_obj * completion_mask).sum() / mask_sum
     kl_loss = (kl_loss * completion_mask).sum() / mask_sum
 
     loss = ppo_loss + beta * kl_loss
     opt.zero_grad()
     loss.backward()
+    if max_grad_norm > 0:
+        params = [p for group in opt.param_groups for p in group["params"]]
+        torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
     opt.step()
 
     return loss.item(), ppo_loss.item(), kl_loss.item()
@@ -198,7 +210,6 @@ def train_grpo(
     temperature: float,
     normalize_advantages: bool = True,
 ) -> None:
-    # metrics = GRPOMetrics()
     n_episodes = 0
     step = 0
     while n_episodes < max_episodes:
@@ -219,47 +230,60 @@ def train_grpo(
 
         token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
-        # generate `group_size` many completions for each batch
-        # list of length `group_size`
+        # generate `group_size` completions for each prompt in parallel
+        # expand batch: [B, L] -> [B * G, L] by repeating each prompt G times
+        expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
+        expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+
         net.eval()
-        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = [
-            generate_from_tokens(
-                net=net,
-                token_ids=token_ids,
-                pad_token_id=pad_token_id,
-                eos_token_id=eos_token_id,
-                sampling_strategy="sample",
-                temperature=temperature,
-                attention_mask=attention_mask,
-                use_kv_cache=True,
-                max_tokens_generated=max_tokens_generated,
-            )
-            for _ in range(group_size)
-        ]
+        t_gen_start = time.perf_counter()
+        all_completions = generate_from_tokens(
+            net=net,
+            token_ids=expanded_token_ids,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            sampling_strategy="sample",
+            temperature=temperature,
+            attention_mask=expanded_attention_mask,
+            use_kv_cache=True,
+            max_tokens_generated=max_tokens_generated,
+        )
+        t_gen = time.perf_counter() - t_gen_start
         net.train()
+
+        # reshape [B * G, L] -> [B, G, L] -> [G, B, L] -> list of G tensors [B, L]
+        all_completions = all_completions.view(batch_size, group_size, -1)
+        all_completions = all_completions.permute(1, 0, 2)
+        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
+            all_completions.unbind(0)
+        )
 
         prompt_len = token_ids.shape[1]
 
-        # outer list has length G, inner last has length B
+        # outer list has length G, inner list has length B
         output_strs: list[list[str]] = [
             tokenizer.decode_batch(c[:, prompt_len:].tolist())
             for c in completion_token_ids
         ]
-        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        # first index is group, second index is batch
+        reward_results: list[list[RewardResult]] = [
             [
-                [
-                    reward_fn(
-                        env_response=env_response,
-                        raw_model_output=s,
-                        extracted_model_output=extractor(s),
-                    )
-                    for s, env_response in zip(group_batch, env_responses)
-                ]
-                for group_batch in output_strs
-            ],
+                reward_fn(
+                    env_response=env_response,
+                    raw_model_output=s,
+                    extracted_model_output=extractor(s),
+                )
+                for s, env_response in zip(group_batch, env_responses)
+            ]
+            for group_batch in output_strs
+        ]
+
+        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+            [[r.total for r in row] for row in reward_results],
             device=device,
         )
 
+        t_logprobs_start = time.perf_counter()
         with torch.inference_mode():
             ref_log_probs, completion_mask = compute_log_probs(
                 net=ref_net,
@@ -275,7 +299,9 @@ def train_grpo(
             )
         old_log_probs = old_log_probs.detach()
         completion_mask = completion_mask.clone()
+        t_logprobs = time.perf_counter() - t_logprobs_start
 
+        t_opt_start = time.perf_counter()
         total_loss = 0
         total_ppo_loss = 0
         total_kl_loss = 0
@@ -301,6 +327,7 @@ def train_grpo(
             total_loss += step_loss
             total_ppo_loss += step_ppo_loss
             total_kl_loss += step_kl_loss
+        t_opt = time.perf_counter() - t_opt_start
 
         step += 1
         n_episodes += len(prompts)
@@ -316,17 +343,31 @@ def train_grpo(
                 [output_strs[j][i] for j in range(len(output_strs))]
                 for i in range(len(output_strs[0]))
             ],
+            rewards=[
+                [reward_results[j][i].components for j in range(len(reward_results))]
+                for i in range(len(reward_results[0]))
+            ],
         )
 
-        extty.log(
-            {
-                "train/loss": total_loss / mu,
-                "train/ppo_loss": total_ppo_loss / mu,
-                "train/kl_loss": total_kl_loss / mu,
-                "train/reward_mean": rewards.mean().item(),
-                "train/reward_std": rewards.std().item(),
-                "train/completion_len_mean": completion_len_mean,
-                "train/example": examples,
-            },
-            step=step,
-        )
+        component_means = aggregate_reward_components(reward_results)
+
+        if extty._active_run is not None:
+            extty.log(
+                {
+                    "train/loss": total_loss / mu,
+                    "train/ppo_loss": total_ppo_loss / mu,
+                    "train/kl_loss": total_kl_loss / mu,
+                    "train/reward_mean": rewards.mean().item(),
+                    "train/reward_std": rewards.std().item(),
+                    "train/completion_len_mean": completion_len_mean,
+                    "train/example": examples,
+                    "time/generation": t_gen,
+                    "time/logprobs": t_logprobs,
+                    "time/optimization": t_opt,
+                    **{
+                        f"train/reward/{name}": mean
+                        for name, mean in component_means.items()
+                    },
+                },
+                step=step,
+            )

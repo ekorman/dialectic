@@ -31,11 +31,12 @@ def evaluate(
         while True:
             model_out = model_generation(s.data)
             extracted = extractor(model_out)
-            episode_reward += reward_fn(
+            result = reward_fn(
                 env_response=s,
                 raw_model_output=model_out,
                 extracted_model_output=extracted,
             )
+            episode_reward += result.total
             if s.is_done:
                 break
 

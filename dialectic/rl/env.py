@@ -164,8 +164,6 @@ class CountdownEnv(Env[Countdown, None]):
         Minimum value for operands. Default is 1.
     max_number : int
         Maximum value for operands. Default is 25.
-    max_target : int
-        Maximum target value. Default is 100.
     """
 
     def __init__(
@@ -173,12 +171,10 @@ class CountdownEnv(Env[Countdown, None]):
         num_operands: int = 4,
         min_number: int = 1,
         max_number: int = 25,
-        max_target: int = 100,
     ):
         self.num_operands = num_operands
         self.min_number = min_number
         self.max_number = max_number
-        self.max_target = max_target
         self.rng = random.Random()
 
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
@@ -187,13 +183,20 @@ class CountdownEnv(Env[Countdown, None]):
             self.rng.randint(self.min_number, self.max_number)
             for _ in range(self.num_operands)
         ]
-        target = self.rng.randint(1, self.max_target)
+
+        ops = self.rng.choices(["+", "-", "*"], k=self.num_operands - 1)
+        expr = str(numbers[0])
+        for number, op in zip(numbers[1:], ops):
+            expr += f"{op}{number}"
+
+        target = eval(expr)
 
         user_content = (
             f"Using the numbers {numbers}, create an equation that equals {target}. "
             f"You can use +, -, *, / and each number at most once. "
-            f"Show your reasoning in <think></think> tags. "
-            f"Put your final equation in <answer></answer> tags."
+            f"Show your reasoning in <think></think> tags. Please be concise and give just one solution."
+            f"Put your final equation in <answer></answer> tags. "
+            f"For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
         )
 
         prompt = get_input_text_from_messages(
