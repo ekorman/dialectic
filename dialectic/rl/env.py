@@ -1,7 +1,6 @@
 import json
 import random
 import re
-import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Generic
@@ -150,62 +149,6 @@ class GSM8kEnv(Env[QA[float], None]):
         raise EpisodeIsDoneError
 
 
-def _compute_reachable_values(numbers: list[int]) -> set[int]:
-    """
-    Compute all positive integer values reachable using +, -, *, /.
-
-    Parameters
-    ----------
-    numbers : list[int]
-        Available numbers, each can be used at most once.
-
-    Returns
-    -------
-    set[int]
-        All positive integers reachable via arithmetic combinations.
-    """
-    if len(numbers) > 4:
-        warnings.warn(
-            f"_compute_reachable_values called with {len(numbers)} operands. "
-            "Performance degrades significantly beyond 4 operands.",
-            stacklevel=2,
-        )
-
-    def helper(nums: tuple[float, ...]) -> set[float]:
-        results: set[float] = set(nums)
-
-        if len(nums) < 2:
-            return results
-
-        for i in range(len(nums)):
-            for j in range(len(nums)):
-                if i == j:
-                    continue
-
-                a, b = nums[i], nums[j]
-                remaining = tuple(
-                    nums[k] for k in range(len(nums)) if k != i and k != j
-                )
-
-                new_values = [a + b, a - b, a * b]
-                if b != 0:
-                    new_values.append(a / b)
-
-                for val in new_values:
-                    results |= helper(remaining + (val,))
-
-        return results
-
-    all_reachable = helper(tuple(float(n) for n in numbers))
-
-    int_reachable: set[int] = set()
-    for val in all_reachable:
-        if val > 0 and val == int(val):
-            int_reachable.add(int(val))
-
-    return int_reachable
-
-
 class CountdownEnv(Env[Countdown, None]):
     """
     Countdown game environment.
@@ -240,13 +183,18 @@ class CountdownEnv(Env[Countdown, None]):
             self.rng.randint(self.min_number, self.max_number)
             for _ in range(self.num_operands)
         ]
-        reachable = _compute_reachable_values(numbers)
-        target = self.rng.choice(list(reachable))
+
+        ops = self.rng.choices(["+", "-", "*"], k=self.num_operands - 1)
+        expr = str(numbers[0])
+        for number, op in zip(numbers[1:], ops):
+            expr += f"{op}{number}"
+
+        target = eval(expr)
 
         user_content = (
             f"Using the numbers {numbers}, create an equation that equals {target}. "
             f"You can use +, -, *, / and each number at most once. "
-            f"Show your reasoning in <think></think> tags. "
+            f"Show your reasoning in <think></think> tags. Please be concise and give just one solution."
             f"Put your final equation in <answer></answer> tags. "
             f"For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
         )

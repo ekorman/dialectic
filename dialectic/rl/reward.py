@@ -281,7 +281,6 @@ class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
                 CountdownParseableComponent(),
                 CountdownAnswerTagsComponent(),
                 CountdownThinkTagsComponent(),
-                LengthBonusComponent(),
             ]
         )
 
