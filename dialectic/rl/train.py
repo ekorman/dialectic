@@ -140,6 +140,63 @@ def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
     return env_responses
 
 
+def compute_grpo_loss(
+    *,
+    log_probs: Float[torch.Tensor, "B G L_new"],
+    old_log_probs: Float[torch.Tensor, "B G L_new"],
+    ref_log_probs: Float[torch.Tensor, "B G L_new"],
+    completion_mask: Bool[torch.Tensor, "B G L_new"],
+    advs: Float[torch.Tensor, "B G 1"],
+    beta: float,
+    eps: float,
+    clip_ratio_c: float = 3.0,
+) -> tuple[torch.Tensor, float, float]:
+    """Compute GRPO loss without backward pass or optimizer step.
+
+    Parameters
+    ----------
+    log_probs
+        Current policy log probabilities.
+    old_log_probs
+        Old policy log probabilities (for importance sampling ratio).
+    ref_log_probs
+        Reference policy log probabilities (for KL penalty).
+    completion_mask
+        Mask for valid completion tokens.
+    advs
+        Pre-computed advantages, shape [B, G, 1].
+    beta
+        KL penalty coefficient.
+    eps
+        PPO clipping epsilon.
+    clip_ratio_c
+        Dual-clip ratio for negative advantages.
+
+    Returns
+    -------
+    tuple[torch.Tensor, float, float]
+        (loss tensor, ppo_loss scalar, kl_loss scalar)
+    """
+    ratio = (log_probs - old_log_probs).exp()
+    unclipped = ratio * advs
+    clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
+
+    ppo_obj = torch.min(unclipped, clipped)
+    dual_clip_obj = clip_ratio_c * advs
+    ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
+    kl_diff = ref_log_probs - log_probs
+    kl_diff = torch.clamp(kl_diff, min=-20, max=20)
+    kl_loss = torch.exp(kl_diff) - kl_diff - 1
+    kl_loss = torch.clamp(kl_loss, min=-10, max=10)
+
+    mask_sum = completion_mask.sum()
+    ppo_loss_scalar = -(ppo_obj * completion_mask).sum() / mask_sum
+    kl_loss_scalar = (kl_loss * completion_mask).sum() / mask_sum
+
+    loss = ppo_loss_scalar + beta * kl_loss_scalar
+    return loss, ppo_loss_scalar.item(), kl_loss_scalar.item()
+
+
 def grpo_step(
     *,
     opt: torch.optim.Optimizer,
@@ -158,26 +215,21 @@ def grpo_step(
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
 
-    advs: Float[torch.Tensor, "B G"] = compute_advantages(
+    advs: Float[torch.Tensor, "B G 1"] = compute_advantages(
         rewards, normalize=normalize_advantages
     ).T.view(batch_size, g, 1)
-    ratio = (log_probs - old_log_probs).exp()
-    unclipped = ratio * advs
-    clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
-    ppo_obj = torch.min(unclipped, clipped)
-    dual_clip_obj = clip_ratio_c * advs
-    ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
-    kl_diff = ref_log_probs - log_probs
-    kl_diff = torch.clamp(kl_diff, min=-20, max=20)
-    kl_loss = torch.exp(kl_diff) - kl_diff - 1
-    kl_loss = torch.clamp(kl_loss, min=-10, max=10)
+    loss, ppo_loss, kl_loss = compute_grpo_loss(
+        log_probs=log_probs,
+        old_log_probs=old_log_probs,
+        ref_log_probs=ref_log_probs,
+        completion_mask=completion_mask,
+        advs=advs,
+        beta=beta,
+        eps=eps,
+        clip_ratio_c=clip_ratio_c,
+    )
 
-    mask_sum = completion_mask.sum()
-    ppo_loss = -(ppo_obj * completion_mask).sum() / mask_sum
-    kl_loss = (kl_loss * completion_mask).sum() / mask_sum
-
-    loss = ppo_loss + beta * kl_loss
     opt.zero_grad()
     loss.backward()
     if max_grad_norm > 0:
@@ -185,7 +237,116 @@ def grpo_step(
         torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
     opt.step()
 
-    return loss.item(), ppo_loss.item(), kl_loss.item()
+    return loss.item(), ppo_loss, kl_loss
+
+
+@torch.no_grad()
+def collect_micro_batch(
+    *,
+    net: Qwen,
+    ref_net: Qwen,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[str], E],
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    max_tokens_generated: int,
+) -> dict:
+    """Collect a single micro-batch of data for gradient accumulation."""
+    env_responses = get_batch(env, batch_size)
+    prompts = [state_to_str(resp.data) for resp in env_responses]
+    device = next(net.parameters()).device
+
+    tokenizer.enable_padding(direction="left")
+    tokens = tokenizer.encode_batch(prompts)
+    attention_mask = (
+        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+    )
+    token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
+    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+
+    was_training = net.training
+    net.eval()
+    t_gen_start = time.perf_counter()
+    all_completions = generate_from_tokens(
+        net=net,
+        token_ids=expanded_token_ids,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        sampling_strategy="sample",
+        temperature=temperature,
+        attention_mask=expanded_attention_mask,
+        use_kv_cache=True,
+        max_tokens_generated=max_tokens_generated,
+    )
+    t_gen = time.perf_counter() - t_gen_start
+    if was_training:
+        net.train()
+
+    all_completions = all_completions.view(batch_size, group_size, -1)
+    all_completions = all_completions.permute(1, 0, 2)
+    completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
+        all_completions.unbind(0)
+    )
+
+    prompt_len = token_ids.shape[1]
+
+    output_strs: list[list[str]] = [
+        tokenizer.decode_batch(c[:, prompt_len:].tolist()) for c in completion_token_ids
+    ]
+    reward_results: list[list[RewardResult]] = [
+        [
+            reward_fn(
+                env_response=env_response,
+                raw_model_output=s,
+                extracted_model_output=extractor(s),
+            )
+            for s, env_response in zip(group_batch, env_responses)
+        ]
+        for group_batch in output_strs
+    ]
+
+    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        [[r.total for r in row] for row in reward_results],
+        device=device,
+    )
+
+    t_logprobs_start = time.perf_counter()
+    ref_log_probs, completion_mask = compute_log_probs(
+        net=ref_net,
+        attention_mask=attention_mask,
+        completion_token_ids=completion_token_ids,
+        pad_token_id=pad_token_id,
+    )
+    old_log_probs, _ = compute_log_probs(
+        net=net,
+        attention_mask=attention_mask,
+        completion_token_ids=completion_token_ids,
+        pad_token_id=pad_token_id,
+    )
+    t_logprobs = time.perf_counter() - t_logprobs_start
+
+    return {
+        "prompts": prompts,
+        "env_responses": env_responses,
+        "attention_mask": attention_mask,
+        "completion_token_ids": completion_token_ids,
+        "output_strs": output_strs,
+        "reward_results": reward_results,
+        "rewards": rewards,
+        "ref_log_probs": ref_log_probs,
+        "old_log_probs": old_log_probs,
+        "completion_mask": completion_mask,
+        "t_gen": t_gen,
+        "t_logprobs": t_logprobs,
+    }
 
 
 def train_grpo(
@@ -201,7 +362,7 @@ def train_grpo(
     extractor: Callable[[str], E],
     beta: float,
     eps: float,
-    mu: int,  # number of optimizations per batch
+    mu: int,  # number of optimization passes per accumulated batch
     max_tokens_generated: int,
     max_episodes: int,
     update_ref_net_batch_cadence: int,
@@ -209,147 +370,133 @@ def train_grpo(
     group_size: int,
     temperature: float,
     normalize_advantages: bool = True,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
 ) -> None:
     n_episodes = 0
     step = 0
+    ref_net = deepcopy(net)
+
     while n_episodes < max_episodes:
         if step % update_ref_net_batch_cadence == 0:
             ref_net = deepcopy(net)
 
-        env_responses = get_batch(env, batch_size)
-        prompts = [state_to_str(resp.data) for resp in env_responses]
-        device = next(net.parameters()).device
+        t_gen_total = 0.0
+        t_logprobs_total = 0.0
+        micro_batches: list[dict] = []
 
-        tokenizer.enable_padding(direction="left")
-        tokens = tokenizer.encode_batch(prompts)
-        # shape [B, L]
-        # Model expects True = masked/padding, tokenizer gives 1 = attend, so invert
-        attention_mask = (
-            torch.tensor([t.attention_mask for t in tokens], device=device) == 0
-        )
-
-        token_ids = torch.tensor([t.ids for t in tokens], device=device)
-
-        # generate `group_size` completions for each prompt in parallel
-        # expand batch: [B, L] -> [B * G, L] by repeating each prompt G times
-        expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-        expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
-
-        net.eval()
-        t_gen_start = time.perf_counter()
-        all_completions = generate_from_tokens(
-            net=net,
-            token_ids=expanded_token_ids,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
-            sampling_strategy="sample",
-            temperature=temperature,
-            attention_mask=expanded_attention_mask,
-            use_kv_cache=True,
-            max_tokens_generated=max_tokens_generated,
-        )
-        t_gen = time.perf_counter() - t_gen_start
-        net.train()
-
-        # reshape [B * G, L] -> [B, G, L] -> [G, B, L] -> list of G tensors [B, L]
-        all_completions = all_completions.view(batch_size, group_size, -1)
-        all_completions = all_completions.permute(1, 0, 2)
-        completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
-            all_completions.unbind(0)
-        )
-
-        prompt_len = token_ids.shape[1]
-
-        # outer list has length G, inner list has length B
-        output_strs: list[list[str]] = [
-            tokenizer.decode_batch(c[:, prompt_len:].tolist())
-            for c in completion_token_ids
-        ]
-        # first index is group, second index is batch
-        reward_results: list[list[RewardResult]] = [
-            [
-                reward_fn(
-                    env_response=env_response,
-                    raw_model_output=s,
-                    extracted_model_output=extractor(s),
-                )
-                for s, env_response in zip(group_batch, env_responses)
-            ]
-            for group_batch in output_strs
-        ]
-
-        rewards: Float[torch.Tensor, "G B"] = torch.tensor(
-            [[r.total for r in row] for row in reward_results],
-            device=device,
-        )
-
-        t_logprobs_start = time.perf_counter()
-        with torch.inference_mode():
-            ref_log_probs, completion_mask = compute_log_probs(
-                net=ref_net,
-                attention_mask=attention_mask,
-                completion_token_ids=completion_token_ids,
-                pad_token_id=pad_token_id,
-            )
-            old_log_probs, _ = compute_log_probs(
+        for _ in range(accumulation_steps):
+            micro_batch = collect_micro_batch(
                 net=net,
-                attention_mask=attention_mask,
-                completion_token_ids=completion_token_ids,
+                ref_net=ref_net,
+                env=env,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
+                extractor=extractor,
+                batch_size=batch_size,
+                group_size=group_size,
+                temperature=temperature,
+                max_tokens_generated=max_tokens_generated,
             )
-        old_log_probs = old_log_probs.detach()
-        completion_mask = completion_mask.clone()
-        t_logprobs = time.perf_counter() - t_logprobs_start
+            micro_batches.append(micro_batch)
+            t_gen_total += micro_batch["t_gen"]
+            t_logprobs_total += micro_batch["t_logprobs"]
+
+        all_rewards = torch.cat(
+            [mb["rewards"] for mb in micro_batches], dim=1
+        )  # [G, B*accum]
+        global_advs: Float[torch.Tensor, "G B*accum"] = compute_advantages(
+            all_rewards, normalize=normalize_advantages
+        )
 
         t_opt_start = time.perf_counter()
-        total_loss = 0
-        total_ppo_loss = 0
-        total_kl_loss = 0
-        for _ in range(mu):
-            log_probs, _ = compute_log_probs(
-                net=net,
-                attention_mask=attention_mask,
-                completion_token_ids=completion_token_ids,
-                pad_token_id=pad_token_id,
-            )
+        total_loss = 0.0
+        total_ppo_loss = 0.0
+        total_kl_loss = 0.0
 
-            step_loss, step_ppo_loss, step_kl_loss = grpo_step(
-                opt=opt,
-                log_probs=log_probs,
-                old_log_probs=old_log_probs,
-                ref_log_probs=ref_log_probs,
-                completion_mask=completion_mask,
-                beta=beta,
-                eps=eps,
-                rewards=rewards,
-                normalize_advantages=normalize_advantages,
-            )
-            total_loss += step_loss
-            total_ppo_loss += step_ppo_loss
-            total_kl_loss += step_kl_loss
+        for _ in range(mu):
+            opt.zero_grad()
+
+            for accum_idx, micro_batch in enumerate(micro_batches):
+                advs_slice = global_advs[
+                    :, accum_idx * batch_size : (accum_idx + 1) * batch_size
+                ]
+                advs_for_loss: Float[torch.Tensor, "B G 1"] = advs_slice.T.unsqueeze(-1)
+
+                log_probs, _ = compute_log_probs(
+                    net=net,
+                    attention_mask=micro_batch["attention_mask"],
+                    completion_token_ids=micro_batch["completion_token_ids"],
+                    pad_token_id=pad_token_id,
+                )
+
+                loss, ppo_loss, kl_loss = compute_grpo_loss(
+                    log_probs=log_probs,
+                    old_log_probs=micro_batch["old_log_probs"],
+                    ref_log_probs=micro_batch["ref_log_probs"],
+                    completion_mask=micro_batch["completion_mask"],
+                    advs=advs_for_loss,
+                    beta=beta,
+                    eps=eps,
+                )
+
+                scaled_loss = loss / accumulation_steps
+                scaled_loss.backward()
+
+                total_loss += loss.item() / accumulation_steps
+                total_ppo_loss += ppo_loss / accumulation_steps
+                total_kl_loss += kl_loss / accumulation_steps
+
+            if max_grad_norm > 0:
+                params = [p for group in opt.param_groups for p in group["params"]]
+                torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
+            opt.step()
+
         t_opt = time.perf_counter() - t_opt_start
 
         step += 1
-        n_episodes += len(prompts)
+        n_episodes += batch_size * accumulation_steps
 
-        completion_len_mean = sum(
-            [len(s) for batch_output_strs in output_strs for s in batch_output_strs]
-        ) / (len(output_strs) * len(output_strs[0]))
-
-        # need to flip B/G for responses
-        examples = extty.BatchExample(
-            prompts=prompts,
-            responses=[
-                [output_strs[j][i] for j in range(len(output_strs))]
-                for i in range(len(output_strs[0]))
-            ],
-            rewards=[
-                [reward_results[j][i].components for j in range(len(reward_results))]
-                for i in range(len(reward_results[0]))
-            ],
+        all_output_strs = [s for mb in micro_batches for s in mb["output_strs"][0]] + [
+            s
+            for g in range(1, group_size)
+            for mb in micro_batches
+            for s in mb["output_strs"][g]
+        ]
+        all_output_strs_nested: list[list[str]] = [
+            [mb["output_strs"][g][b] for g in range(group_size)]
+            for mb in micro_batches
+            for b in range(batch_size)
+        ]
+        completion_len_mean = sum(len(s) for s in all_output_strs) / len(
+            all_output_strs
         )
 
-        component_means = aggregate_reward_components(reward_results)
+        all_prompts = [p for mb in micro_batches for p in mb["prompts"]]
+        all_reward_results = [
+            [mb["reward_results"][g][b] for g in range(group_size)]
+            for mb in micro_batches
+            for b in range(batch_size)
+        ]
+
+        examples = extty.BatchExample(
+            prompts=all_prompts,
+            responses=all_output_strs_nested,
+            rewards=[[r.components for r in row] for row in all_reward_results],
+        )
+
+        flat_reward_results = [
+            mb["reward_results"][g][b]
+            for mb in micro_batches
+            for g in range(group_size)
+            for b in range(batch_size)
+        ]
+        component_means = aggregate_reward_components(
+            [[r] for r in flat_reward_results]
+        )
 
         if extty._active_run is not None:
             extty.log(
@@ -357,12 +504,12 @@ def train_grpo(
                     "train/loss": total_loss / mu,
                     "train/ppo_loss": total_ppo_loss / mu,
                     "train/kl_loss": total_kl_loss / mu,
-                    "train/reward_mean": rewards.mean().item(),
-                    "train/reward_std": rewards.std().item(),
+                    "train/reward_mean": all_rewards.mean().item(),
+                    "train/reward_std": all_rewards.std().item(),
                     "train/completion_len_mean": completion_len_mean,
                     "train/example": examples,
-                    "time/generation": t_gen,
-                    "time/logprobs": t_logprobs,
+                    "time/generation": t_gen_total,
+                    "time/logprobs": t_logprobs_total,
                     "time/optimization": t_opt,
                     **{
                         f"train/reward/{name}": mean
