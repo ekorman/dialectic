@@ -151,9 +151,10 @@ def grpo_step(
     eps: float,
     rewards: Float[torch.Tensor, "G B"],
     normalize_advantages: bool = True,
+    clip_ratio_c: float = 3.0,
+    max_grad_norm: float = 1.0,
 ) -> tuple[float, float, float]:
     batch_size, g = log_probs.shape[:2]
-    # will old_log_probs ever be None?
     if old_log_probs is None:
         old_log_probs = log_probs.detach()
 
@@ -164,19 +165,24 @@ def grpo_step(
     unclipped = ratio * advs
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
 
-    ppo_loss = torch.min(unclipped, clipped)
+    ppo_obj = torch.min(unclipped, clipped)
+    dual_clip_obj = clip_ratio_c * advs
+    ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
     kl_diff = ref_log_probs - log_probs
     kl_diff = torch.clamp(kl_diff, min=-20, max=20)
     kl_loss = torch.exp(kl_diff) - kl_diff - 1
     kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
     mask_sum = completion_mask.sum()
-    ppo_loss = -(ppo_loss * completion_mask).sum() / mask_sum
+    ppo_loss = -(ppo_obj * completion_mask).sum() / mask_sum
     kl_loss = (kl_loss * completion_mask).sum() / mask_sum
 
     loss = ppo_loss + beta * kl_loss
     opt.zero_grad()
     loss.backward()
+    if max_grad_norm > 0:
+        params = [p for group in opt.param_groups for p in group["params"]]
+        torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
     opt.step()
 
     return loss.item(), ppo_loss.item(), kl_loss.item()
