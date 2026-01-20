@@ -259,6 +259,7 @@ def train_grpo(
             tokenizer.decode_batch(c[:, prompt_len:].tolist())
             for c in completion_token_ids
         ]
+        # first index is group, second index is batch
         reward_results: list[list[RewardResult]] = [
             [
                 reward_fn(
@@ -335,6 +336,10 @@ def train_grpo(
             responses=[
                 [output_strs[j][i] for j in range(len(output_strs))]
                 for i in range(len(output_strs[0]))
+            ],
+            rewards=[
+                [reward_results[j][i].components for j in range(len(reward_results))]
+                for i in range(len(reward_results[0]))
             ],
         )
 
