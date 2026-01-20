@@ -65,6 +65,7 @@ def train(
     tokenizer_path: str = "/weights/tokenizer.json",
     binary_reward: bool = False,
     num_operands: int = 2,
+    mu: int = 4,
 ):
     extty.init(
         "grpo-learning",
@@ -76,6 +77,8 @@ def train(
             "lr": lr,
             "beta": beta,
             "binary_reward": binary_reward,
+            "mu": mu,
+            "num_operands": num_operands,
         },
         server=True,
     )
@@ -120,7 +123,7 @@ def train(
             extractor=extract_from_answer_tags,
             beta=beta,
             eps=0.2,
-            mu=1,
+            mu=mu,
             max_tokens_generated=max_tokens,
             max_episodes=max_episodes,
             update_ref_net_batch_cadence=10,
