@@ -28,6 +28,14 @@ def _is_modal_installed():
     return importlib.util.find_spec("modal") is not None
 
 
+def _check_inside_modal_fn():
+    if _is_modal_installed():
+        import modal
+
+        return modal.current_function_call_id()
+    return False
+
+
 bucket_name = "model-weights"
 r2_account_id = "a64c6da180648dd944675d311c296763"
 
@@ -67,7 +75,7 @@ def train(
             "mu": mu,
             "num_operands": num_operands,
         },
-        server=True,
+        server=_check_inside_modal_fn(),
     )
 
     net = load_qwen_06b()
