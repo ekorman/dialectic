@@ -229,12 +229,13 @@ class TestGRPOMechanics:
         def deterministic_generate_from_tokens(
             *,
             token_ids: torch.Tensor,
-            pad_token_id: int,
             **kwargs,
         ) -> torch.Tensor:
+            pad_token_id = kwargs.get("pad_token_id")
+            completion_token_id = 1 if pad_token_id != 1 else 2
             extra = torch.full(
                 (token_ids.shape[0], 1),
-                pad_token_id,
+                completion_token_id,
                 dtype=token_ids.dtype,
                 device=token_ids.device,
             )
