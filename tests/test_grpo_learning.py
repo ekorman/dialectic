@@ -202,6 +202,98 @@ class TestGRPOMechanics:
             assert param.dtype == torch.bfloat16
             assert torch.isfinite(param).all()
 
+    def test_gradient_accumulation_matches_large_batch(
+        self, tiny_model, tokenizer, monkeypatch
+    ):
+        """Gradient accumulation matches a larger batch update."""
+        from copy import deepcopy
+
+        from dialectic.rl.env import EpisodeIsDoneError, Env
+        from dialectic.rl.types import EnvResponse
+
+        class FixedCountdownEnv(Env[Countdown, None]):
+            def __init__(self, responses: list[Countdown]):
+                self._responses = responses
+                self._idx = 0
+
+            def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
+                if self._idx >= len(self._responses):
+                    raise RuntimeError("Exceeded fixed environment responses")
+                response = self._responses[self._idx]
+                self._idx += 1
+                return EnvResponse(is_done=True, data=response)
+
+            def step(self, action: None):
+                raise EpisodeIsDoneError
+
+        def deterministic_generate_from_tokens(
+            *,
+            token_ids: torch.Tensor,
+            pad_token_id: int,
+            **kwargs,
+        ) -> torch.Tensor:
+            extra = torch.full(
+                (token_ids.shape[0], 1),
+                pad_token_id,
+                dtype=token_ids.dtype,
+                device=token_ids.device,
+            )
+            return torch.cat([token_ids, extra], dim=1)
+
+        monkeypatch.setattr(
+            "dialectic.rl.train.generate_from_tokens",
+            deterministic_generate_from_tokens,
+        )
+
+        fixed_responses = [
+            Countdown(prompt=f"Prompt {i}", numbers=[1, 2, 3], target=6)
+            for i in range(4)
+        ]
+
+        base_state = deepcopy(tiny_model.state_dict())
+
+        def run_training(*, batch_size: int, accumulation_steps: int) -> Qwen:
+            model = create_tiny_model()
+            model.load_state_dict(base_state)
+            env = FixedCountdownEnv(deepcopy(fixed_responses))
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            train_grpo(
+                net=model,
+                opt=opt,
+                env=env,
+                reward_fn=CountdownRewardFn(),
+                state_to_str=countdown_state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=151643,
+                pad_token_id=151643,
+                extractor=extract_from_answer_tags,
+                beta=0.01,
+                eps=0.2,
+                mu=1,
+                max_tokens_generated=1,
+                max_episodes=batch_size * accumulation_steps,
+                update_ref_net_batch_cadence=10,
+                batch_size=batch_size,
+                group_size=2,
+                temperature=1.0,
+                normalize_advantages=True,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=0.0,
+                logprob_chunk_size=0,
+                use_bf16=False,
+            )
+            return model
+
+        model_large_batch = run_training(batch_size=4, accumulation_steps=1)
+        model_accumulated = run_training(batch_size=2, accumulation_steps=2)
+
+        for name, param in model_large_batch.named_parameters():
+            accum_param = dict(model_accumulated.named_parameters())[name]
+            assert torch.allclose(param, accum_param, atol=1e-6), (
+                f"Parameter {name} mismatch between accumulation and large batch"
+            )
+
 
 class TestChunkedLogProbs:
     """Test that chunked log prob computation matches non-chunked."""
