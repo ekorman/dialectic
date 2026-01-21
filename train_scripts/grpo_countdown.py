@@ -51,7 +51,7 @@ def train(
     *,
     device: str | None = None,
     max_episodes: int = 1000,
-    batch_size: int = 8,
+    batch_size: int = 2,
     group_size: int = 8,
     max_tokens: int = 1024,
     lr: float = 1e-5,
@@ -61,8 +61,9 @@ def train(
     binary_reward: bool = False,
     num_operands: int = 2,
     mu: int = 1,
-    accumulation_steps: int = 4,
+    accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
+    logprob_chunk_size: int = 64,
 ):
     extty.init(
         "grpo-learning",
@@ -78,6 +79,7 @@ def train(
             "num_operands": num_operands,
             "accumulation_steps": accumulation_steps,
             "max_grad_norm": max_grad_norm,
+            "logprob_chunk_size": logprob_chunk_size,
         },
         server=_check_inside_modal_fn(),
     )
@@ -131,6 +133,7 @@ def train(
             temperature=0.7,
             accumulation_steps=accumulation_steps,
             max_grad_norm=max_grad_norm,
+            logprob_chunk_size=logprob_chunk_size,
         )
     finally:
         extty.finish()
@@ -167,7 +170,7 @@ def main():
     parser.add_argument(
         "--max-episodes", type=int, default=1000, help="Max training episodes"
     )
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
     parser.add_argument("--group-size", type=int, default=8, help="Group size for GRPO")
     parser.add_argument(
         "--max-tokens", type=int, default=1024, help="Max tokens to generate"
@@ -198,7 +201,7 @@ def main():
     parser.add_argument(
         "--accumulation-steps",
         type=int,
-        default=4,
+        default=16,
         help="Gradient accumulation steps",
     )
     parser.add_argument(
@@ -206,6 +209,12 @@ def main():
         type=float,
         default=1.0,
         help="Max gradient norm for clipping",
+    )
+    parser.add_argument(
+        "--logprob-chunk-size",
+        type=int,
+        default=64,
+        help="Chunk size for log prob computation (0 to disable chunking)",
     )
     args = parser.parse_args()
 
@@ -224,6 +233,7 @@ def main():
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         max_grad_norm=args.max_grad_norm,
+        logprob_chunk_size=args.logprob_chunk_size,
     )
 
 

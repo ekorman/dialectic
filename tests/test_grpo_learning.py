@@ -18,7 +18,7 @@ from dialectic.llm.qwen import Qwen
 from dialectic.rl.env import CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn
-from dialectic.rl.train import train_grpo
+from dialectic.rl.train import compute_log_probs, train_grpo
 from dialectic.rl.types import Countdown
 
 
@@ -168,6 +168,112 @@ class TestGRPOMechanics:
                 break
 
         assert params_changed, "No parameters changed during training"
+
+
+class TestChunkedLogProbs:
+    """Test that chunked log prob computation matches non-chunked."""
+
+    @pytest.fixture
+    def tiny_model(self):
+        return create_tiny_model()
+
+    def test_chunked_matches_non_chunked(self, tiny_model):
+        """Chunked and non-chunked log prob computation give identical results."""
+        batch_size = 2
+        group_size = 3
+        prompt_len = 10
+        completion_len = 20
+        vocab_size = tiny_model.vocab_size
+        pad_token_id = 0
+
+        torch.manual_seed(42)
+        prompt_ids = torch.randint(1, vocab_size, (batch_size, prompt_len))
+        completion_ids = [
+            torch.cat(
+                [
+                    prompt_ids,
+                    torch.randint(1, vocab_size, (batch_size, completion_len)),
+                ],
+                dim=1,
+            )
+            for _ in range(group_size)
+        ]
+        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+
+        tiny_model.eval()
+        with torch.no_grad():
+            log_probs_no_chunk, mask_no_chunk = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=0,
+            )
+
+            log_probs_chunked, mask_chunked = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=8,
+            )
+
+        assert log_probs_no_chunk.shape == log_probs_chunked.shape
+        assert mask_no_chunk.shape == mask_chunked.shape
+        assert torch.allclose(log_probs_no_chunk, log_probs_chunked, atol=1e-5)
+        assert torch.equal(mask_no_chunk, mask_chunked)
+
+    def test_chunked_with_different_chunk_sizes(self, tiny_model):
+        """Different chunk sizes produce identical results."""
+        batch_size = 2
+        group_size = 2
+        prompt_len = 8
+        completion_len = 32
+        vocab_size = tiny_model.vocab_size
+        pad_token_id = 0
+
+        torch.manual_seed(123)
+        prompt_ids = torch.randint(1, vocab_size, (batch_size, prompt_len))
+        completion_ids = [
+            torch.cat(
+                [
+                    prompt_ids,
+                    torch.randint(1, vocab_size, (batch_size, completion_len)),
+                ],
+                dim=1,
+            )
+            for _ in range(group_size)
+        ]
+        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+
+        tiny_model.eval()
+        with torch.no_grad():
+            log_probs_chunk_8, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=8,
+            )
+
+            log_probs_chunk_16, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=16,
+            )
+
+            log_probs_chunk_5, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=5,
+            )
+
+        assert torch.allclose(log_probs_chunk_8, log_probs_chunk_16, atol=1e-5)
+        assert torch.allclose(log_probs_chunk_8, log_probs_chunk_5, atol=1e-5)
 
 
 class TestCountdownReward:

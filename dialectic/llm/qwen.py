@@ -373,6 +373,7 @@ class Qwen(nn.Module):
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
+        return_hidden_states: bool = False,
     ):
         x = self.embed_tokens(x)
 
@@ -380,6 +381,9 @@ class Qwen(nn.Module):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
 
         x = self.norm(x)
+
+        if return_hidden_states:
+            return x
 
         # just get last element of output sequence
         # important: if attention_mask is not None then we assume left padding!

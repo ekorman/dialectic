@@ -76,27 +76,120 @@ def compute_log_probs(
     attention_mask: Integer[torch.Tensor, "B L_prompt"],
     completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
     pad_token_id: int,
+    chunk_size: int = 0,
 ) -> tuple[Float[torch.Tensor, "B G L_new"], Bool[torch.Tensor, "B G L_new"]]:
+    """Compute log probabilities for completions.
+
+    Parameters
+    ----------
+    net
+        The language model (must be a Qwen model for chunked computation).
+    attention_mask
+        Attention mask for the prompt.
+    completion_token_ids
+        List of completion token tensors, one per group member.
+    pad_token_id
+        Token ID used for padding.
+    chunk_size
+        If > 0, compute log probs in chunks to reduce memory usage.
+        Recommended: 64-128 for large vocab models.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (log_probs, completion_mask) both of shape [B, G, L_completion]
+    """
     l_prompt = attention_mask.shape[1]
     stacked = stack_and_pad(tensors=completion_token_ids, pad_token_id=pad_token_id)
-    logits: Float[torch.Tensor, "B G L_completion VC"] = compute_logits_of_group(
-        net=net,
-        input_ids=stacked,
-        attention_mask=attention_mask,
-    )
 
-    logits = logits[:, :, l_prompt - 1 : -1]
+    if chunk_size > 0:
+        log_probs = _compute_log_probs_chunked(
+            net=net,
+            input_ids=stacked,
+            attention_mask=attention_mask,
+            l_prompt=l_prompt,
+            chunk_size=chunk_size,
+        )
+    else:
+        logits: Float[torch.Tensor, "B G L_completion VC"] = compute_logits_of_group(
+            net=net,
+            input_ids=stacked,
+            attention_mask=attention_mask,
+        )
+        logits = logits[:, :, l_prompt - 1 : -1]
+        only_completion = stacked[:, :, l_prompt:]
+        B, G, L, V = logits.shape
+        log_probs = -torch.nn.functional.cross_entropy(
+            logits.reshape(B * G * L, V),
+            only_completion.reshape(B * G * L),
+            reduction="none",
+        ).reshape(B, G, L)
+
     only_completion = stacked[:, :, l_prompt:]
-
-    B, G, L, V = logits.shape
-    log_probs = -torch.nn.functional.cross_entropy(
-        logits.reshape(B * G * L, V),
-        only_completion.reshape(B * G * L),
-        reduction="none",
-    ).reshape(B, G, L)
-
     completion_mask = only_completion != pad_token_id
     return log_probs, completion_mask
+
+
+def _compute_log_probs_chunked(
+    *,
+    net: nn.Module,
+    input_ids: Integer[torch.Tensor, "B G L"],
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
+    l_prompt: int,
+    chunk_size: int,
+) -> Float[torch.Tensor, "B G L_completion"]:
+    """Compute log probs in chunks to avoid OOM from large logits tensor."""
+    from dialectic.llm.qwen import Qwen
+
+    assert isinstance(net, Qwen), "Chunked computation requires Qwen model"
+
+    batch_size, group_size, seq_len = input_ids.shape
+    flat_input_ids = input_ids.view(batch_size * group_size, seq_len)
+
+    if attention_mask is not None:
+        full_mask = torch.ones(
+            batch_size,
+            seq_len,
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        full_mask[:, :l_prompt] = attention_mask
+        full_mask = full_mask.unsqueeze(1).expand(-1, group_size, -1)
+        full_mask = full_mask.reshape(batch_size * group_size, seq_len)
+    else:
+        full_mask = None
+
+    hidden_states: Float[torch.Tensor, "BG L D"] = net(
+        flat_input_ids,
+        attention_mask=full_mask,
+        return_hidden_states=True,
+    )
+
+    completion_len = seq_len - l_prompt
+    hidden_for_completion = hidden_states[:, l_prompt - 1 : -1]
+    target_tokens = flat_input_ids[:, l_prompt:]
+
+    log_probs_list = []
+    for chunk_start in range(0, completion_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, completion_len)
+
+        chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
+        chunk_targets = target_tokens[:, chunk_start:chunk_end]
+
+        chunk_logits = net.lm_head(chunk_hidden)
+
+        BG, L_chunk, V = chunk_logits.shape
+        chunk_log_probs = -torch.nn.functional.cross_entropy(
+            chunk_logits.reshape(BG * L_chunk, V),
+            chunk_targets.reshape(BG * L_chunk),
+            reduction="none",
+        ).reshape(BG, L_chunk)
+
+        log_probs_list.append(chunk_log_probs)
+        del chunk_logits
+
+    log_probs_flat = torch.cat(log_probs_list, dim=1)
+    return log_probs_flat.view(batch_size, group_size, completion_len)
 
 
 def stack_and_pad(
@@ -256,6 +349,7 @@ def collect_micro_batch(
     group_size: int,
     temperature: float,
     max_tokens_generated: int,
+    logprob_chunk_size: int = 0,
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
     env_responses = get_batch(env, batch_size)
@@ -324,12 +418,14 @@ def collect_micro_batch(
         attention_mask=attention_mask,
         completion_token_ids=completion_token_ids,
         pad_token_id=pad_token_id,
+        chunk_size=logprob_chunk_size,
     )
     old_log_probs, _ = compute_log_probs(
         net=net,
         attention_mask=attention_mask,
         completion_token_ids=completion_token_ids,
         pad_token_id=pad_token_id,
+        chunk_size=logprob_chunk_size,
     )
     t_logprobs = time.perf_counter() - t_logprobs_start
 
@@ -372,6 +468,7 @@ def train_grpo(
     normalize_advantages: bool = True,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
+    logprob_chunk_size: int = 64,
 ) -> None:
     n_episodes = 0
     step = 0
@@ -386,6 +483,7 @@ def train_grpo(
         micro_batches: list[dict] = []
 
         for _ in range(accumulation_steps):
+            print("A")
             micro_batch = collect_micro_batch(
                 net=net,
                 ref_net=ref_net,
@@ -400,11 +498,13 @@ def train_grpo(
                 group_size=group_size,
                 temperature=temperature,
                 max_tokens_generated=max_tokens_generated,
+                logprob_chunk_size=logprob_chunk_size,
             )
             micro_batches.append(micro_batch)
             t_gen_total += micro_batch["t_gen"]
             t_logprobs_total += micro_batch["t_logprobs"]
 
+        print("B")
         all_rewards = torch.cat(
             [mb["rewards"] for mb in micro_batches], dim=1
         )  # [G, B*accum]
@@ -431,6 +531,7 @@ def train_grpo(
                     attention_mask=micro_batch["attention_mask"],
                     completion_token_ids=micro_batch["completion_token_ids"],
                     pad_token_id=pad_token_id,
+                    chunk_size=logprob_chunk_size,
                 )
 
                 loss, ppo_loss, kl_loss = compute_grpo_loss(
