@@ -64,6 +64,7 @@ def train(
     accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
+    use_bf16: bool = True,
 ):
     extty.init(
         "grpo-learning",
@@ -80,6 +81,7 @@ def train(
             "accumulation_steps": accumulation_steps,
             "max_grad_norm": max_grad_norm,
             "logprob_chunk_size": logprob_chunk_size,
+            "use_bf16": use_bf16,
         },
         server=_check_inside_modal_fn(),
     )
@@ -134,6 +136,7 @@ def train(
             accumulation_steps=accumulation_steps,
             max_grad_norm=max_grad_norm,
             logprob_chunk_size=logprob_chunk_size,
+            use_bf16=use_bf16,
         )
     finally:
         extty.finish()
@@ -216,6 +219,18 @@ def main():
         default=64,
         help="Chunk size for log prob computation (0 to disable chunking)",
     )
+    parser.add_argument(
+        "--use-bf16",
+        action="store_true",
+        default=True,
+        help="Use bf16 mixed precision training (default: True)",
+    )
+    parser.add_argument(
+        "--no-bf16",
+        dest="use_bf16",
+        action="store_false",
+        help="Disable bf16 mixed precision training",
+    )
     args = parser.parse_args()
 
     train(
@@ -234,6 +249,7 @@ def main():
         accumulation_steps=args.accumulation_steps,
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
+        use_bf16=args.use_bf16,
     )
 
 

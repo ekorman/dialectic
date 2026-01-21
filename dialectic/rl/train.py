@@ -350,6 +350,7 @@ def collect_micro_batch(
     temperature: float,
     max_tokens_generated: int,
     logprob_chunk_size: int = 0,
+    use_bf16: bool = False,
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
     env_responses = get_batch(env, batch_size)
@@ -379,6 +380,7 @@ def collect_micro_batch(
         attention_mask=expanded_attention_mask,
         use_kv_cache=True,
         max_tokens_generated=max_tokens_generated,
+        use_bf16=use_bf16,
     )
     t_gen = time.perf_counter() - t_gen_start
     if was_training:
@@ -413,20 +415,23 @@ def collect_micro_batch(
     )
 
     t_logprobs_start = time.perf_counter()
-    ref_log_probs, completion_mask = compute_log_probs(
-        net=ref_net,
-        attention_mask=attention_mask,
-        completion_token_ids=completion_token_ids,
-        pad_token_id=pad_token_id,
-        chunk_size=logprob_chunk_size,
-    )
-    old_log_probs, _ = compute_log_probs(
-        net=net,
-        attention_mask=attention_mask,
-        completion_token_ids=completion_token_ids,
-        pad_token_id=pad_token_id,
-        chunk_size=logprob_chunk_size,
-    )
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        ref_log_probs, completion_mask = compute_log_probs(
+            net=ref_net,
+            attention_mask=attention_mask,
+            completion_token_ids=completion_token_ids,
+            pad_token_id=pad_token_id,
+            chunk_size=logprob_chunk_size,
+        )
+        old_log_probs, _ = compute_log_probs(
+            net=net,
+            attention_mask=attention_mask,
+            completion_token_ids=completion_token_ids,
+            pad_token_id=pad_token_id,
+            chunk_size=logprob_chunk_size,
+        )
     t_logprobs = time.perf_counter() - t_logprobs_start
 
     return {
@@ -469,7 +474,12 @@ def train_grpo(
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
+    use_bf16: bool = True,
 ) -> None:
+    device = next(net.parameters()).device
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
     n_episodes = 0
     step = 0
     ref_net = deepcopy(net)
@@ -499,6 +509,7 @@ def train_grpo(
                 temperature=temperature,
                 max_tokens_generated=max_tokens_generated,
                 logprob_chunk_size=logprob_chunk_size,
+                use_bf16=use_bf16,
             )
             micro_batches.append(micro_batch)
             t_gen_total += micro_batch["t_gen"]
@@ -526,13 +537,16 @@ def train_grpo(
                 ]
                 advs_for_loss: Float[torch.Tensor, "B G 1"] = advs_slice.T.unsqueeze(-1)
 
-                log_probs, _ = compute_log_probs(
-                    net=net,
-                    attention_mask=micro_batch["attention_mask"],
-                    completion_token_ids=micro_batch["completion_token_ids"],
-                    pad_token_id=pad_token_id,
-                    chunk_size=logprob_chunk_size,
-                )
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+                ):
+                    log_probs, _ = compute_log_probs(
+                        net=net,
+                        attention_mask=micro_batch["attention_mask"],
+                        completion_token_ids=micro_batch["completion_token_ids"],
+                        pad_token_id=pad_token_id,
+                        chunk_size=logprob_chunk_size,
+                    )
 
                 loss, ppo_loss, kl_loss = compute_grpo_loss(
                     log_probs=log_probs,
@@ -609,9 +623,9 @@ def train_grpo(
                     "train/reward_std": all_rewards.std().item(),
                     "train/completion_len_mean": completion_len_mean,
                     "train/example": examples,
-                    "time/generation": t_gen_total,
-                    "time/logprobs": t_logprobs_total,
-                    "time/optimization": t_opt,
+                    "train/generation_time": t_gen_total,
+                    "train/logprobs_time": t_logprobs_total,
+                    "train/optimization_time": t_opt,
                     **{
                         f"train/reward/{name}": mean
                         for name, mean in component_means.items()

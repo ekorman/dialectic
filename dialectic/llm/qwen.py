@@ -416,6 +416,7 @@ def generate_from_tokens(
     use_kv_cache: bool = True,
     attention_mask: torch.Tensor | None = None,  # should be left-padded
     temperature: float = 1.0,
+    use_bf16: bool = False,
 ) -> Int[Tensor, "B L"]:
     assert sampling_strategy in ["greedy", "sample"]
 
@@ -444,9 +445,12 @@ def generate_from_tokens(
 
     tokens_generated = 0
     while tokens_generated < max_tokens_generated:
-        logits: torch.Tensor = net(
-            input_ids, kv_caches=kv_caches, attention_mask=attention_mask
-        )
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            logits: torch.Tensor = net(
+                input_ids, kv_caches=kv_caches, attention_mask=attention_mask
+            )
 
         if sampling_strategy == "greedy":
             next_token_id = logits.argmax(-1)

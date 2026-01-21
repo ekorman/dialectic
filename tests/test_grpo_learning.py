@@ -82,6 +82,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
     def test_loss_is_finite(self, tiny_model, tokenizer, env):
@@ -107,6 +108,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer, env):
@@ -159,6 +161,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
         params_changed = False
@@ -168,6 +171,36 @@ class TestGRPOMechanics:
                 break
 
         assert params_changed, "No parameters changed during training"
+
+    def test_bf16_training_produces_finite_loss(self, tiny_model, tokenizer, env):
+        """bf16 mixed precision training produces finite loss values."""
+        opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+
+        train_grpo(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            reward_fn=CountdownRewardFn(),
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151643,
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=0.01,
+            eps=0.2,
+            mu=1,
+            max_tokens_generated=20,
+            max_episodes=4,
+            update_ref_net_batch_cadence=5,
+            batch_size=2,
+            group_size=2,
+            temperature=1.0,
+            use_bf16=True,
+        )
+
+        for param in tiny_model.parameters():
+            assert param.dtype == torch.bfloat16
+            assert torch.isfinite(param).all()
 
 
 class TestChunkedLogProbs:
