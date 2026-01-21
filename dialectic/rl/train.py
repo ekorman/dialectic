@@ -575,9 +575,9 @@ def train_grpo(
         step += 1
         n_episodes += batch_size * accumulation_steps
 
-        all_output_strs = [s for mb in micro_batches for s in mb["output_strs"][0]] + [
+        all_output_strs = [
             s
-            for g in range(1, group_size)
+            for g in range(group_size)
             for mb in micro_batches
             for s in mb["output_strs"][g]
         ]
