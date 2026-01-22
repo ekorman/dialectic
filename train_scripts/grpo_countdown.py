@@ -65,6 +65,9 @@ def train(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
+    use_vllm: bool = False,
+    vllm_model_path: str | None = None,
+    vllm_gpu_memory_utilization: float = 0.4,
 ):
     extty.init(
         "grpo-learning",
@@ -82,6 +85,8 @@ def train(
             "max_grad_norm": max_grad_norm,
             "logprob_chunk_size": logprob_chunk_size,
             "use_bf16": use_bf16,
+            "use_vllm": use_vllm,
+            "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization,
         },
         server=_check_inside_modal_fn(),
     )
@@ -113,6 +118,20 @@ def train(
     print(f"device: {device}")
     net = net.to(device)
 
+    # Initialize vLLM generator if requested
+    vllm_generator = None
+    if use_vllm:
+        from dialectic.llm.vllm_generation import create_vllm_generator
+
+        model_path = vllm_model_path or weights_path
+        print(f"Initializing vLLM generator with model: {model_path}")
+        vllm_generator = create_vllm_generator(
+            weights_path=model_path,
+            tokenizer_path=tokenizer_path,
+            gpu_memory_utilization=vllm_gpu_memory_utilization,
+        )
+        print("vLLM generator initialized")
+
     try:
         train_grpo(
             net=net,
@@ -137,6 +156,7 @@ def train(
             max_grad_norm=max_grad_norm,
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
+            vllm_generator=vllm_generator,
         )
     finally:
         extty.finish()
@@ -231,6 +251,22 @@ def main():
         action="store_false",
         help="Disable bf16 mixed precision training",
     )
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        help="Use vLLM for generation (faster inference)",
+    )
+    parser.add_argument(
+        "--vllm-model-path",
+        default=None,
+        help="Path to model for vLLM (defaults to weights-path if not specified)",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.4,
+        help="GPU memory utilization for vLLM (0.0-1.0, default: 0.4)",
+    )
     args = parser.parse_args()
 
     train(
@@ -250,6 +286,9 @@ def main():
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
+        use_vllm=args.use_vllm,
+        vllm_model_path=args.vllm_model_path,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
     )
 
 

@@ -351,6 +351,7 @@ def collect_micro_batch(
     max_tokens_generated: int,
     logprob_chunk_size: int = 0,
     use_bf16: bool = False,
+    vllm_generator=None,  # VLLMGenerator | None
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
     env_responses = get_batch(env, batch_size)
@@ -367,24 +368,37 @@ def collect_micro_batch(
     expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
     expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
 
-    was_training = net.training
-    net.eval()
     t_gen_start = time.perf_counter()
-    all_completions = generate_from_tokens(
-        net=net,
-        token_ids=expanded_token_ids,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
-        sampling_strategy="sample",
-        temperature=temperature,
-        attention_mask=expanded_attention_mask,
-        use_kv_cache=True,
-        max_tokens_generated=max_tokens_generated,
-        use_bf16=use_bf16,
-    )
+
+    # Use vLLM for generation if available, otherwise use standard generation
+    if vllm_generator is not None:
+        all_completions = vllm_generator.generate_from_tokens(
+            token_ids=expanded_token_ids,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            sampling_strategy="sample",
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+        )
+    else:
+        was_training = net.training
+        net.eval()
+        all_completions = generate_from_tokens(
+            net=net,
+            token_ids=expanded_token_ids,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            sampling_strategy="sample",
+            temperature=temperature,
+            attention_mask=expanded_attention_mask,
+            use_kv_cache=True,
+            max_tokens_generated=max_tokens_generated,
+            use_bf16=use_bf16,
+        )
+        if was_training:
+            net.train()
+
     t_gen = time.perf_counter() - t_gen_start
-    if was_training:
-        net.train()
 
     all_completions = all_completions.view(batch_size, group_size, -1)
     all_completions = all_completions.permute(1, 0, 2)
@@ -475,6 +489,7 @@ def train_grpo(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
+    vllm_generator=None,  # VLLMGenerator | None
 ) -> None:
     device = next(net.parameters()).device
     if use_bf16:
@@ -510,6 +525,7 @@ def train_grpo(
                 max_tokens_generated=max_tokens_generated,
                 logprob_chunk_size=logprob_chunk_size,
                 use_bf16=use_bf16,
+                vllm_generator=vllm_generator,
             )
             micro_batches.append(micro_batch)
             t_gen_total += micro_batch["t_gen"]
