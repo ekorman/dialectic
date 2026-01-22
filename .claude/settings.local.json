@@ -17,7 +17,9 @@
       "Bash(python3:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:xihuai18.github.io)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(source ~/.nvm/nvm.sh)",
+      "Bash(ls:*)"
     ]
   }
 }

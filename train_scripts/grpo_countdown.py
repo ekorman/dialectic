@@ -51,16 +51,20 @@ def train(
     *,
     device: str | None = None,
     max_episodes: int = 1000,
-    batch_size: int = 8,
-    group_size: int = 4,
-    max_tokens: int = 1000,
+    batch_size: int = 2,
+    group_size: int = 8,
+    max_tokens: int = 1024,
     lr: float = 1e-5,
     beta: float = 0.04,
     weights_path: str = "/weights/qwen3-0.6b.pth",
     tokenizer_path: str = "/weights/tokenizer.json",
     binary_reward: bool = False,
     num_operands: int = 2,
-    mu: int = 4,
+    mu: int = 1,
+    accumulation_steps: int = 16,
+    max_grad_norm: float = 1.0,
+    logprob_chunk_size: int = 64,
+    use_bf16: bool = True,
 ):
     extty.init(
         "grpo-learning",
@@ -74,6 +78,10 @@ def train(
             "binary_reward": binary_reward,
             "mu": mu,
             "num_operands": num_operands,
+            "accumulation_steps": accumulation_steps,
+            "max_grad_norm": max_grad_norm,
+            "logprob_chunk_size": logprob_chunk_size,
+            "use_bf16": use_bf16,
         },
         server=_check_inside_modal_fn(),
     )
@@ -125,6 +133,10 @@ def train(
             batch_size=batch_size,
             group_size=group_size,
             temperature=0.7,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            logprob_chunk_size=logprob_chunk_size,
+            use_bf16=use_bf16,
         )
     finally:
         extty.finish()
@@ -159,12 +171,12 @@ def main():
     parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
     parser.add_argument(
-        "--max-episodes", type=int, default=50, help="Max training episodes"
+        "--max-episodes", type=int, default=1000, help="Max training episodes"
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
-    parser.add_argument("--group-size", type=int, default=2, help="Group size for GRPO")
+    parser.add_argument("--group-size", type=int, default=8, help="Group size for GRPO")
     parser.add_argument(
-        "--max-tokens", type=int, default=100, help="Max tokens to generate"
+        "--max-tokens", type=int, default=1024, help="Max tokens to generate"
     )
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument(
@@ -176,14 +188,49 @@ def main():
     parser.add_argument(
         "--tokenizer-path",
         default="qwen-tokenizer/tokenizer.json",
-        help="Path to model weights",
+        help="Path to tokenizer",
     )
     parser.add_argument(
         "--binary-reward",
         action="store_true",
         help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
     )
-    parser.add_argument("--num_operands", type=int, default=2, help="Batch size")
+    parser.add_argument(
+        "--num-operands", type=int, default=2, help="Number of operands"
+    )
+    parser.add_argument(
+        "--mu", type=int, default=1, help="Optimization passes per batch"
+    )
+    parser.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=16,
+        help="Gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping",
+    )
+    parser.add_argument(
+        "--logprob-chunk-size",
+        type=int,
+        default=64,
+        help="Chunk size for log prob computation (0 to disable chunking)",
+    )
+    parser.add_argument(
+        "--use-bf16",
+        action="store_true",
+        default=True,
+        help="Use bf16 mixed precision training (default: True)",
+    )
+    parser.add_argument(
+        "--no-bf16",
+        dest="use_bf16",
+        action="store_false",
+        help="Disable bf16 mixed precision training",
+    )
     args = parser.parse_args()
 
     train(
@@ -197,6 +244,12 @@ def main():
         weights_path=args.weights_path,
         tokenizer_path=args.tokenizer_path,
         binary_reward=args.binary_reward,
+        num_operands=args.num_operands,
+        mu=args.mu,
+        accumulation_steps=args.accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        logprob_chunk_size=args.logprob_chunk_size,
+        use_bf16=args.use_bf16,
     )
 
 

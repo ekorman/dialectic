@@ -18,7 +18,7 @@ from dialectic.llm.qwen import Qwen
 from dialectic.rl.env import CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn
-from dialectic.rl.train import train_grpo
+from dialectic.rl.train import compute_log_probs, train_grpo
 from dialectic.rl.types import Countdown
 
 
@@ -82,6 +82,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
     def test_loss_is_finite(self, tiny_model, tokenizer, env):
@@ -107,6 +108,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer, env):
@@ -159,6 +161,7 @@ class TestGRPOMechanics:
             batch_size=2,
             group_size=2,
             temperature=1.0,
+            use_bf16=False,
         )
 
         params_changed = False
@@ -168,6 +171,235 @@ class TestGRPOMechanics:
                 break
 
         assert params_changed, "No parameters changed during training"
+
+    def test_bf16_training_produces_finite_loss(self, tiny_model, tokenizer, env):
+        """bf16 mixed precision training produces finite loss values."""
+        opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+
+        train_grpo(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            reward_fn=CountdownRewardFn(),
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151643,
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=0.01,
+            eps=0.2,
+            mu=1,
+            max_tokens_generated=20,
+            max_episodes=4,
+            update_ref_net_batch_cadence=5,
+            batch_size=2,
+            group_size=2,
+            temperature=1.0,
+            use_bf16=True,
+        )
+
+        for param in tiny_model.parameters():
+            assert param.dtype == torch.bfloat16
+            assert torch.isfinite(param).all()
+
+    def test_gradient_accumulation_matches_large_batch(
+        self, tiny_model, tokenizer, monkeypatch
+    ):
+        """Gradient accumulation matches a larger batch update."""
+        from copy import deepcopy
+
+        from dialectic.rl.env import EpisodeIsDoneError, Env
+        from dialectic.rl.types import EnvResponse
+
+        class FixedCountdownEnv(Env[Countdown, None]):
+            def __init__(self, responses: list[Countdown]):
+                self._responses = responses
+                self._idx = 0
+
+            def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
+                if self._idx >= len(self._responses):
+                    raise RuntimeError("Exceeded fixed environment responses")
+                response = self._responses[self._idx]
+                self._idx += 1
+                return EnvResponse(is_done=True, data=response)
+
+            def step(self, action: None):
+                raise EpisodeIsDoneError
+
+        def deterministic_generate_from_tokens(
+            *,
+            token_ids: torch.Tensor,
+            **kwargs,
+        ) -> torch.Tensor:
+            pad_token_id = kwargs.get("pad_token_id")
+            completion_token_id = 1 if pad_token_id != 1 else 2
+            extra = torch.full(
+                (token_ids.shape[0], 1),
+                completion_token_id,
+                dtype=token_ids.dtype,
+                device=token_ids.device,
+            )
+            return torch.cat([token_ids, extra], dim=1)
+
+        monkeypatch.setattr(
+            "dialectic.rl.train.generate_from_tokens",
+            deterministic_generate_from_tokens,
+        )
+
+        fixed_responses = [
+            Countdown(prompt=f"Prompt {i}", numbers=[1, 2, 3], target=6)
+            for i in range(4)
+        ]
+
+        base_state = deepcopy(tiny_model.state_dict())
+
+        def run_training(*, batch_size: int, accumulation_steps: int) -> Qwen:
+            model = create_tiny_model()
+            model.load_state_dict(base_state)
+            env = FixedCountdownEnv(deepcopy(fixed_responses))
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            train_grpo(
+                net=model,
+                opt=opt,
+                env=env,
+                reward_fn=CountdownRewardFn(),
+                state_to_str=countdown_state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=151643,
+                pad_token_id=151643,
+                extractor=extract_from_answer_tags,
+                beta=0.01,
+                eps=0.2,
+                mu=1,
+                max_tokens_generated=1,
+                max_episodes=batch_size * accumulation_steps,
+                update_ref_net_batch_cadence=10,
+                batch_size=batch_size,
+                group_size=2,
+                temperature=1.0,
+                normalize_advantages=True,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=0.0,
+                logprob_chunk_size=0,
+                use_bf16=False,
+            )
+            return model
+
+        model_large_batch = run_training(batch_size=4, accumulation_steps=1)
+        model_accumulated = run_training(batch_size=2, accumulation_steps=2)
+
+        for name, param in model_large_batch.named_parameters():
+            accum_param = dict(model_accumulated.named_parameters())[name]
+            assert torch.allclose(param, accum_param, atol=1e-6), (
+                f"Parameter {name} mismatch between accumulation and large batch"
+            )
+
+
+class TestChunkedLogProbs:
+    """Test that chunked log prob computation matches non-chunked."""
+
+    @pytest.fixture
+    def tiny_model(self):
+        return create_tiny_model()
+
+    def test_chunked_matches_non_chunked(self, tiny_model):
+        """Chunked and non-chunked log prob computation give identical results."""
+        batch_size = 2
+        group_size = 3
+        prompt_len = 10
+        completion_len = 20
+        vocab_size = tiny_model.vocab_size
+        pad_token_id = 0
+
+        torch.manual_seed(42)
+        prompt_ids = torch.randint(1, vocab_size, (batch_size, prompt_len))
+        completion_ids = [
+            torch.cat(
+                [
+                    prompt_ids,
+                    torch.randint(1, vocab_size, (batch_size, completion_len)),
+                ],
+                dim=1,
+            )
+            for _ in range(group_size)
+        ]
+        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+
+        tiny_model.eval()
+        with torch.no_grad():
+            log_probs_no_chunk, mask_no_chunk = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=0,
+            )
+
+            log_probs_chunked, mask_chunked = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=8,
+            )
+
+        assert log_probs_no_chunk.shape == log_probs_chunked.shape
+        assert mask_no_chunk.shape == mask_chunked.shape
+        assert torch.allclose(log_probs_no_chunk, log_probs_chunked, atol=1e-5)
+        assert torch.equal(mask_no_chunk, mask_chunked)
+
+    def test_chunked_with_different_chunk_sizes(self, tiny_model):
+        """Different chunk sizes produce identical results."""
+        batch_size = 2
+        group_size = 2
+        prompt_len = 8
+        completion_len = 32
+        vocab_size = tiny_model.vocab_size
+        pad_token_id = 0
+
+        torch.manual_seed(123)
+        prompt_ids = torch.randint(1, vocab_size, (batch_size, prompt_len))
+        completion_ids = [
+            torch.cat(
+                [
+                    prompt_ids,
+                    torch.randint(1, vocab_size, (batch_size, completion_len)),
+                ],
+                dim=1,
+            )
+            for _ in range(group_size)
+        ]
+        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+
+        tiny_model.eval()
+        with torch.no_grad():
+            log_probs_chunk_8, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=8,
+            )
+
+            log_probs_chunk_16, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=16,
+            )
+
+            log_probs_chunk_5, _ = compute_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_token_ids=completion_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=5,
+            )
+
+        assert torch.allclose(log_probs_chunk_8, log_probs_chunk_16, atol=1e-5)
+        assert torch.allclose(log_probs_chunk_8, log_probs_chunk_5, atol=1e-5)
 
 
 class TestCountdownReward:
