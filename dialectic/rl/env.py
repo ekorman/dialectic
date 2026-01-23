@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic
 
-from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 from dialectic.rl.types import QA, A, EnvResponse, T
 
 
@@ -176,6 +175,7 @@ class CountdownEnv(Env[Countdown, None]):
 
     def __init__(
         self,
+        prompt_template: str | None = None,
         num_operands: int = 4,
         min_number: int = 1,
         max_number: int = 25,
@@ -183,10 +183,18 @@ class CountdownEnv(Env[Countdown, None]):
         self.num_operands = num_operands
         self.min_number = min_number
         self.max_number = max_number
+        self.prompt_template = prompt_template or (
+            "Using the numbers {numbers}, create an equation that equals {target}. "
+            "You can use +, -, *, / and each number at most once. "
+            "Show your reasoning in <reasoning></reasoning> tags. Please be concise and give just one solution."
+            "Put your final equation in <answer></answer> tags. "
+            "For example, if the equation is 3+5*2, respond with <reasoning>[detailed reasoning explanations]</reasoning><answer>3+5*2</answer>."
+        )
         self.rng = random.Random()
 
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
-        self.rng.seed(seed)
+        if seed is not None:
+            self.rng.seed(seed)
         numbers = [
             self.rng.randint(self.min_number, self.max_number)
             for _ in range(self.num_operands)
@@ -199,18 +207,7 @@ class CountdownEnv(Env[Countdown, None]):
 
         target = eval(expr)
 
-        user_content = (
-            f"Using the numbers {numbers}, create an equation that equals {target}. "
-            f"You can use +, -, *, / and each number at most once. "
-            f"Show your reasoning in <think></think> tags. Please be concise and give just one solution."
-            f"Put your final equation in <answer></answer> tags. "
-            f"For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
-        )
-
-        prompt = get_input_text_from_messages(
-            messages=[Message(role="user", content=user_content)],
-            add_generation_prompt=True,
-        )
+        prompt = self.prompt_template.format(numbers=numbers, target=target)
 
         return EnvResponse(
             is_done=True,

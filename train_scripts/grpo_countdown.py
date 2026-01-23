@@ -16,6 +16,7 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
+from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -39,8 +40,33 @@ bucket_name = "model-weights"
 r2_account_id = "a64c6da180648dd944675d311c296763"
 
 
-def countdown_state_to_str(data: Countdown) -> str:
-    return data.prompt
+def get_state_to_str(enable_thinking: bool):
+    def _state_to_str(data: Countdown) -> str:
+        return get_input_text_from_messages(
+            [Message(role="user", content=data.prompt)],
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+
+    return _state_to_str
+
+
+def get_prompt_template(enable_thinking: bool):
+    if enable_thinking:
+        return (
+            "Using the numbers {numbers}, create an equation that equals {target}. "
+            "You can use +, -, *, / and each number at most once. "
+            "Show your reasoning in <think></think> tags. Please be concise and give just one solution."
+            "Put your final equation in <answer></answer> tags. "
+            "For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
+        )
+    return (
+        "Using the numbers {numbers}, create an equation that equals {target}. "
+        "You can use +, -, *, / and each number at most once. "
+        "Show your reasoning in <reasoning></reasoning> tags. Please be concise and give just one solution."
+        "Put your final equation in <answer></answer> tags. "
+        "For example, if the equation is 3+5*2, respond with <reasoning>[detailed reasoning explanations]</reasoning><answer>3+5*2</answer>."
+    )
 
 
 TIMEOUT_HOURS = 1
@@ -64,6 +90,7 @@ def train(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
+    use_qwen_thinking: bool = False,
 ):
     extty.init(
         "grpo-learning",
@@ -107,10 +134,13 @@ def train(
         num_operands=num_operands,
         min_number=1,
         max_number=10,
+        prompt_template=get_prompt_template(enable_thinking=use_qwen_thinking),
     )
     device = device or get_default_device()
     print(f"device: {device}")
     net = net.to(device)
+
+    state_to_str = get_state_to_str(enable_thinking=use_qwen_thinking)
 
     try:
         train_grpo(
@@ -118,7 +148,7 @@ def train(
             opt=opt,
             env=env,
             reward_fn=reward_fn,
-            state_to_str=countdown_state_to_str,
+            state_to_str=state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151645,  # <|im_end|>
             pad_token_id=151643,
@@ -230,6 +260,19 @@ def main():
         action="store_false",
         help="Disable bf16 mixed precision training",
     )
+
+    parser.add_argument(
+        "--use-qwen-thinking",
+        action="store_true",
+        default=False,
+        help="Use Qwen's out-of-the-box thinking mode",
+    )
+    parser.add_argument(
+        "--no-qwen-thinking",
+        dest="use_qwen_thinking",
+        action="store_false",
+        help="Do not use Qwen's out-of-the-box thinking mode",
+    )
     args = parser.parse_args()
 
     train(
@@ -249,6 +292,7 @@ def main():
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
+        use_qwen_thinking=args.use_qwen_thinking,
     )
 
 
