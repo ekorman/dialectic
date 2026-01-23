@@ -179,6 +179,7 @@ class CountdownEnv(Env[Countdown, None]):
         num_operands: int = 4,
         min_number: int = 1,
         max_number: int = 25,
+        seed: int | None = None,
     ):
         self.num_operands = num_operands
         self.min_number = min_number
@@ -190,7 +191,7 @@ class CountdownEnv(Env[Countdown, None]):
             "Put your final equation in <answer></answer> tags. "
             "For example, if the equation is 3+5*2, respond with <reasoning>[detailed reasoning explanations]</reasoning><answer>3+5*2</answer>."
         )
-        self.rng = random.Random()
+        self.rng = random.Random(seed)
 
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
         if seed is not None:
