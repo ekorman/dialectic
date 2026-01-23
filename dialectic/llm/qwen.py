@@ -536,13 +536,16 @@ def generate_from_chat(
     max_tokens_generated: int = 1000,
     device: str | torch.device | None = None,
     temperature: float = 1.0,
+    enable_thinking: bool = True,
 ):
     return generate_from_text(
         net=net,
         tokenizer=tokenizer,
         sampling_strategy=sampling_strategy,
         text_batch=[
-            get_input_text_from_messages(message, add_generation_prompt=True)
+            get_input_text_from_messages(
+                message, add_generation_prompt=True, enable_thinking=enable_thinking
+            )
             for message in batch_messages
         ],
         eos_token=eos_token,
