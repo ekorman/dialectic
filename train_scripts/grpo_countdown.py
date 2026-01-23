@@ -17,11 +17,10 @@ from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
 from dialectic.llm.utils import get_default_device
-from dialectic.rl.env import CountdownEnv
+from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
-from dialectic.rl.types import Countdown
 
 
 def _is_modal_installed():

@@ -2,11 +2,12 @@ import json
 import random
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic
 
 from dialectic.llm.tokenizer import Message, get_input_text_from_messages
-from dialectic.rl.types import QA, A, Countdown, EnvResponse, T
+from dialectic.rl.types import QA, A, EnvResponse, T
 
 
 class EpisodeIsDoneError(RuntimeError):
@@ -147,6 +148,13 @@ class GSM8kEnv(Env[QA[float], None]):
 
     def step(self, action: None):
         raise EpisodeIsDoneError
+
+
+@dataclass
+class Countdown:
+    prompt: str
+    numbers: list[int]
+    target: int
 
 
 class CountdownEnv(Env[Countdown, None]):

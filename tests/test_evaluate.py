@@ -5,12 +5,11 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import Qwen
-from dialectic.rl.env import CountdownEnv
+from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.evaluate import EvaluationResult, evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn
 from dialectic.rl.train import RolloutBatch, generate_rollout_batch
-from dialectic.rl.types import Countdown
 
 
 def create_tiny_model(vocab_size: int = 151936) -> Qwen:

@@ -2,7 +2,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Generic, Sequence
 
-from dialectic.rl.types import QA, Countdown, E, EnvResponse, RewardResult, T
+from dialectic.rl.env import Countdown
+from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
 
 class RewardFn(ABC, Generic[T, E]):
