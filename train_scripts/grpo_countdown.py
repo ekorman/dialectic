@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import importlib.util
+import os
 
 import extty
 import torch
@@ -69,7 +70,7 @@ def get_prompt_template(enable_thinking: bool):
     )
 
 
-TIMEOUT_HOURS = 1
+MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
 def train(
@@ -192,7 +193,7 @@ if _is_modal_installed():
                 read_only=True,
             )
         },
-        timeout=60 * 60 * TIMEOUT_HOURS,
+        timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
     )(train)
 
 
