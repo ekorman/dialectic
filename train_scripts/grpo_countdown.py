@@ -127,7 +127,9 @@ def train(
     if binary_reward:
         reward_fn = CountdownRewardFn()
     else:
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(
+            "think" if use_qwen_thinking else "reasoning"
+        )
 
     tokenizer = Tokenizer.from_file(tokenizer_path)
 

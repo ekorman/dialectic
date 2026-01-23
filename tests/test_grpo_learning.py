@@ -483,7 +483,7 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_correct_answer(self):
         """Max selection: correct (1.0) beats all other accuracy components."""
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -504,10 +504,7 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_parseable_only(self):
         """Max selection: parseable (0.3) wins when correct fails."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -526,10 +523,7 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_think_tags_only(self):
         """Max selection: think_tags (0.05) wins when no answer tags."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
