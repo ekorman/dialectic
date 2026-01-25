@@ -229,6 +229,8 @@ def compute_advantages(
 ) -> Float[torch.Tensor, "G B"]:
     mean = rewards.mean(0, keepdim=True)
     if normalize:
+        if rewards.shape[0] <= 1:
+            return rewards - mean
         return (rewards - mean) / (rewards.std(0, keepdim=True) + eps)
     return rewards - mean
 
@@ -281,6 +283,9 @@ def generate_rollout_batch(
     was_training = net.training
     net.eval()
     t_gen_start = time.perf_counter()
+    # import pdb
+
+    # pdb.set_trace()
     all_completions = generate_from_tokens(
         net=net,
         token_ids=expanded_token_ids,
