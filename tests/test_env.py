@@ -115,7 +115,7 @@ class TestCountdownEnv:
         for num in resp.data.numbers:
             assert 10 <= num <= 20
 
-    def test_seed_reproducibility(self):
+    def test_seed_reproducibility_at_reset(self):
         env1 = CountdownEnv()
         env2 = CountdownEnv()
 
@@ -124,6 +124,17 @@ class TestCountdownEnv:
 
         assert resp1.data.numbers == resp2.data.numbers
         assert resp1.data.target == resp2.data.target
+
+    def test_seed_reproducibility_at_init(self):
+        env1 = CountdownEnv(seed=42)
+        env2 = CountdownEnv(seed=42)
+
+        env1_responses = [env1.reset() for _ in range(3)]
+        env2_responses = [env2.reset() for _ in range(3)]
+
+        for resp1, resp2 in zip(env1_responses, env2_responses):
+            assert resp1.data.numbers == resp2.data.numbers
+            assert resp1.data.target == resp2.data.target
 
     def test_step_raises_error(self):
         env = CountdownEnv()

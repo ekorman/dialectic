@@ -1,7 +1,8 @@
 import time
 import warnings
 from copy import deepcopy
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Generic
 
 import extty
 import torch
@@ -13,6 +14,18 @@ from dialectic.llm.qwen import Qwen, generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
+
+
+@dataclass
+class RolloutBatch(Generic[T]):
+    env_responses: list[EnvResponse[T]]
+    prompts: list[str]
+    output_strs: list[list[str]]  # [G][B]
+    reward_results: list[list[RewardResult]]  # [G][B]
+    rewards: Float[torch.Tensor, "G B"]
+    completion_token_ids: list[Integer[torch.Tensor, "B L"]]  # len G
+    attention_mask: Bool[torch.Tensor, "B L_prompt"]
+    t_generation: float
 
 
 def aggregate_reward_components(
@@ -216,6 +229,8 @@ def compute_advantages(
 ) -> Float[torch.Tensor, "G B"]:
     mean = rewards.mean(0, keepdim=True)
     if normalize:
+        if rewards.shape[0] <= 1:
+            return rewards - mean
         return (rewards - mean) / (rewards.std(0, keepdim=True) + eps)
     return rewards - mean
 
@@ -231,6 +246,98 @@ def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
         else:
             warnings.warn("Got None response from `env.reset`")
     return env_responses
+
+
+@torch.no_grad()
+def generate_rollout_batch(
+    *,
+    net: Qwen,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[str], E],
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    max_tokens_generated: int,
+    use_bf16: bool = False,
+) -> RolloutBatch[T]:
+    """Generate completions and compute rewards for a batch from the environment."""
+    env_responses = get_batch(env, batch_size)
+    prompts = [state_to_str(resp.data) for resp in env_responses]
+    device = next(net.parameters()).device
+
+    tokenizer.enable_padding(direction="left")
+    tokens = tokenizer.encode_batch(prompts)
+    attention_mask = (
+        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+    )
+    token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
+    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+
+    was_training = net.training
+    net.eval()
+    t_gen_start = time.perf_counter()
+
+    all_completions = generate_from_tokens(
+        net=net,
+        token_ids=expanded_token_ids,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        sampling_strategy="sample" if temperature > 0 else "greedy",
+        temperature=temperature if temperature > 0 else 1.0,
+        attention_mask=expanded_attention_mask,
+        use_kv_cache=True,
+        max_tokens_generated=max_tokens_generated,
+        use_bf16=use_bf16,
+    )
+    t_generation = time.perf_counter() - t_gen_start
+    if was_training:
+        net.train()
+
+    all_completions = all_completions.view(batch_size, group_size, -1)
+    all_completions = all_completions.permute(1, 0, 2)
+    completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
+        all_completions.unbind(0)
+    )
+
+    prompt_len = token_ids.shape[1]
+
+    output_strs: list[list[str]] = [
+        tokenizer.decode_batch(c[:, prompt_len:].tolist()) for c in completion_token_ids
+    ]
+    reward_results: list[list[RewardResult]] = [
+        [
+            reward_fn(
+                env_response=env_response,
+                raw_model_output=s,
+                extracted_model_output=extractor(s),
+            )
+            for s, env_response in zip(group_batch, env_responses)
+        ]
+        for group_batch in output_strs
+    ]
+
+    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        [[r.total for r in row] for row in reward_results],
+        device=device,
+    )
+
+    return RolloutBatch(
+        env_responses=env_responses,
+        prompts=prompts,
+        output_strs=output_strs,
+        reward_results=reward_results,
+        rewards=rewards,
+        completion_token_ids=completion_token_ids,
+        attention_mask=attention_mask,
+        t_generation=t_generation,
+    )
 
 
 def compute_grpo_loss(
@@ -353,99 +460,55 @@ def collect_micro_batch(
     use_bf16: bool = False,
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
-    env_responses = get_batch(env, batch_size)
-    prompts = [state_to_str(resp.data) for resp in env_responses]
-    device = next(net.parameters()).device
-
-    tokenizer.enable_padding(direction="left")
-    tokens = tokenizer.encode_batch(prompts)
-    attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
-    )
-    token_ids = torch.tensor([t.ids for t in tokens], device=device)
-
-    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
-
-    was_training = net.training
-    net.eval()
-    t_gen_start = time.perf_counter()
-    all_completions = generate_from_tokens(
+    rollout = generate_rollout_batch(
         net=net,
-        token_ids=expanded_token_ids,
-        pad_token_id=pad_token_id,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
         eos_token_id=eos_token_id,
-        sampling_strategy="sample",
+        pad_token_id=pad_token_id,
+        extractor=extractor,
+        batch_size=batch_size,
+        group_size=group_size,
         temperature=temperature,
-        attention_mask=expanded_attention_mask,
-        use_kv_cache=True,
         max_tokens_generated=max_tokens_generated,
         use_bf16=use_bf16,
     )
-    t_gen = time.perf_counter() - t_gen_start
-    if was_training:
-        net.train()
 
-    all_completions = all_completions.view(batch_size, group_size, -1)
-    all_completions = all_completions.permute(1, 0, 2)
-    completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
-        all_completions.unbind(0)
-    )
-
-    prompt_len = token_ids.shape[1]
-
-    output_strs: list[list[str]] = [
-        tokenizer.decode_batch(c[:, prompt_len:].tolist()) for c in completion_token_ids
-    ]
-    reward_results: list[list[RewardResult]] = [
-        [
-            reward_fn(
-                env_response=env_response,
-                raw_model_output=s,
-                extracted_model_output=extractor(s),
-            )
-            for s, env_response in zip(group_batch, env_responses)
-        ]
-        for group_batch in output_strs
-    ]
-
-    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
-        [[r.total for r in row] for row in reward_results],
-        device=device,
-    )
-
+    device = next(net.parameters()).device
     t_logprobs_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
         ref_log_probs, completion_mask = compute_log_probs(
             net=ref_net,
-            attention_mask=attention_mask,
-            completion_token_ids=completion_token_ids,
+            attention_mask=rollout.attention_mask,
+            completion_token_ids=rollout.completion_token_ids,
             pad_token_id=pad_token_id,
             chunk_size=logprob_chunk_size,
         )
         old_log_probs, _ = compute_log_probs(
             net=net,
-            attention_mask=attention_mask,
-            completion_token_ids=completion_token_ids,
+            attention_mask=rollout.attention_mask,
+            completion_token_ids=rollout.completion_token_ids,
             pad_token_id=pad_token_id,
             chunk_size=logprob_chunk_size,
         )
     t_logprobs = time.perf_counter() - t_logprobs_start
 
     return {
-        "prompts": prompts,
-        "env_responses": env_responses,
-        "attention_mask": attention_mask,
-        "completion_token_ids": completion_token_ids,
-        "output_strs": output_strs,
-        "reward_results": reward_results,
-        "rewards": rewards,
+        "prompts": rollout.prompts,
+        "env_responses": rollout.env_responses,
+        "attention_mask": rollout.attention_mask,
+        "completion_token_ids": rollout.completion_token_ids,
+        "output_strs": rollout.output_strs,
+        "reward_results": rollout.reward_results,
+        "rewards": rollout.rewards,
         "ref_log_probs": ref_log_probs,
         "old_log_probs": old_log_probs,
         "completion_mask": completion_mask,
-        "t_gen": t_gen,
+        "t_gen": rollout.t_generation,
         "t_logprobs": t_logprobs,
     }
 
@@ -493,7 +556,6 @@ def train_grpo(
         micro_batches: list[dict] = []
 
         for _ in range(accumulation_steps):
-            print("A")
             micro_batch = collect_micro_batch(
                 net=net,
                 ref_net=ref_net,
@@ -515,7 +577,6 @@ def train_grpo(
             t_gen_total += micro_batch["t_gen"]
             t_logprobs_total += micro_batch["t_logprobs"]
 
-        print("B")
         all_rewards = torch.cat(
             [mb["rewards"] for mb in micro_batches], dim=1
         )  # [G, B*accum]

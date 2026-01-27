@@ -9,8 +9,7 @@ Usage:
 """
 
 import argparse
-import importlib.util
-import os
+from dataclasses import asdict
 
 import extty
 import torch
@@ -20,25 +19,9 @@ from dialectic.llm.qwen import load_qwen_06b
 from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
+from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
-from dialectic.rl.train import train_grpo
-
-
-def _is_modal_installed():
-    return importlib.util.find_spec("modal") is not None
-
-
-def _check_inside_modal_fn():
-    if _is_modal_installed():
-        import modal
-
-        return modal.current_function_call_id()
-    return False
-
-
-bucket_name = "model-weights"
-r2_account_id = "a64c6da180648dd944675d311c296763"
 
 
 def get_state_to_str(enable_thinking: bool):
@@ -70,49 +53,27 @@ def get_prompt_template(enable_thinking: bool):
     )
 
 
-MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
-
-
-def train(
+@extty.evaluation(
+    "grpo",
+    model="qwen",
+    model_config_kwargs=["weights_path"],
+    eval_config_kwargs=["batch_size"],
+)
+def eval(
     *,
     device: str | None = None,
-    max_episodes: int = 1000,
+    max_tokens: int = 1024,
     batch_size: int = 2,
     group_size: int = 8,
-    max_tokens: int = 1024,
-    lr: float = 1e-5,
-    beta: float = 0.04,
     weights_path: str = "/weights/qwen3-0.6b.pth",
     tokenizer_path: str = "/weights/tokenizer.json",
     binary_reward: bool = False,
     num_operands: int = 2,
-    mu: int = 1,
-    accumulation_steps: int = 16,
-    max_grad_norm: float = 1.0,
-    logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
+    max_episodes: int,
+    n_examples: int,
 ):
-    extty.init(
-        "grpo-learning",
-        config={
-            "max_episodes": max_episodes,
-            "batch_size": batch_size,
-            "group_size": group_size,
-            "max_tokens": max_tokens,
-            "lr": lr,
-            "beta": beta,
-            "binary_reward": binary_reward,
-            "mu": mu,
-            "num_operands": num_operands,
-            "accumulation_steps": accumulation_steps,
-            "max_grad_norm": max_grad_norm,
-            "logprob_chunk_size": logprob_chunk_size,
-            "use_bf16": use_bf16,
-        },
-        server=_check_inside_modal_fn(),
-    )
-
     net = load_qwen_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
@@ -121,8 +82,6 @@ def train(
     print(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
     )
-
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
 
     if binary_reward:
         reward_fn = CountdownRewardFn()
@@ -145,58 +104,25 @@ def train(
 
     state_to_str = get_state_to_str(enable_thinking=use_qwen_thinking)
 
-    try:
-        train_grpo(
-            net=net,
-            opt=opt,
-            env=env,
-            reward_fn=reward_fn,
-            state_to_str=state_to_str,
-            tokenizer=tokenizer,
-            eos_token_id=151645,  # <|im_end|>
-            pad_token_id=151643,
-            extractor=extract_from_answer_tags,
-            beta=beta,
-            eps=0.2,
-            mu=mu,
-            max_tokens_generated=max_tokens,
-            max_episodes=max_episodes,
-            update_ref_net_batch_cadence=10,
-            batch_size=batch_size,
-            group_size=group_size,
-            temperature=0.7,
-            accumulation_steps=accumulation_steps,
-            max_grad_norm=max_grad_norm,
-            logprob_chunk_size=logprob_chunk_size,
-            use_bf16=use_bf16,
-        )
-    finally:
-        extty.finish()
-
-
-if _is_modal_installed():
-    import modal
-
-    app = modal.App()
-    secret = modal.Secret.from_name(
-        "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+    eval_result, examples = evaluate(
+        net=net,
+        tokenizer=tokenizer,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        eos_token_id=151645,
+        pad_token_id=151643,
+        extractor=extract_from_answer_tags,
+        max_tokens_generated=max_tokens,
+        max_episodes=max_episodes,
+        batch_size=batch_size,
+        group_size=group_size,
+        temperature=0.7,
+        use_bf16=use_bf16,
+        n_examples=n_examples,
     )
 
-    image = modal.Image.debian_slim().uv_sync().add_local_python_source("dialectic")
-
-    train_modal = app.function(
-        image=image,
-        gpu="A100-80GB",
-        volumes={
-            "/weights": modal.CloudBucketMount(
-                bucket_name=bucket_name,
-                bucket_endpoint_url=f"https://{r2_account_id}.r2.cloudflarestorage.com",
-                secret=secret,
-                read_only=True,
-            )
-        },
-        timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
-    )(train)
+    return asdict(eval_result), examples
 
 
 def main():
@@ -206,13 +132,9 @@ def main():
         "--max-episodes", type=int, default=1000, help="Max training episodes"
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
-    parser.add_argument("--group-size", type=int, default=8, help="Group size for GRPO")
+    parser.add_argument("--group-size", type=int, default=4, help="Group size for GRPO")
     parser.add_argument(
         "--max-tokens", type=int, default=1024, help="Max tokens to generate"
-    )
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument(
-        "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
     parser.add_argument(
         "--weights-path", default="weights/qwen3-0.6b.pth", help="Path to model weights"
@@ -230,27 +152,7 @@ def main():
     parser.add_argument(
         "--num-operands", type=int, default=2, help="Number of operands"
     )
-    parser.add_argument(
-        "--mu", type=int, default=1, help="Optimization passes per batch"
-    )
-    parser.add_argument(
-        "--accumulation-steps",
-        type=int,
-        default=16,
-        help="Gradient accumulation steps",
-    )
-    parser.add_argument(
-        "--max-grad-norm",
-        type=float,
-        default=1.0,
-        help="Max gradient norm for clipping",
-    )
-    parser.add_argument(
-        "--logprob-chunk-size",
-        type=int,
-        default=64,
-        help="Chunk size for log prob computation (0 to disable chunking)",
-    )
+
     parser.add_argument(
         "--use-bf16",
         action="store_true",
@@ -276,26 +178,24 @@ def main():
         action="store_false",
         help="Do not use Qwen's out-of-the-box thinking mode",
     )
+    parser.add_argument(
+        "--n-examples", type=int, default=10, help="Number of examples to return"
+    )
     args = parser.parse_args()
 
-    train(
+    eval(
         device=args.device,
         max_episodes=args.max_episodes,
         batch_size=args.batch_size,
         group_size=args.group_size,
         max_tokens=args.max_tokens,
-        lr=args.lr,
-        beta=args.beta,
         weights_path=args.weights_path,
         tokenizer_path=args.tokenizer_path,
         binary_reward=args.binary_reward,
         num_operands=args.num_operands,
-        mu=args.mu,
-        accumulation_steps=args.accumulation_steps,
-        max_grad_norm=args.max_grad_norm,
-        logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
         use_qwen_thinking=args.use_qwen_thinking,
+        n_examples=args.n_examples,
     )
 
 

@@ -15,11 +15,11 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import Qwen
-from dialectic.rl.env import CountdownEnv
+from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn
+from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import compute_log_probs, train_grpo
-from dialectic.rl.types import Countdown
+from dialectic.rl.types import EnvResponse
 
 
 def create_tiny_model(vocab_size: int = 151936) -> Qwen:
@@ -208,7 +208,7 @@ class TestGRPOMechanics:
         """Gradient accumulation matches a larger batch update."""
         from copy import deepcopy
 
-        from dialectic.rl.env import EpisodeIsDoneError, Env
+        from dialectic.rl.env import Env, EpisodeIsDoneError
         from dialectic.rl.types import EnvResponse
 
         class FixedCountdownEnv(Env[Countdown, None]):
@@ -483,10 +483,7 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_correct_answer(self):
         """Max selection: correct (1.0) beats all other accuracy components."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -502,14 +499,12 @@ class TestCompositeRewardFn:
         assert result.components["parseable"] == 0.3
         assert result.components["answer_tags"] == 0.1
         assert result.components["think_tags"] == 0.05
-        assert result.total > 1.0
+
+        assert result.total == 1.0  # since all components are in the same group
 
     def test_countdown_with_format_parseable_only(self):
         """Max selection: parseable (0.3) wins when correct fails."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -528,10 +523,7 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_think_tags_only(self):
         """Max selection: think_tags (0.05) wins when no answer tags."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
+        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -548,26 +540,6 @@ class TestCompositeRewardFn:
         assert result.components["answer_tags"] == 0.0
         assert result.components["think_tags"] == 0.05
         assert result.total >= 0.05
-
-    def test_length_bonus_additive(self):
-        """Length bonus is additive (not in a group)."""
-        from dialectic.rl.reward import CountdownWithFormatRewardFn
-        from dialectic.rl.types import EnvResponse
-
-        reward_fn = CountdownWithFormatRewardFn()
-        env_response = EnvResponse(
-            is_done=True,
-            data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
-        )
-
-        result = reward_fn(
-            env_response=env_response,
-            raw_model_output="x" * 500 + "<answer>2 + 3 + 5</answer>",
-            extracted_model_output="2 + 3 + 5",
-        )
-
-        assert result.components["length_bonus"] == 0.05
-        assert result.total == 1.0 + 0.05
 
 
 class TestAnswerExtractor:

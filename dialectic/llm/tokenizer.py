@@ -27,7 +27,7 @@ def get_input_text_from_messages(
     messages: list[Message],
     add_generation_prompt: bool,
     tools: list[Tool | dict[str, Any]] | None = None,
-    enable_thinking: bool | None = None,
+    enable_thinking: bool = True,
 ) -> str:
     """
     Convert messages to the Qwen chat template format.

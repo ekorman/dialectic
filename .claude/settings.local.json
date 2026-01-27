@@ -19,7 +19,8 @@
       "WebFetch(domain:xihuai18.github.io)",
       "Bash(python:*)",
       "Bash(source ~/.nvm/nvm.sh)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(uv run pyright:*)"
     ]
   }
 }

@@ -507,6 +507,7 @@ def test_load_qwen_06b():
             tokenizer,
             [messages1, messages2],
             sampling_strategy="greedy",
+            enable_thinking=True,
         )
         assert (
             resp[0]

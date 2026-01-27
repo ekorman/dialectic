@@ -2,7 +2,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Generic, Sequence
 
-from dialectic.rl.types import QA, Countdown, E, EnvResponse, RewardResult, T
+from dialectic.rl.env import Countdown
+from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
 
 class RewardFn(ABC, Generic[T, E]):
@@ -222,6 +223,9 @@ class CountdownAnswerTagsComponent(RewardComponent[Countdown, str | None]):
 class CountdownThinkTagsComponent(RewardComponent[Countdown, str | None]):
     """0.05 if has <think> tags."""
 
+    def __init__(self, tag_name: str):
+        self.tag_name = tag_name
+
     @property
     def name(self) -> str:
         return "think_tags"
@@ -239,8 +243,8 @@ class CountdownThinkTagsComponent(RewardComponent[Countdown, str | None]):
     ) -> float:
         if (
             raw_model_output
-            and "<think>" in raw_model_output
-            and "</think>" in raw_model_output
+            and f"<{self.tag_name}>" in raw_model_output
+            and f"</{self.tag_name}>" in raw_model_output
         ):
             return 0.05
         return 0.0
@@ -274,13 +278,13 @@ class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
     Plus small length bonus (up to 0.05) to create variance between similar outputs.
     """
 
-    def __init__(self):
+    def __init__(self, thinking_tag_name: str):
         self._composite = CompositeRewardFn(
             [
                 CountdownCorrectComponent(),
                 CountdownParseableComponent(),
                 CountdownAnswerTagsComponent(),
-                CountdownThinkTagsComponent(),
+                CountdownThinkTagsComponent(thinking_tag_name),
             ]
         )
 

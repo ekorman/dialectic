@@ -20,13 +20,6 @@ class QA[R]:
 
 
 @dataclass
-class Countdown:
-    prompt: str
-    numbers: list[int]
-    target: int
-
-
-@dataclass
 class RewardResult:
     total: float
     components: dict[str, float]
