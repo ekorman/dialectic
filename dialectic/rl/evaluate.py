@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass
 from typing import Callable
 
@@ -37,7 +38,7 @@ def evaluate(
     batch_size: int = 1,
     group_size: int = 1,
     temperature: float = 0.0,
-    n_examples_to_log: int = 5,
+    n_examples: int = 10,
     use_bf16: bool = False,
 ) -> EvaluationResult:
     """Evaluate a model against an environment and reward function.
@@ -70,7 +71,7 @@ def evaluate(
         Number of completions per prompt.
     temperature
         Sampling temperature (0.0 for greedy).
-    n_examples_to_log
+    n_examples
         Number of examples to log to extty.
     use_bf16
         Whether to use bfloat16 for generation.
@@ -135,30 +136,21 @@ def evaluate(
             name: sum(vals) / len(vals) for name, vals in all_components.items()
         }
 
-    if extty._active_run is not None:
-        examples = extty.BatchExample(
-            prompts=all_prompts[:n_examples_to_log],
-            responses=all_output_strs_nested[:n_examples_to_log],
-            rewards=all_reward_results[:n_examples_to_log],  # type: ignore[arg-type]
-        )
+    sample_idxs = random.sample(
+        range(len(all_prompts)), min(n_examples, len(all_prompts))
+    )
 
-        extty.log(
-            {
-                "eval/reward_mean": reward_mean,
-                "eval/reward_std": reward_std,
-                "eval/examples": examples,
-                **{
-                    f"eval/reward/{name}": mean
-                    for name, mean in component_means.items()
-                },
-            },
-            step=0,
+    examples = [
+        extty.Example(
+            prompt=all_prompts[i],
+            responses=all_output_strs_nested[i],
         )
+        for i in sample_idxs
+    ]
 
     return EvaluationResult(
         n_episodes=n_episodes,
         reward_mean=reward_mean,
         reward_std=reward_std,
         component_means=component_means,
-        all_rewards=all_rewards,
-    )
+    ), examples
