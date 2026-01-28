@@ -16,7 +16,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
 )
 
-from dialectic.qwen import (
+from dialectic.llm.qwen import (
     MHSA,
     GatedMLP,
     Qwen,
@@ -28,7 +28,7 @@ from dialectic.qwen import (
     generate_from_tokens,
     load_qwen_06b,
 )
-from dialectic.tokenizer import Message
+from dialectic.llm.tokenizer import Message
 
 torch.manual_seed(18)
 
@@ -228,6 +228,7 @@ def test_qwen():
     ).eval()
 
     assert model(x).shape == torch.Size((b, 1, vocab_size))
+    assert model(x, return_all_logits=True).shape == torch.Size((b, l, vocab_size))
 
     # check against a huggingface defined net
     conf = Qwen3Config()
@@ -275,12 +276,14 @@ def test_qwen_generate():
         rope_base_value=rope_base_value,
     ).eval()
 
+    # check we get the same thing if we cache or not
     out_no_cache = generate_from_tokens(
         net=model,
         token_ids=x,
         eos_token_id=-1,
         max_tokens_generated=24,
         use_kv_cache=False,
+        sampling_strategy="greedy",
     )
 
     out_with_cache = generate_from_tokens(
@@ -289,17 +292,211 @@ def test_qwen_generate():
         eos_token_id=-1,
         max_tokens_generated=24,
         use_kv_cache=True,
+        sampling_strategy="greedy",
     )
 
     torch.testing.assert_close(out_no_cache, out_with_cache)
     assert out_with_cache.shape == torch.Size((b, 24 + l))
+
+    # test we get the same thing for a batch or not
+    out_singleton = generate_from_tokens(
+        net=model,
+        token_ids=x[:1],
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+    assert out_singleton.shape == torch.Size((1, 24 + l))
+    torch.testing.assert_close(out_singleton, out_with_cache[:1])
+
+
+def test_qwen_generate_attention_mask():
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    x1 = torch.randint(0, vocab_size, size=(1, 4))
+    x2 = torch.randint(0, vocab_size, size=(1, 7))
+
+    x_batched = torch.randint(0, vocab_size, size=(2, 7))  # replace with rando...
+    # left pad
+    x_batched[0, 3:] = x1
+    x_batched[1] = x2
+
+    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = True
+
+    out1 = generate_from_tokens(
+        net=model,
+        token_ids=x1,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+        attention_mask=None,
+    )
+    out2 = generate_from_tokens(
+        net=model,
+        token_ids=x2,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+        attention_mask=None,
+    )
+    out_batched = generate_from_tokens(
+        net=model,
+        token_ids=x_batched,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+        attention_mask=attention_mask,
+    )
+
+    assert (out1 == out_batched[:1, 3:]).all()
+    assert (out2 == out_batched[1:]).all()
+
+
+def test_qwen_generate_attention_mask_with_kv_cache():
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    x1 = torch.randint(0, vocab_size, size=(1, 4))
+    x2 = torch.randint(0, vocab_size, size=(1, 7))
+
+    x_batched = torch.randint(0, vocab_size, size=(2, 7))  # replace with rando...
+    # left pad
+    x_batched[0, 3:] = x1
+    x_batched[1] = x2
+
+    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = True
+
+    out1 = generate_from_tokens(
+        net=model,
+        token_ids=x1,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=True,
+        sampling_strategy="greedy",
+        attention_mask=None,
+    )
+    out2 = generate_from_tokens(
+        net=model,
+        token_ids=x2,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=True,
+        sampling_strategy="greedy",
+        attention_mask=None,
+    )
+    out_batched = generate_from_tokens(
+        net=model,
+        token_ids=x_batched,
+        eos_token_id=-1,
+        max_tokens_generated=24,
+        use_kv_cache=True,
+        sampling_strategy="greedy",
+        attention_mask=attention_mask,
+    )
+
+    assert (out1 == out_batched[:1, 3:]).all()
+    assert (out2 == out_batched[1:]).all()
+
+
+def test_qwen_generate_temperature():
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+    vocab_size = 500
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    model = Qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    x = torch.randint(0, vocab_size, size=(1, 4))
+
+    out_greedy = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=10,
+        sampling_strategy="greedy",
+    )
+
+    # very low temperature should approximate greedy
+    out_low_temp = generate_from_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        max_tokens_generated=10,
+        sampling_strategy="sample",
+        temperature=0.001,
+    )
+
+    torch.testing.assert_close(out_greedy, out_low_temp)
 
 
 @pytest.mark.skipif(
     os.getenv("TEST_LLM_AGAINST_HF") is None,
     reason="skipping `test_load_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
-def test_load_qwen_06b():
+def test_model_generation_against_qwen_06b():
+    """Test model generation against HuggingFace. the expected output was obtained with the code
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    messages = [
+        {"role": "user", "content": "Hello who are you?"},
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+
+    outputs = model.generate(**inputs, do_sample=False, max_new_tokens=500)
+    print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
+    """
     model = load_qwen_06b()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -322,8 +519,17 @@ def test_load_qwen_06b():
         )
 
         tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-        messages = [Message(role="user", content="Hello who are you?")]
-        resp = generate_from_chat(model, tokenizer, messages)
+        messages1 = [Message(role="user", content="Hello who are you?")]
+        messages2 = [
+            Message(role="user", content="What is the capital of France? /nothink")
+        ]
+        resp = generate_from_chat(
+            model,
+            tokenizer,
+            [messages1, messages2],
+            sampling_strategy="greedy",
+            enable_thinking=True,
+        )
         assert (
             resp[0]
             == """user
@@ -333,6 +539,17 @@ assistant
 Okay, the user asked, "Hello who are you?" I need to respond appropriately. First, I should acknowledge their greeting. Then, I should explain my role as a language model. I should mention that I can assist with various tasks like answering questions, providing information, or helping with specific needs. It's important to keep the response friendly and open-ended to encourage further interaction. I should also make sure the tone is helpful and not too technical. Let me put that together in a natural way.
 </think>
 
-Hello! I'm a language model designed to assist with a wide range of tasks, from answering questions to providing information. How can I help you today?
-"""
+Hello! I'm a language model designed to assist with a wide range of tasks, from answering questions to providing information. How can I help you today?"""
+        )
+
+        assert (
+            resp[1]
+            == """user
+What is the capital of France? /nothink
+assistant
+<think>
+Okay, the user is asking for the capital of France. I need to make sure I recall the correct answer. France's capital is Paris. Let me think... Yes, Paris is the capital city. I should confirm that there isn't any other city that's considered the capital. For example, maybe some other city has a similar name, but I don't think so. Also, checking my memory, the capital is indeed Paris. I should state that clearly and maybe add a brief note if needed, like mentioning that it's the largest city in France. That should cover the user's question.
+</think>
+
+The capital of France is **Paris**."""
         )

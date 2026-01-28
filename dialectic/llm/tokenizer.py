@@ -8,21 +8,12 @@ class ToolCall:
     name: str
     arguments: str | dict[str, Any]
 
-    @property
-    def function(self) -> "ToolCall":
-        return self
-
-
-@dataclass
-class ToolCallWrapper:
-    function: ToolCall
-
 
 @dataclass
 class Message:
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
-    tool_calls: list[ToolCall | ToolCallWrapper] | None = None
+    tool_calls: list[ToolCall] | None = None
     reasoning_content: str | None = None
 
 
@@ -36,7 +27,7 @@ def get_input_text_from_messages(
     messages: list[Message],
     add_generation_prompt: bool,
     tools: list[Tool | dict[str, Any]] | None = None,
-    enable_thinking: bool | None = None,
+    enable_thinking: bool = True,
 ) -> str:
     """
     Convert messages to the Qwen chat template format.
@@ -135,19 +126,13 @@ def get_input_text_from_messages(
                     if (j == 0 and content) or j > 0:
                         result += "\n"
 
-                    actual_tool_call = tool_call
-                    if hasattr(tool_call, "function") and isinstance(
-                        tool_call.function, ToolCall
-                    ):
-                        actual_tool_call = tool_call.function
-
                     result += "<tool_call>\n"
-                    result += f'{{"name": "{actual_tool_call.name}", "arguments": '
+                    result += f'{{"name": "{tool_call.name}", "arguments": '
 
-                    if isinstance(actual_tool_call.arguments, str):
-                        result += actual_tool_call.arguments
+                    if isinstance(tool_call.arguments, str):
+                        result += tool_call.arguments
                     else:
-                        result += json.dumps(actual_tool_call.arguments)
+                        result += json.dumps(tool_call.arguments)
 
                     result += "}\n</tool_call>"
 
