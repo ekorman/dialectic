@@ -1,5 +1,1 @@
-- [ ] Implement GRPO
-- [ ] Replicate deepseekzero type training
-- [ ] Implement GSPO?
-- [ ] Implement RLOO
-- [ ] Implement soft tokens hard truths against GSM8k?
+# dialectic
