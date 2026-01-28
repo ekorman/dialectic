@@ -1,4 +1,5 @@
 from .attention import MHSA
+from .decoder import DecoderLayer
 from .gated_mlp import GatedMLP
 from .kv_cache import KVCache
 from .rms_norm import RMSNorm
@@ -11,4 +12,5 @@ __all__ = [
     "MHSA",
     "GatedMLP",
     "RMSNorm",
+    "DecoderLayer",
 ]

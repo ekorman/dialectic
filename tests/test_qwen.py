@@ -13,7 +13,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from dialectic.llm.qwen import (
     Qwen,
-    QwenDecoderLayer,
+    create_qwen_decoder_layer,
     generate_from_chat,
     generate_from_tokens,
     load_qwen_06b,
@@ -37,7 +37,7 @@ def test_qwen_decoder_layer():
 
     rot_emb = Qwen3RotaryEmbedding(conf)
 
-    d1 = QwenDecoderLayer(
+    d1 = create_qwen_decoder_layer(
         d,
         attn_head_d=head_d,
         attn_num_heads=num_heads,

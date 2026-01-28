@@ -18,49 +18,29 @@ from jaxtyping import Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
-from dialectic.llm.components import MHSA, GatedMLP, KVCache, RMSNorm
+from dialectic.llm.components import DecoderLayer, KVCache, RMSNorm
 from dialectic.llm.tokenizer import Message, get_input_text_from_messages
 
 
-class QwenDecoderLayer(nn.Module):
-    """
-    RMSNorm -> Residual attention -> RMSNorm -> Residual MLP
-    """
-
-    def __init__(
-        self,
-        d: int,
-        attn_head_d: int,
-        attn_num_heads: int,
-        attn_num_kv_heads: int,
-        mlp_hidden_d: int,
-        rope_base_value: float | None = None,
-    ):
-        super().__init__()
-        self.input_layernorm = RMSNorm(d)
-        self.self_attn = MHSA(
-            d=d,
-            head_d=attn_head_d,
-            num_heads=attn_num_heads,
-            num_kv_heads=attn_num_kv_heads,
-            causal=True,
-            apply_rms_norm=True,
-            rope_base_value=rope_base_value,
-        )
-        self.post_attention_layernorm = RMSNorm(d)
-        self.mlp = GatedMLP(d=d, hidden_d=mlp_hidden_d)
-
-    def forward(
-        self,
-        x,
-        kv_cache: KVCache | None = None,
-        attention_mask: torch.Tensor | None = None,
-    ):
-        x = x + self.self_attn(
-            self.input_layernorm(x), kv_cache=kv_cache, attention_mask=attention_mask
-        )
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+def create_qwen_decoder_layer(
+    d: int,
+    *,
+    attn_head_d: int,
+    attn_num_heads: int,
+    attn_num_kv_heads: int,
+    mlp_hidden_d: int,
+    rope_base_value: float | None = None,
+):
+    return DecoderLayer(
+        d=d,
+        attn_head_d=attn_head_d,
+        attn_num_heads=attn_num_heads,
+        attn_num_kv_heads=attn_num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+        causal=True,
+        apply_qk_rms_norm=True,
+    )
 
 
 class Qwen(nn.Module):
@@ -84,7 +64,7 @@ class Qwen(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, d)
         self.layers = nn.ModuleList(
             [
-                QwenDecoderLayer(
+                create_qwen_decoder_layer(
                     d=d,
                     attn_head_d=attn_head_d,
                     attn_num_heads=attn_num_heads,
