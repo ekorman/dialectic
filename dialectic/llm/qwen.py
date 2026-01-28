@@ -19,7 +19,7 @@ from tokenizers import Tokenizer
 from torch import Tensor
 
 from dialectic.llm.components import DecoderLayer, KVCache, RMSNorm
-from dialectic.llm.templates import Message, get_input_text_from_messages
+from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 
 
 def create_qwen_decoder_layer(
@@ -254,7 +254,7 @@ def generate_from_chat(
         tokenizer=tokenizer,
         sampling_strategy=sampling_strategy,
         text_batch=[
-            get_input_text_from_messages(
+            get_qwen_input_text_from_messages(
                 message, add_generation_prompt=True, enable_thinking=enable_thinking
             )
             for message in batch_messages

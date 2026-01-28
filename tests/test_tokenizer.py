@@ -1,7 +1,7 @@
 from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
 
-from dialectic.llm.templates import Message, ToolCall, get_input_text_from_messages
+from dialectic.llm.templates import Message, ToolCall, get_qwen_input_text_from_messages
 
 
 def get_auto_tokenizer():
@@ -51,7 +51,7 @@ def test_tokenizer_against_hf():
 
     assert (
         text
-        == get_input_text_from_messages(
+        == get_qwen_input_text_from_messages(
             messages=[Message(**m) for m in messages],
             add_generation_prompt=True,
             enable_thinking=True,
@@ -82,7 +82,7 @@ def test_system_and_user_message():
         enable_thinking=True,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         enable_thinking=True,
@@ -108,7 +108,7 @@ def test_multi_turn_conversation():
         enable_thinking=True,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         enable_thinking=True,
@@ -130,7 +130,7 @@ def test_enable_thinking_false():
         enable_thinking=False,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         enable_thinking=False,
@@ -155,7 +155,7 @@ def test_no_generation_prompt():
         add_generation_prompt=False,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=False,
     )
@@ -192,7 +192,7 @@ def test_with_tools():
         tools=tools,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         tools=tools,
@@ -230,7 +230,7 @@ def test_with_tools_and_system_message():
         tools=tools,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         tools=tools,
@@ -284,7 +284,7 @@ def test_assistant_with_tool_calls():
         else:
             msg_objects.append(Message(role=m["role"], content=m["content"]))
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=False,
     )
@@ -337,7 +337,7 @@ def test_tool_response():
         else:
             msg_objects.append(Message(role=m["role"], content=m["content"]))
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=True,
     )
@@ -396,7 +396,7 @@ def test_multiple_tool_responses():
         else:
             msg_objects.append(Message(role=m["role"], content=m["content"]))
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=True,
     )
@@ -434,7 +434,7 @@ def test_assistant_with_reasoning_content():
         ),
     ]
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=False,
     )
@@ -465,7 +465,7 @@ def test_assistant_with_think_tags_in_content():
         Message(role="assistant", content="<think>\nLet me calculate...\n</think>\n4"),
     ]
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=False,
     )
@@ -490,7 +490,7 @@ def test_system_message_not_first():
         add_generation_prompt=True,
     )
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
     )
@@ -533,7 +533,7 @@ def test_tool_call_with_dict_arguments():
         ),
     ]
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=False,
     )
@@ -543,7 +543,7 @@ def test_tool_call_with_dict_arguments():
 
 def test_empty_messages():
     """Test with empty messages list."""
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[],
         add_generation_prompt=True,
     )
@@ -552,7 +552,7 @@ def test_empty_messages():
 
 def test_empty_messages_no_generation():
     """Test with empty messages and no generation prompt."""
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=[],
         add_generation_prompt=False,
     )
@@ -621,7 +621,7 @@ def test_full_tool_use_conversation():
         else:
             msg_objects.append(Message(role=m["role"], content=m["content"]))
 
-    result = get_input_text_from_messages(
+    result = get_qwen_input_text_from_messages(
         messages=msg_objects,
         add_generation_prompt=False,
         tools=tools,

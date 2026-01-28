@@ -23,7 +23,7 @@ class Tool:
     function: dict[str, Any] = field(default_factory=dict)
 
 
-def get_input_text_from_messages(
+def get_qwen_input_text_from_messages(
     messages: list[Message],
     add_generation_prompt: bool,
     tools: list[Tool | dict[str, Any]] | None = None,
