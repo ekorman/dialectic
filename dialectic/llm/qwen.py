@@ -80,7 +80,7 @@ class Qwen(nn.Module):
 
     def forward(
         self,
-        x,
+        x: Int[Tensor, "B L"],
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
