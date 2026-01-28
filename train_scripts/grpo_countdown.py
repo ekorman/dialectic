@@ -17,7 +17,7 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
-from dialectic.llm.tokenizer import Message, get_input_text_from_messages
+from dialectic.llm.templates import Message, get_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags

@@ -18,7 +18,7 @@ from dialectic.llm.qwen import (
     generate_from_tokens,
     load_qwen_06b,
 )
-from dialectic.llm.tokenizer import Message
+from dialectic.llm.templates import Message
 
 torch.manual_seed(18)
 

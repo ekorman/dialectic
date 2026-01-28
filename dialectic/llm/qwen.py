@@ -19,7 +19,7 @@ from tokenizers import Tokenizer
 from torch import Tensor
 
 from dialectic.llm.components import DecoderLayer, KVCache, RMSNorm
-from dialectic.llm.tokenizer import Message, get_input_text_from_messages
+from dialectic.llm.templates import Message, get_input_text_from_messages
 
 
 def create_qwen_decoder_layer(
