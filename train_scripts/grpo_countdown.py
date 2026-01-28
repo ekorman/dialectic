@@ -43,36 +43,34 @@ r2_account_id = "a64c6da180648dd944675d311c296763"
 
 def get_state_to_str(enable_thinking: bool):
     def _state_to_str(data: Countdown) -> str:
-        return get_input_text_from_messages(
+        reasoning_tag = "think" if enable_thinking else "reasoning"
+        ret = get_input_text_from_messages(
             [Message(role="user", content=data.prompt)],
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
 
+        ret += f"Let me solve this step by step\n<{reasoning_tag}>"
+
+        return ret
+
     return _state_to_str
 
 
 def get_prompt_template(enable_thinking: bool):
-    if enable_thinking:
-        return (
-            "Using the numbers {numbers}, create an equation that equals {target}. "
-            "You can use +, -, *, / and each number at most once. "
-            "Show your reasoning in <think></think> tags. Please be concise and give just one solution."
-            "Put your final equation in <answer></answer> tags. "
-            "For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
-        )
+    reasoning_tag = "think" if enable_thinking else "reasoning"
     return (
         "Using the numbers {numbers}, create an equation that equals {target}. "
-        "You can use +, -, *, / and each number at most once. "
-        "Show your reasoning in <reasoning></reasoning> tags. Please be concise and give just one solution."
-        "Put your final equation in <answer></answer> tags. "
-        "For example, if the equation is 3+5*2, respond with <reasoning>[detailed reasoning explanations]</reasoning><answer>3+5*2</answer>."
+        "You can use basic arithmetic operations (+, -, *, /) and each number at most once. "
+        f"Show your reasoning in <{reasoning_tag}></{reasoning_tag}> tags."
+        "Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
     )
 
 
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
+@extty.experiment(project="grpo-countdown", server=_check_inside_modal_fn)
 def train(
     *,
     device: str | None = None,
@@ -85,7 +83,10 @@ def train(
     weights_path: str = "/weights/qwen3-0.6b.pth",
     tokenizer_path: str = "/weights/tokenizer.json",
     binary_reward: bool = False,
-    num_operands: int = 2,
+    n_larges: int = 2,
+    n_total: int = 6,
+    n_ops: int = 5,
+    seed: int | None = None,
     mu: int = 1,
     accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
@@ -93,26 +94,6 @@ def train(
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
 ):
-    extty.init(
-        "grpo-learning",
-        config={
-            "max_episodes": max_episodes,
-            "batch_size": batch_size,
-            "group_size": group_size,
-            "max_tokens": max_tokens,
-            "lr": lr,
-            "beta": beta,
-            "binary_reward": binary_reward,
-            "mu": mu,
-            "num_operands": num_operands,
-            "accumulation_steps": accumulation_steps,
-            "max_grad_norm": max_grad_norm,
-            "logprob_chunk_size": logprob_chunk_size,
-            "use_bf16": use_bf16,
-        },
-        server=_check_inside_modal_fn(),
-    )
-
     net = load_qwen_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
@@ -134,9 +115,10 @@ def train(
     tokenizer = Tokenizer.from_file(tokenizer_path)
 
     env = CountdownEnv(
-        num_operands=num_operands,
-        min_number=1,
-        max_number=10,
+        seed=seed,
+        n_larges=n_larges,
+        n_total=n_total,
+        n_ops=n_ops,
         prompt_template=get_prompt_template(enable_thinking=use_qwen_thinking),
     )
     device = device or get_default_device()
@@ -182,7 +164,11 @@ if _is_modal_installed():
         "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
     )
 
-    image = modal.Image.debian_slim().uv_sync().add_local_python_source("dialectic")
+    image = (
+        modal.Image.debian_slim()
+        .uv_sync()
+        .add_local_python_source("dialectic", "extty")
+    )
 
     train_modal = app.function(
         image=image,
@@ -289,7 +275,7 @@ def main():
         weights_path=args.weights_path,
         tokenizer_path=args.tokenizer_path,
         binary_reward=args.binary_reward,
-        num_operands=args.num_operands,
+        n_ops=args.num_operands,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         max_grad_norm=args.max_grad_norm,

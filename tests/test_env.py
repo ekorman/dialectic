@@ -98,22 +98,23 @@ class TestCountdownEnv:
 
         assert resp.is_done
         assert isinstance(resp.data.numbers, list)
-        assert len(resp.data.numbers) == 4
+        assert len(resp.data.numbers) == 6  # default n_total
         assert isinstance(resp.data.target, int)
         assert "prompt" in resp.data.__dict__
 
-    def test_custom_num_operands(self):
-        env = CountdownEnv(num_operands=6)
+    def test_custom_n_total(self):
+        env = CountdownEnv(n_total=4, n_larges=1)
         resp = env.reset()
 
-        assert len(resp.data.numbers) == 6
+        assert len(resp.data.numbers) == 4
 
-    def test_number_range(self):
-        env = CountdownEnv(min_number=10, max_number=20)
+    def test_numbers_from_smalls_and_larges(self):
+        env = CountdownEnv(n_total=6, n_larges=2)
         resp = env.reset()
 
+        # Check that numbers come from SMALLS and LARGES pools
         for num in resp.data.numbers:
-            assert 10 <= num <= 20
+            assert num in CountdownEnv.SMALLS or num in CountdownEnv.LARGES
 
     def test_seed_reproducibility_at_reset(self):
         env1 = CountdownEnv()
@@ -142,3 +143,11 @@ class TestCountdownEnv:
 
         with pytest.raises(EpisodeIsDoneError):
             env.step(None)
+
+    def test_custom_prompt_template(self):
+        template = "Numbers: {numbers}, Target: {target}"
+        env = CountdownEnv(prompt_template=template)
+        resp = env.reset()
+
+        assert resp.data.prompt.startswith("Numbers:")
+        assert str(resp.data.target) in resp.data.prompt

@@ -287,7 +287,7 @@ modal = [
 
 [package.metadata]
 requires-dist = [
-    { name = "extty", specifier = ">=0.5.0" },
+    { name = "extty", specifier = ">=0.6.0" },
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "tokenizers", specifier = ">=0.22.1" },
     { name = "torch", specifier = ">=2.9.1" },
@@ -313,14 +313,14 @@ wheels = [
 
 [[package]]
 name = "extty"
-version = "0.5.0"
+version = "0.6.0"
 source = { registry = "https://pypi.pols.ai/" }
 dependencies = [
     { name = "psutil" },
 ]
-sdist = { url = "https://pypi.pols.ai/packages/extty-0.5.0.tar.gz", hash = "sha256:9e064b15d08241a9ef6f8ea1ed441b1ff1b9ee280e49c6cfb43e7e5cdc17da44" }
+sdist = { url = "https://pypi.pols.ai/packages/extty-0.6.0.tar.gz", hash = "sha256:15fc93cc28c6b4f825f1abe6ad0eb4093f1da878d85a10697304075a15f6c9d6" }
 wheels = [
-    { url = "https://pypi.pols.ai/packages/extty-0.5.0-py3-none-any.whl", hash = "sha256:479baa49b9f566d16d204dd4f757c24e9bad3a2de63ae19a2ede704976216385" },
+    { url = "https://pypi.pols.ai/packages/extty-0.6.0-py3-none-any.whl", hash = "sha256:4534042fb208fa5d173204a8160e0654a1ef0f099b18e0bdc97f9d8e943b6e01" },
 ]
 
 [[package]]

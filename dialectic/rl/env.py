@@ -173,17 +173,64 @@ class CountdownEnv(Env[Countdown, None]):
         Maximum value for operands. Default is 25.
     """
 
+    SMALLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] * 2
+    LARGES = [25, 50, 75, 100]
+
+    @staticmethod
+    def _valid_ops(a: int, b: int) -> list[tuple[str, int]]:
+        ops: list[tuple[str, int]] = []
+        ops.append(("+", a + b))
+        ops.append(("*", a * b))
+
+        if a > b:
+            ops.append(("-", a - b))
+        elif b > a:
+            ops.append(("-", b - a))
+
+        if b != 0 and a % b == 0:
+            q = a // b
+            if q > 0:
+                ops.append(("/", q))
+        if a != 0 and b % a == 0:
+            q = b // a
+            if q > 0:
+                ops.append(("/", q))
+
+        return ops
+
+    def _generate_problem(self):
+        numbers = self.rng.sample(self.LARGES, self.n_larges) + self.rng.sample(
+            self.SMALLS, self.n_total - self.n_larges
+        )
+        self.rng.shuffle(numbers)
+        pool = numbers[:]
+
+        for _ in range(self.n_ops):
+            if len(pool) < 2:
+                break
+            i, j = self.rng.sample(range(len(pool)), 2)
+            candidates = self._valid_ops(pool[i], pool[j])
+            _, output = self.rng.choice(candidates)
+
+            for idx in sorted((i, j), reverse=True):
+                del pool[idx]
+
+            pool.append(output)
+
+        return numbers, pool[-1]
+
     def __init__(
         self,
+        *,
         prompt_template: str | None = None,
-        num_operands: int = 4,
-        min_number: int = 1,
-        max_number: int = 25,
+        n_larges: int = 2,
+        n_total: int = 6,
+        n_ops: int = 5,
         seed: int | None = None,
     ):
-        self.num_operands = num_operands
-        self.min_number = min_number
-        self.max_number = max_number
+        self.n_larges = n_larges
+        self.n_total = n_total
+        self.n_ops = n_ops
         self.prompt_template = prompt_template or (
             "Using the numbers {numbers}, create an equation that equals {target}. "
             "You can use +, -, *, / and each number at most once. "
@@ -196,17 +243,8 @@ class CountdownEnv(Env[Countdown, None]):
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
         if seed is not None:
             self.rng.seed(seed)
-        numbers = [
-            self.rng.randint(self.min_number, self.max_number)
-            for _ in range(self.num_operands)
-        ]
 
-        ops = self.rng.choices(["+", "-", "*"], k=self.num_operands - 1)
-        expr = str(numbers[0])
-        for number, op in zip(numbers[1:], ops):
-            expr += f"{op}{number}"
-
-        target = eval(expr)
+        numbers, target = self._generate_problem()
 
         prompt = self.prompt_template.format(numbers=numbers, target=target)
 
