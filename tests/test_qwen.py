@@ -475,7 +475,28 @@ def test_qwen_generate_temperature():
     os.getenv("TEST_LLM_AGAINST_HF") is None,
     reason="skipping `test_load_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
-def test_load_qwen_06b():
+def test_model_generation_against_qwen_06b():
+    """Test model generation against HuggingFace. the expected output was obtained with the code
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_name = "Qwen/Qwen3-0.6B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    messages = [
+        {"role": "user", "content": "Hello who are you?"},
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+
+    outputs = model.generate(**inputs, do_sample=False, max_new_tokens=500)
+    print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
+    """
     model = load_qwen_06b()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
