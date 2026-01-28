@@ -10,29 +10,16 @@ Run with:
     uv run pytest tests/test_grpo_learning.py::TestGRPOLearning -v -s  # Tier 2 only
 """
 
-import pytest
+from copy import deepcopy
+
 import torch
-from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import Qwen
-from dialectic.rl.env import Countdown, CountdownEnv
+from dialectic.rl.env import Countdown, Env, EpisodeIsDoneError
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
+from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn, RewardFn
 from dialectic.rl.train import compute_log_probs, train_grpo
-from dialectic.rl.types import EnvResponse
-
-
-def create_tiny_model(vocab_size: int = 151936) -> Qwen:
-    """Create a tiny model for fast testing."""
-    return Qwen(
-        d=32,
-        vocab_size=vocab_size,
-        n_decoder_layers=2,
-        attn_head_d=16,
-        attn_num_heads=4,
-        attn_num_kv_heads=2,
-        mlp_hidden_d=64,
-    )
+from dialectic.rl.types import EnvResponse, RewardResult
 
 
 def countdown_state_to_str(data: Countdown) -> str:
@@ -42,22 +29,6 @@ def countdown_state_to_str(data: Countdown) -> str:
 
 class TestGRPOMechanics:
     """Tier 1: Verify training mechanics work with tiny model."""
-
-    @pytest.fixture
-    def tiny_model(self):
-        return create_tiny_model()
-
-    @pytest.fixture
-    def tokenizer(self):
-        return Tokenizer.from_file("qwen-tokenizer/tokenizer.json")
-
-    @pytest.fixture
-    def env(self):
-        return CountdownEnv(
-            num_operands=2,
-            min_number=1,
-            max_number=5,
-        )
 
     def test_training_loop_completes(self, tiny_model, tokenizer, env):
         """Training loop runs without errors."""
@@ -117,8 +88,6 @@ class TestGRPOMechanics:
         Uses a length-based reward to ensure variance in rewards,
         which creates non-zero advantages and allows gradients to flow.
         """
-        from dialectic.rl.reward import RewardFn
-        from dialectic.rl.types import EnvResponse, RewardResult
 
         class LengthRewardFn(RewardFn[Countdown, str | None]):
             """Reward based on output length to ensure variance."""
@@ -206,10 +175,6 @@ class TestGRPOMechanics:
         self, tiny_model, tokenizer, monkeypatch
     ):
         """Gradient accumulation matches a larger batch update."""
-        from copy import deepcopy
-
-        from dialectic.rl.env import Env, EpisodeIsDoneError
-        from dialectic.rl.types import EnvResponse
 
         class FixedCountdownEnv(Env[Countdown, None]):
             def __init__(self, responses: list[Countdown]):
@@ -254,7 +219,15 @@ class TestGRPOMechanics:
         base_state = deepcopy(tiny_model.state_dict())
 
         def run_training(*, batch_size: int, accumulation_steps: int) -> Qwen:
-            model = create_tiny_model()
+            model = Qwen(
+                d=32,
+                vocab_size=151936,
+                n_decoder_layers=2,
+                attn_head_d=16,
+                attn_num_heads=4,
+                attn_num_kv_heads=2,
+                mlp_hidden_d=64,
+            )
             model.load_state_dict(base_state)
             env = FixedCountdownEnv(deepcopy(fixed_responses))
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -298,10 +271,6 @@ class TestGRPOMechanics:
 
 class TestChunkedLogProbs:
     """Test that chunked log prob computation matches non-chunked."""
-
-    @pytest.fixture
-    def tiny_model(self):
-        return create_tiny_model()
 
     def test_chunked_matches_non_chunked(self, tiny_model):
         """Chunked and non-chunked log prob computation give identical results."""
