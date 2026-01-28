@@ -11,6 +11,7 @@ Usage:
 import argparse
 import importlib.util
 import os
+import random
 
 import extty
 import torch
@@ -86,7 +87,7 @@ def train(
     n_larges: int = 2,
     n_total: int = 6,
     n_ops: int = 5,
-    seed: int | None = None,
+    seed: int,
     mu: int = 1,
     accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
@@ -94,6 +95,7 @@ def train(
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
 ):
+    torch.manual_seed(seed)
     net = load_qwen_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
@@ -261,6 +263,12 @@ def main():
         dest="use_qwen_thinking",
         action="store_false",
         help="Do not use Qwen's out-of-the-box thinking mode",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=random.choice(range(1000)),
+        help="Chunk size for log prob computation (0 to disable chunking)",
     )
     args = parser.parse_args()
 
