@@ -30,6 +30,8 @@ def create_qwen_decoder_layer(
     attn_num_kv_heads: int,
     mlp_hidden_d: int,
     rope_base_value: float | None = None,
+    rms_norm_eps: float = 1e-6,
+    rope_max_position_embeddings: int = 32768,
 ):
     return DecoderLayer(
         d=d,
@@ -40,6 +42,8 @@ def create_qwen_decoder_layer(
         rope_base_value=rope_base_value,
         causal=True,
         apply_qk_rms_norm=True,
+        rms_norm_eps=rms_norm_eps,
+        rope_max_position_embeddings=rope_max_position_embeddings,
     )
 
 
@@ -54,6 +58,7 @@ class Qwen(nn.Module):
         attn_num_kv_heads: int,
         mlp_hidden_d: int,
         rope_base_value: float | None = None,
+        rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
         self.d = d
@@ -71,11 +76,12 @@ class Qwen(nn.Module):
                     attn_num_kv_heads=attn_num_kv_heads,
                     mlp_hidden_d=mlp_hidden_d,
                     rope_base_value=rope_base_value,
+                    rms_norm_eps=rms_norm_eps,
                 )
                 for _ in range(n_decoder_layers)
             ]
         )
-        self.norm = RMSNorm(d)
+        self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
 
     def forward(

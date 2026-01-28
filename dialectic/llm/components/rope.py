@@ -1,3 +1,6 @@
+import math
+from dataclasses import dataclass
+
 import torch
 from jaxtyping import Float
 from torch import Tensor
@@ -24,14 +27,43 @@ def apply_rope(
     ) + rot * sin.expand(x.shape[0], x.shape[2], x.shape[3]).unsqueeze(1)
 
 
+# used for Llama
+@dataclass
+class RopeScaling:
+    factor: float
+    high_freq_factor: float
+    low_freq_factor: float
+
+
 def create_rope_sine_cosine_tensors(
     dim: int,
     base_value: float,
     context_length: int,
+    rope_scaling: RopeScaling | None = None,
     device: str | torch.device | None = None,
 ) -> tuple[Float[Tensor, "1 L D"], Float[Tensor, "1 L D"]]:
-    thetas = base_value ** (-2 * (torch.arange(dim // 2, device=device)) / dim)
+    # thetas = base_value ** (-2 * (torch.arange(dim // 2, device=device)) / dim)
+    thetas = base_value ** (-torch.arange(0, dim, 2, device=device) / dim)
     thetas = thetas.repeat(2)
+
+    if rope_scaling is not None:
+        wavelen = 2 * math.pi / thetas
+        thetas = torch.where(
+            wavelen > context_length / rope_scaling.low_freq_factor,
+            thetas / rope_scaling.factor,
+            thetas,
+        )
+        smooth_factor = (context_length / wavelen - rope_scaling.low_freq_factor) / (
+            rope_scaling.high_freq_factor - rope_scaling.low_freq_factor
+        )
+        smoothed_thetas = (
+            1 - smooth_factor
+        ) * thetas / rope_scaling.factor + smooth_factor * thetas
+        is_medium_freq = ~(
+            wavelen < context_length / rope_scaling.high_freq_factor
+        ) * ~(wavelen > context_length / rope_scaling.low_freq_factor)
+
+        thetas = torch.where(is_medium_freq, smoothed_thetas, thetas)
 
     freqs = torch.outer(torch.arange(context_length, device=device), thetas)
 

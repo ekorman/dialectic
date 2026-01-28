@@ -5,7 +5,11 @@ from torch import Tensor
 
 from dialectic.llm.components.kv_cache import KVCache
 from dialectic.llm.components.rms_norm import RMSNorm
-from dialectic.llm.components.rope import apply_rope, create_rope_sine_cosine_tensors
+from dialectic.llm.components.rope import (
+    RopeScaling,
+    apply_rope,
+    create_rope_sine_cosine_tensors,
+)
 
 
 def attention(
@@ -58,7 +62,9 @@ class MHSA(nn.Module):
         causal: bool = False,
         rope_base_value: float | None = None,
         apply_rms_norm: bool = False,
-        max_position_embeddings: int = 32768,
+        rms_norm_eps: float | None = None,
+        max_position_embeddings: int = 8192,
+        rope_scaling: RopeScaling | None = None,
     ):
         super().__init__()
 
@@ -77,8 +83,8 @@ class MHSA(nn.Module):
         self.apply_rms_norm = apply_rms_norm  # ty: ignore[unresolved-attribute]
 
         if apply_rms_norm:
-            self.q_norm = RMSNorm(self.head_d)
-            self.k_norm = RMSNorm(self.head_d)
+            self.q_norm = RMSNorm(self.head_d, rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_d, rms_norm_eps)
 
         # Precompute and cache RoPE sin/cos tensors
         if self.use_rope and rope_base_value is not None:
@@ -86,6 +92,7 @@ class MHSA(nn.Module):
                 head_d,
                 base_value=rope_base_value,
                 context_length=max_position_embeddings,
+                rope_scaling=rope_scaling,
             )
             self.register_buffer("rope_sin", sin, persistent=False)
             self.register_buffer("rope_cos", cos, persistent=False)
