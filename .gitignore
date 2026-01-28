@@ -5,3 +5,5 @@ weights
 .DS_Store
 *.jsonl
 .vscode
+data
+weights
