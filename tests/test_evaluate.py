@@ -12,10 +12,11 @@ from dialectic.rl.reward import CountdownRewardFn
 from dialectic.rl.train import RolloutBatch, generate_rollout_batch
 
 
-def create_tiny_model(vocab_size: int = 151936) -> Qwen:
+@pytest.fixture
+def tiny_model():
     return Qwen(
         d=32,
-        vocab_size=vocab_size,
+        vocab_size=151936,
         n_decoder_layers=2,
         attn_head_d=16,
         attn_num_heads=4,
@@ -24,30 +25,24 @@ def create_tiny_model(vocab_size: int = 151936) -> Qwen:
     )
 
 
+@pytest.fixture
+def env():
+    return CountdownEnv()
+
+
+@pytest.fixture
+def tokenizer():
+    return Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+
+
 def countdown_state_to_str(data: Countdown) -> str:
     return data.prompt
 
 
 class TestEvaluate:
-    @pytest.fixture
-    def tiny_model(self):
-        return create_tiny_model()
-
-    @pytest.fixture
-    def tokenizer(self):
-        return Tokenizer.from_file("qwen-tokenizer/tokenizer.json")
-
-    @pytest.fixture
-    def env(self):
-        return CountdownEnv(
-            num_operands=2,
-            min_number=1,
-            max_number=5,
-        )
-
     def test_evaluate_runs_without_errors(self, tiny_model, tokenizer, env):
         """Evaluate function completes without errors."""
-        result = evaluate(
+        result, _ = evaluate(
             net=tiny_model,
             env=env,
             reward_fn=CountdownRewardFn(),
@@ -67,7 +62,7 @@ class TestEvaluate:
 
     def test_evaluate_returns_correct_episode_count(self, tiny_model, tokenizer, env):
         """Evaluate returns the correct number of episodes."""
-        result = evaluate(
+        result, _ = evaluate(
             net=tiny_model,
             env=env,
             reward_fn=CountdownRewardFn(),
@@ -87,7 +82,7 @@ class TestEvaluate:
 
     def test_evaluate_result_fields(self, tiny_model, tokenizer, env):
         """EvaluationResult contains all expected fields with valid values."""
-        result = evaluate(
+        result, _ = evaluate(
             net=tiny_model,
             env=env,
             reward_fn=CountdownRewardFn(),
@@ -106,12 +101,10 @@ class TestEvaluate:
         assert isinstance(result.reward_mean, float)
         assert isinstance(result.reward_std, float)
         assert isinstance(result.component_means, dict)
-        assert isinstance(result.all_rewards, list)
-        assert len(result.all_rewards) == 4 * 2  # max_episodes * group_size
 
     def test_evaluate_greedy_sampling(self, tiny_model, tokenizer, env):
         """Evaluate works with greedy sampling (temperature=0)."""
-        result = evaluate(
+        result, _ = evaluate(
             net=tiny_model,
             env=env,
             reward_fn=CountdownRewardFn(),
@@ -132,22 +125,6 @@ class TestEvaluate:
 
 
 class TestGenerateRolloutBatch:
-    @pytest.fixture
-    def tiny_model(self):
-        return create_tiny_model()
-
-    @pytest.fixture
-    def tokenizer(self):
-        return Tokenizer.from_file("qwen-tokenizer/tokenizer.json")
-
-    @pytest.fixture
-    def env(self):
-        return CountdownEnv(
-            num_operands=2,
-            min_number=1,
-            max_number=5,
-        )
-
     def test_rollout_batch_structure(self, tiny_model, tokenizer, env):
         """generate_rollout_batch returns RolloutBatch with correct structure."""
         batch_size = 2

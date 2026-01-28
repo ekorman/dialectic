@@ -19,7 +19,6 @@ class EvaluationResult:
     reward_mean: float
     reward_std: float
     component_means: dict[str, float]
-    all_rewards: list[float]
 
 
 @torch.no_grad()
@@ -40,7 +39,7 @@ def evaluate(
     temperature: float = 0.0,
     n_examples: int = 10,
     use_bf16: bool = False,
-) -> EvaluationResult:
+) -> tuple[EvaluationResult, list[extty.Example]]:
     """Evaluate a model against an environment and reward function.
 
     Parameters
