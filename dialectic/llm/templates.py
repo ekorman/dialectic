@@ -30,6 +30,7 @@ def get_llama_input_text_from_messages(
     tools: list[Tool | dict[str, Any]] | None = None,
     tools_in_user_message: bool = True,
     date_string: str | None = None,
+    add_system_date_prompt: bool = False,
 ) -> str:
     """
     Convert messages to the Llama 3 chat template format.
@@ -66,11 +67,13 @@ def get_llama_input_text_from_messages(
         system_message = (msgs[0].content or "").strip()
         msgs = msgs[1:]
 
-    result += "<|start_header_id|>system<|end_header_id|>\n\n"
+    if tools is not None or add_system_date_prompt:
+        result += "<|start_header_id|>system<|end_header_id|>\n\n"
     if tools is not None:
         result += "Environment: ipython\n"
-    result += "Cutting Knowledge Date: December 2023\n"
-    result += f"Today Date: {date_string}\n\n"
+    if add_system_date_prompt:
+        result += "Cutting Knowledge Date: December 2023\n"
+        result += f"Today Date: {date_string}\n\n"
 
     if tools is not None and not tools_in_user_message:
         result += "You have access to the following functions. To call a function, please respond with JSON for a function call."

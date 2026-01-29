@@ -657,12 +657,14 @@ def test_llama_simple_user_message():
         tokenize=False,
         add_generation_prompt=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     result = get_llama_input_text_from_messages(
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -691,6 +693,7 @@ def test_llama_system_and_user_message():
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -718,6 +721,7 @@ def test_llama_multi_turn_conversation():
         messages=[Message(**m) for m in messages],
         add_generation_prompt=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -744,6 +748,7 @@ def test_llama_no_generation_prompt():
         messages=[Message(**m) for m in messages],
         add_generation_prompt=False,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -786,6 +791,7 @@ def test_llama_with_tools_in_user_message():
         tools=tools,
         tools_in_user_message=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -830,6 +836,7 @@ def test_llama_with_tools_in_system_message():
         tools=tools,
         tools_in_user_message=False,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -876,6 +883,7 @@ def test_llama_assistant_with_tool_call():
         messages=msg_objects,
         add_generation_prompt=False,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -926,6 +934,7 @@ def test_llama_tool_response():
         messages=msg_objects,
         add_generation_prompt=True,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -998,6 +1007,7 @@ def test_llama_full_tool_use_conversation():
         add_generation_prompt=False,
         tools=tools,
         date_string=date_string,
+        add_system_date_prompt=True,
     )
 
     assert result == expected
@@ -1059,6 +1069,7 @@ def test_llama_date_in_system():
         messages=[Message(role="user", content="Hello")],
         add_generation_prompt=True,
         date_string="15 Jan 2025",
+        add_system_date_prompt=True,
     )
 
     assert "Today Date: 15 Jan 2025" in result

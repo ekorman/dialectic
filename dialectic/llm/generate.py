@@ -8,7 +8,11 @@ from torch import Tensor
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import KVCache
-from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
+from dialectic.llm.templates import (
+    Message,
+    get_llama_input_text_from_messages,
+    get_qwen_input_text_from_messages,
+)
 
 
 @torch.inference_mode()
@@ -154,6 +158,36 @@ def qwen_generate_from_chat(
             )
             for message in batch_messages
         ],
+        eos_token=eos_token,
+        pad_token=pad_token,
+        max_tokens_generated=max_tokens_generated,
+        device=device,
+        temperature=temperature,
+    )
+
+
+def llama_generate_from_chat(
+    net: BaseTransformer,
+    tokenizer: Tokenizer,
+    batch_messages: list[list[Message]],
+    eos_token: str = "<|eot_id|>",
+    pad_token: str = "<|eot_id|>",  # "<|finetune_right_pad_id|>",
+    sampling_strategy: Literal["greedy", "sample"] = "sample",
+    max_tokens_generated: int = 1000,
+    device: str | torch.device | None = None,
+    temperature: float = 1.0,
+):
+    text_batch = [
+        get_llama_input_text_from_messages(message, add_generation_prompt=True)
+        for message in batch_messages
+    ]
+    ## ['<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 29 Jan 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n']
+
+    return generate_from_text(
+        net=net,
+        tokenizer=tokenizer,
+        sampling_strategy=sampling_strategy,
+        text_batch=text_batch,
         eos_token=eos_token,
         pad_token=pad_token,
         max_tokens_generated=max_tokens_generated,
