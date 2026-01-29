@@ -11,7 +11,7 @@ from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.qwen import generate_from_tokens
+from dialectic.llm.generate import generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, RewardResult, T

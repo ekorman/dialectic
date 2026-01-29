@@ -11,13 +11,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from dialectic.llm.qwen import (
-    create_qwen,
-    create_qwen_decoder_layer,
-    generate_from_chat,
-    generate_from_tokens,
-    load_qwen_06b,
-)
+from dialectic.llm.generate import generate_from_tokens, qwen_generate_from_chat
+from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen_06b
 from dialectic.llm.templates import Message
 
 torch.manual_seed(18)
@@ -370,7 +365,7 @@ def test_model_generation_against_qwen_06b():
         messages2 = [
             Message(role="user", content="What is the capital of France? /nothink")
         ]
-        resp = generate_from_chat(
+        resp = qwen_generate_from_chat(
             model,
             tokenizer,
             [messages1, messages2],
