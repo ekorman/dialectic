@@ -6,7 +6,7 @@ import extty
 import torch
 from tokenizers import Tokenizer
 
-from dialectic.llm.qwen import Qwen
+from dialectic.llm.base import BaseTransformer
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import generate_rollout_batch
@@ -24,7 +24,7 @@ class EvaluationResult:
 @torch.no_grad()
 def evaluate(
     *,
-    net: Qwen,
+    net: BaseTransformer,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],

@@ -13,12 +13,12 @@ import sys
 from typing import Literal
 
 import torch
-import torch.nn as nn
 from jaxtyping import Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
-from dialectic.llm.components import DecoderLayer, KVCache, RMSNorm
+from dialectic.llm.base import BaseTransformer
+from dialectic.llm.components import DecoderLayer, KVCache
 from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 
 
@@ -47,70 +47,32 @@ def create_qwen_decoder_layer(
     )
 
 
-class Qwen(nn.Module):
-    def __init__(
-        self,
-        d: int,
-        vocab_size: int,
-        n_decoder_layers: int,
-        attn_head_d: int,
-        attn_num_heads: int,
-        attn_num_kv_heads: int,
-        mlp_hidden_d: int,
-        rope_base_value: float | None = None,
-        rms_norm_eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.d = d
-        self.attn_num_heads = attn_num_heads
-        self.attn_num_kv_heads = attn_num_kv_heads
-        self.attn_head_d = attn_head_d
-        self.vocab_size = vocab_size
-        self.embed_tokens = nn.Embedding(vocab_size, d)
-        self.layers = nn.ModuleList(
-            [
-                create_qwen_decoder_layer(
-                    d=d,
-                    attn_head_d=attn_head_d,
-                    attn_num_heads=attn_num_heads,
-                    attn_num_kv_heads=attn_num_kv_heads,
-                    mlp_hidden_d=mlp_hidden_d,
-                    rope_base_value=rope_base_value,
-                    rms_norm_eps=rms_norm_eps,
-                )
-                for _ in range(n_decoder_layers)
-            ]
-        )
-        self.norm = RMSNorm(d, rms_norm_eps)
-        self.lm_head = nn.Linear(d, vocab_size, bias=False)
-
-    def forward(
-        self,
-        x: Int[Tensor, "B L"],
-        kv_caches: list[KVCache] | None = None,
-        attention_mask: torch.Tensor | None = None,
-        return_all_logits: bool = False,
-        return_hidden_states: bool = False,
-    ):
-        x = self.embed_tokens(x)
-
-        for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
-            x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
-
-        x = self.norm(x)
-
-        if return_hidden_states:
-            return x
-
-        # just get last element of output sequence
-        # important: if attention_mask is not None then we assume left padding!
-        if not return_all_logits:
-            x = x[:, -1:]
-        return self.lm_head(x)
+def create_qwen(
+    d: int,
+    vocab_size: int,
+    n_decoder_layers: int,
+    attn_head_d: int,
+    attn_num_heads: int,
+    attn_num_kv_heads: int,
+    mlp_hidden_d: int,
+    rope_base_value: int = 1000000,
+):
+    return BaseTransformer(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=attn_head_d,
+        attn_num_heads=attn_num_heads,
+        attn_num_kv_heads=attn_num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rms_norm_eps=1e-6,
+        rope_base_value=rope_base_value,
+        decoder_layer_factory=create_qwen_decoder_layer,
+    )
 
 
-def load_qwen_06b() -> Qwen:
-    return Qwen(
+def load_qwen_06b() -> BaseTransformer:
+    return create_qwen(
         d=1024,
         vocab_size=151936,
         n_decoder_layers=28,
@@ -124,7 +86,7 @@ def load_qwen_06b() -> Qwen:
 
 @torch.inference_mode()
 def generate_from_tokens(
-    net: Qwen,
+    net: BaseTransformer,
     token_ids: Int[Tensor, "B L"],
     eos_token_id: int = 151645,
     pad_token_id: int = 151643,
@@ -203,7 +165,7 @@ def generate_from_tokens(
 
 
 def generate_from_text(
-    net: Qwen,
+    net: BaseTransformer,
     tokenizer: Tokenizer,
     text_batch: list[str],
     eos_token: str = "<|im_end|>",
@@ -244,7 +206,7 @@ def generate_from_text(
 
 
 def generate_from_chat(
-    net: Qwen,
+    net: BaseTransformer,
     tokenizer: Tokenizer,
     batch_messages: list[list[Message]],
     eos_token: str = "<|im_end|>",

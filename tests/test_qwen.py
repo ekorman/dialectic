@@ -12,7 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from dialectic.llm.qwen import (
-    Qwen,
+    create_qwen,
     create_qwen_decoder_layer,
     generate_from_chat,
     generate_from_tokens,
@@ -63,7 +63,7 @@ def test_qwen():
     rope_base_value = 10000
     x = torch.randint(0, vocab_size, size=(b, l))
 
-    model = Qwen(
+    model = create_qwen(
         d=d,
         vocab_size=vocab_size,
         n_decoder_layers=n_decoder_layers,
@@ -112,7 +112,7 @@ def test_qwen_generate():
     rope_base_value = 10000
     x = torch.randint(0, vocab_size, size=(b, l))
 
-    model = Qwen(
+    model = create_qwen(
         d=d,
         vocab_size=vocab_size,
         n_decoder_layers=n_decoder_layers,
@@ -164,7 +164,7 @@ def test_qwen_generate_attention_mask():
     n_decoder_layers = 3
     rope_base_value = 10000
 
-    model = Qwen(
+    model = create_qwen(
         d=d,
         vocab_size=vocab_size,
         n_decoder_layers=n_decoder_layers,
@@ -224,7 +224,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     n_decoder_layers = 3
     rope_base_value = 10000
 
-    model = Qwen(
+    model = create_qwen(
         d=d,
         vocab_size=vocab_size,
         n_decoder_layers=n_decoder_layers,
@@ -284,7 +284,7 @@ def test_qwen_generate_temperature():
     n_decoder_layers = 3
     rope_base_value = 10000
 
-    model = Qwen(
+    model = create_qwen(
         d=d,
         vocab_size=vocab_size,
         n_decoder_layers=n_decoder_layers,
