@@ -320,7 +320,7 @@ def test_qwen_generate_temperature():
 
 @pytest.mark.skipif(
     os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_load_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
 def test_model_generation_against_qwen_06b():
     """Test model generation against HuggingFace. the expected output was obtained with the code

@@ -1,3 +1,6 @@
+import os
+
+import pytest
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -25,6 +28,10 @@ Hello! I'm an artificial intelligence model known as Llama. Llama stands for "La
 """
 
 
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_llama_against_hf` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
 @torch.no_grad()
 def test_llama_against_hf():
     model = load_llama_1b()
