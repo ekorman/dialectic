@@ -104,7 +104,6 @@ def test_llama_against_hf_generation():
 
     model.eval()
 
-    # now check text generation
     messages = [[Message(role="user", content="Hello who are you?")]]
 
     chat_output = llama_generate_from_chat(
