@@ -2,6 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+from jaxtyping import Int
 
 from dialectic.llm.components import KVCache, RMSNorm
 
@@ -46,7 +47,7 @@ class BaseTransformer(nn.Module):
 
     def forward(
         self,
-        x,
+        x: Int[torch.Tensor, "B L"],
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
