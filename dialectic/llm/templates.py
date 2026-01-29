@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 
@@ -21,6 +22,122 @@ class Message:
 class Tool:
     type: str = "function"
     function: dict[str, Any] = field(default_factory=dict)
+
+
+def get_llama_input_text_from_messages(
+    messages: list[Message],
+    add_generation_prompt: bool,
+    tools: list[Tool | dict[str, Any]] | None = None,
+    tools_in_user_message: bool = True,
+    date_string: str | None = None,
+) -> str:
+    """
+    Convert messages to the Llama 3 chat template format.
+
+    Parameters
+    ----------
+    messages : list[Message]
+        List of Message objects representing the conversation.
+    add_generation_prompt : bool
+        Whether to add the assistant generation prompt at the end.
+    tools : list[Tool | dict[str, Any]] | None, optional
+        List of tool definitions to include.
+    tools_in_user_message : bool, optional
+        If True, tools are included in the first user message. If False,
+        tools are included in the system message. Defaults to True.
+    date_string : str | None, optional
+        The date string to include in the system message. If None, uses
+        a default date.
+
+    Returns
+    -------
+    str
+        The formatted chat template string.
+    """
+
+    if date_string is None:
+        date_string = datetime.now().strftime("%d %b %Y")
+
+    result = "<|begin_of_text|>"
+    msgs = list(messages)
+
+    system_message = ""
+    if msgs and msgs[0].role == "system":
+        system_message = (msgs[0].content or "").strip()
+        msgs = msgs[1:]
+
+    result += "<|start_header_id|>system<|end_header_id|>\n\n"
+    if tools is not None:
+        result += "Environment: ipython\n"
+    result += "Cutting Knowledge Date: December 2023\n"
+    result += f"Today Date: {date_string}\n\n"
+
+    if tools is not None and not tools_in_user_message:
+        result += "You have access to the following functions. To call a function, please respond with JSON for a function call."
+        result += 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.'
+        result += "Do not use variables.\n\n"
+        for tool in tools:
+            if isinstance(tool, Tool):
+                result += json.dumps(
+                    {"type": tool.type, "function": tool.function}, indent=4
+                )
+            else:
+                result += json.dumps(tool, indent=4)
+            result += "\n\n"
+
+    result += system_message
+    result += "<|eot_id|>"
+
+    if tools_in_user_message and tools is not None:
+        if not msgs:
+            raise ValueError(
+                "Cannot put tools in the first user message when there's no first user message!"
+            )
+        first_user_message = (msgs[0].content or "").strip()
+        msgs = msgs[1:]
+
+        result += "<|start_header_id|>user<|end_header_id|>\n\n"
+        result += "Given the following functions, please respond with a JSON for a function call "
+        result += "with its proper arguments that best answers the given prompt.\n\n"
+        result += 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.'
+        result += "Do not use variables.\n\n"
+        for tool in tools:
+            if isinstance(tool, Tool):
+                result += json.dumps(
+                    {"type": tool.type, "function": tool.function}, indent=4
+                )
+            else:
+                result += json.dumps(tool, indent=4)
+            result += "\n\n"
+        result += first_user_message + "<|eot_id|>"
+
+    for message in msgs:
+        content = (message.content or "").strip()
+
+        if message.role in ("user", "assistant") and not message.tool_calls:
+            result += f"<|start_header_id|>{message.role}<|end_header_id|>\n\n{content}<|eot_id|>"
+
+        elif message.tool_calls:
+            if len(message.tool_calls) != 1:
+                raise ValueError("Llama 3 only supports single tool-calls at once!")
+            tool_call = message.tool_calls[0]
+            result += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            result += f'{{"name": "{tool_call.name}", "parameters": '
+            if isinstance(tool_call.arguments, str):
+                result += tool_call.arguments
+            else:
+                result += json.dumps(tool_call.arguments)
+            result += "}<|eot_id|>"
+
+        elif message.role == "tool":
+            result += "<|start_header_id|>ipython<|end_header_id|>\n\n"
+            result += json.dumps(content)
+            result += "<|eot_id|>"
+
+    if add_generation_prompt:
+        result += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    return result
 
 
 def get_qwen_input_text_from_messages(

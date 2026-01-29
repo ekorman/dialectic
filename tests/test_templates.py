@@ -1,7 +1,12 @@
 from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
 
-from dialectic.llm.templates import Message, ToolCall, get_qwen_input_text_from_messages
+from dialectic.llm.templates import (
+    Message,
+    ToolCall,
+    get_llama_input_text_from_messages,
+    get_qwen_input_text_from_messages,
+)
 
 
 def get_auto_tokenizer():
@@ -628,3 +633,433 @@ def test_full_tool_use_conversation():
     )
 
     assert result == expected
+
+
+# ============================================================================
+# Llama 3 Template Tests
+# ============================================================================
+
+
+def get_llama_auto_tokenizer():
+    return AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+
+
+def test_llama_simple_user_message():
+    """Test a simple user message."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    prompt = "Give me a short introduction to large language model."
+    messages = [{"role": "user", "content": prompt}]
+    date_string = "26 Jul 2024"
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    assert result == expected
+    assert "<|start_header_id|>user<|end_header_id|>" in result
+    assert "<|start_header_id|>assistant<|end_header_id|>" in result
+
+
+def test_llama_system_and_user_message():
+    """Test system message followed by user message."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"},
+    ]
+    date_string = "26 Jul 2024"
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    assert result == expected
+
+
+def test_llama_multi_turn_conversation():
+    """Test a multi-turn conversation with user and assistant."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "2+2 equals 4."},
+        {"role": "user", "content": "And 3+3?"},
+    ]
+    date_string = "26 Jul 2024"
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    assert result == expected
+
+
+def test_llama_no_generation_prompt():
+    """Test without generation prompt."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there!"},
+    ]
+    date_string = "26 Jul 2024"
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=False,
+        date_string=date_string,
+    )
+
+    assert result == expected
+    assert not result.endswith("<|start_header_id|>assistant<|end_header_id|>\n\n")
+
+
+def test_llama_with_tools_in_user_message():
+    """Test with tools parameter (tools in user message by default)."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    messages = [{"role": "user", "content": "What's the weather in Tokyo?"}]
+    date_string = "26 Jul 2024"
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=tools,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=True,
+        tools=tools,
+        tools_in_user_message=True,
+        date_string=date_string,
+    )
+
+    assert result == expected
+    assert "Environment: ipython" in result
+    assert "get_weather" in result
+
+
+def test_llama_with_tools_in_system_message():
+    """Test with tools in system message."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+
+    messages = [{"role": "user", "content": "What's the weather in Tokyo?"}]
+    date_string = "26 Jul 2024"
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+    ]
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=tools,
+        tools_in_user_message=False,
+        date_string=date_string,
+    )
+
+    result = get_llama_input_text_from_messages(
+        messages=[Message(**m) for m in messages],
+        add_generation_prompt=True,
+        tools=tools,
+        tools_in_user_message=False,
+        date_string=date_string,
+    )
+
+    assert result == expected
+
+
+def test_llama_assistant_with_tool_call():
+    """Test assistant message with a single tool call."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+    date_string = "26 Jul 2024"
+
+    messages = [
+        {"role": "user", "content": "What's the weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": {"location": "Tokyo"},
+                    }
+                }
+            ],
+        },
+    ]
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        date_string=date_string,
+    )
+
+    msg_objects = [
+        Message(role="user", content="What's the weather?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(name="get_weather", arguments={"location": "Tokyo"})],
+        ),
+    ]
+
+    result = get_llama_input_text_from_messages(
+        messages=msg_objects,
+        add_generation_prompt=False,
+        date_string=date_string,
+    )
+
+    assert result == expected
+    assert '"name": "get_weather"' in result
+    assert '"parameters":' in result
+
+
+def test_llama_tool_response():
+    """Test tool response message (uses ipython role)."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+    date_string = "26 Jul 2024"
+
+    messages = [
+        {"role": "user", "content": "What's the weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": {"location": "Tokyo"},
+                    }
+                }
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 22, "condition": "sunny"}'},
+    ]
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    msg_objects = [
+        Message(role="user", content="What's the weather?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(name="get_weather", arguments={"location": "Tokyo"})],
+        ),
+        Message(role="tool", content='{"temperature": 22, "condition": "sunny"}'),
+    ]
+
+    result = get_llama_input_text_from_messages(
+        messages=msg_objects,
+        add_generation_prompt=True,
+        date_string=date_string,
+    )
+
+    assert result == expected
+    assert "<|start_header_id|>ipython<|end_header_id|>" in result
+
+
+def test_llama_full_tool_use_conversation():
+    """Test a complete tool use conversation flow."""
+    auto_tokenizer = get_llama_auto_tokenizer()
+    date_string = "26 Jul 2024"
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a location",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    messages = [
+        {"role": "system", "content": "You are a helpful weather assistant."},
+        {"role": "user", "content": "What's the weather in Paris?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": {"location": "Paris"},
+                    }
+                }
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 18, "condition": "cloudy"}'},
+        {
+            "role": "assistant",
+            "content": "The weather in Paris is 18°C and cloudy.",
+        },
+    ]
+
+    expected = auto_tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=tools,
+        date_string=date_string,
+    )
+
+    msg_objects = [
+        Message(role="system", content="You are a helpful weather assistant."),
+        Message(role="user", content="What's the weather in Paris?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(name="get_weather", arguments={"location": "Paris"})],
+        ),
+        Message(role="tool", content='{"temperature": 18, "condition": "cloudy"}'),
+        Message(role="assistant", content="The weather in Paris is 18°C and cloudy."),
+    ]
+
+    result = get_llama_input_text_from_messages(
+        messages=msg_objects,
+        add_generation_prompt=False,
+        tools=tools,
+        date_string=date_string,
+    )
+
+    assert result == expected
+
+
+def test_llama_multiple_tool_calls_raises():
+    """Test that multiple tool calls raises an error (Llama limitation)."""
+    import pytest
+
+    msg_objects = [
+        Message(role="user", content="What's the weather?"),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(name="get_weather", arguments={"location": "Tokyo"}),
+                ToolCall(name="get_weather", arguments={"location": "London"}),
+            ],
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="single tool-calls"):
+        get_llama_input_text_from_messages(
+            messages=msg_objects,
+            add_generation_prompt=False,
+        )
+
+
+def test_llama_tools_without_user_message_raises():
+    """Test that tools in user message without a user message raises an error."""
+    import pytest
+
+    messages = [Message(role="system", content="You are helpful.")]
+
+    tools = [{"type": "function", "function": {"name": "test"}}]
+
+    with pytest.raises(ValueError, match="first user message"):
+        get_llama_input_text_from_messages(
+            messages=messages,
+            add_generation_prompt=True,
+            tools=tools,
+            tools_in_user_message=True,
+        )
+
+
+def test_llama_bos_token():
+    """Test that output starts with BOS token."""
+    result = get_llama_input_text_from_messages(
+        messages=[Message(role="user", content="Hello")],
+        add_generation_prompt=True,
+    )
+
+    assert result.startswith("<|begin_of_text|>")
+
+
+def test_llama_date_in_system():
+    """Test that date is included in system message."""
+    result = get_llama_input_text_from_messages(
+        messages=[Message(role="user", content="Hello")],
+        add_generation_prompt=True,
+        date_string="15 Jan 2025",
+    )
+
+    assert "Today Date: 15 Jan 2025" in result
+    assert "Cutting Knowledge Date: December 2023" in result
