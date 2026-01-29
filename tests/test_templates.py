@@ -1,3 +1,6 @@
+import os
+
+import pytest
 from tokenizers import Encoding, Tokenizer
 from transformers import AutoTokenizer
 
@@ -644,6 +647,9 @@ def get_llama_auto_tokenizer():
     return AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_simple_user_message():
     """Test a simple user message."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -672,6 +678,9 @@ def test_llama_simple_user_message():
     assert "<|start_header_id|>assistant<|end_header_id|>" in result
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_system_and_user_message():
     """Test system message followed by user message."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -699,6 +708,9 @@ def test_llama_system_and_user_message():
     assert result == expected
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_multi_turn_conversation():
     """Test a multi-turn conversation with user and assistant."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -727,6 +739,9 @@ def test_llama_multi_turn_conversation():
     assert result == expected
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_no_generation_prompt():
     """Test without generation prompt."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -755,6 +770,9 @@ def test_llama_no_generation_prompt():
     assert not result.endswith("<|start_header_id|>assistant<|end_header_id|>\n\n")
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_with_tools_in_user_message():
     """Test with tools parameter (tools in user message by default)."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -799,6 +817,9 @@ def test_llama_with_tools_in_user_message():
     assert "get_weather" in result
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_with_tools_in_system_message():
     """Test with tools in system message."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -842,6 +863,9 @@ def test_llama_with_tools_in_system_message():
     assert result == expected
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_assistant_with_tool_call():
     """Test assistant message with a single tool call."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -891,6 +915,9 @@ def test_llama_assistant_with_tool_call():
     assert '"parameters":' in result
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_tool_response():
     """Test tool response message (uses ipython role)."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -941,6 +968,9 @@ def test_llama_tool_response():
     assert "<|start_header_id|>ipython<|end_header_id|>" in result
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_full_tool_use_conversation():
     """Test a complete tool use conversation flow."""
     auto_tokenizer = get_llama_auto_tokenizer()
@@ -1013,6 +1043,9 @@ def test_llama_full_tool_use_conversation():
     assert result == expected
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_multiple_tool_calls_raises():
     """Test that multiple tool calls raises an error (Llama limitation)."""
     import pytest
@@ -1036,6 +1069,9 @@ def test_llama_multiple_tool_calls_raises():
         )
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_tools_without_user_message_raises():
     """Test that tools in user message without a user message raises an error."""
     import pytest
@@ -1053,6 +1089,9 @@ def test_llama_tools_without_user_message_raises():
         )
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_bos_token():
     """Test that output starts with BOS token."""
     result = get_llama_input_text_from_messages(
@@ -1063,6 +1102,9 @@ def test_llama_bos_token():
     assert result.startswith("<|begin_of_text|>")
 
 
+@pytest.mark.skipif(
+    os.getenv("LLAMA_ACCESS") is None, reason="`LLAMA_ACCESS` env flag not set"
+)
 def test_llama_date_in_system():
     """Test that date is included in system message."""
     result = get_llama_input_text_from_messages(
