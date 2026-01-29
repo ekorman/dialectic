@@ -11,13 +11,14 @@ Usage:
 import argparse
 import importlib.util
 import os
+import random
 
 import extty
 import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
-from dialectic.llm.tokenizer import Message, get_input_text_from_messages
+from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -44,7 +45,7 @@ r2_account_id = "a64c6da180648dd944675d311c296763"
 def get_state_to_str(enable_thinking: bool):
     def _state_to_str(data: Countdown) -> str:
         reasoning_tag = "think" if enable_thinking else "reasoning"
-        ret = get_input_text_from_messages(
+        ret = get_qwen_input_text_from_messages(
             [Message(role="user", content=data.prompt)],
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
@@ -86,7 +87,7 @@ def train(
     n_larges: int = 2,
     n_total: int = 6,
     n_ops: int = 5,
-    seed: int | None = None,
+    seed: int,
     mu: int = 1,
     accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
@@ -94,6 +95,7 @@ def train(
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
 ):
+    torch.manual_seed(seed)
     net = load_qwen_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
@@ -261,6 +263,12 @@ def main():
         dest="use_qwen_thinking",
         action="store_false",
         help="Do not use Qwen's out-of-the-box thinking mode",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=random.choice(range(1000)),
+        help="Chunk size for log prob computation (0 to disable chunking)",
     )
     args = parser.parse_args()
 

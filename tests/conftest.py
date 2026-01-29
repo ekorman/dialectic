@@ -1,13 +1,13 @@
 import pytest
 from tokenizers import Tokenizer
 
-from dialectic.llm.qwen import Qwen
+from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import CountdownEnv
 
 
 @pytest.fixture
 def tiny_model():
-    return Qwen(
+    return create_qwen(
         d=32,
         vocab_size=151936,
         n_decoder_layers=2,

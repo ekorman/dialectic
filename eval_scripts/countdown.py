@@ -16,7 +16,7 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
-from dialectic.llm.tokenizer import Message, get_input_text_from_messages
+from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.evaluate import evaluate
@@ -26,7 +26,7 @@ from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 
 def get_state_to_str(enable_thinking: bool):
     def _state_to_str(data: Countdown) -> str:
-        return get_input_text_from_messages(
+        return get_qwen_input_text_from_messages(
             [Message(role="user", content=data.prompt)],
             add_generation_prompt=True,
             enable_thinking=enable_thinking,

@@ -10,7 +10,8 @@ import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
-from dialectic.llm.qwen import Qwen, generate_from_tokens
+from dialectic.llm.base import BaseTransformer
+from dialectic.llm.generate import generate_from_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
@@ -85,7 +86,7 @@ def compute_logits_of_group(
 
 def compute_log_probs(
     *,
-    net: nn.Module,
+    net: BaseTransformer,
     attention_mask: Integer[torch.Tensor, "B L_prompt"],
     completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
     pad_token_id: int,
@@ -96,7 +97,7 @@ def compute_log_probs(
     Parameters
     ----------
     net
-        The language model (must be a Qwen model for chunked computation).
+        The language model.
     attention_mask
         Attention mask for the prompt.
     completion_token_ids
@@ -152,9 +153,6 @@ def _compute_log_probs_chunked(
     chunk_size: int,
 ) -> Float[torch.Tensor, "B G L_completion"]:
     """Compute log probs in chunks to avoid OOM from large logits tensor."""
-    from dialectic.llm.qwen import Qwen
-
-    assert isinstance(net, Qwen), "Chunked computation requires Qwen model"
 
     batch_size, group_size, seq_len = input_ids.shape
     flat_input_ids = input_ids.view(batch_size * group_size, seq_len)
@@ -251,7 +249,7 @@ def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
 @torch.no_grad()
 def generate_rollout_batch(
     *,
-    net: Qwen,
+    net: BaseTransformer,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -443,8 +441,8 @@ def grpo_step(
 @torch.no_grad()
 def collect_micro_batch(
     *,
-    net: Qwen,
-    ref_net: Qwen,
+    net: BaseTransformer,
+    ref_net: BaseTransformer,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -515,7 +513,7 @@ def collect_micro_batch(
 
 def train_grpo(
     *,
-    net: Qwen,
+    net: BaseTransformer,
     opt: torch.optim.Optimizer,
     env: Env[T, A],  # assume single step
     reward_fn: RewardFn[T, E],

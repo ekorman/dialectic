@@ -14,7 +14,7 @@ from copy import deepcopy
 
 import torch
 
-from dialectic.llm.qwen import Qwen
+from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import Countdown, Env, EpisodeIsDoneError
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn, RewardFn
@@ -218,8 +218,8 @@ class TestGRPOMechanics:
 
         base_state = deepcopy(tiny_model.state_dict())
 
-        def run_training(*, batch_size: int, accumulation_steps: int) -> Qwen:
-            model = Qwen(
+        def run_training(*, batch_size: int, accumulation_steps: int):
+            model = create_qwen(
                 d=32,
                 vocab_size=151936,
                 n_decoder_layers=2,

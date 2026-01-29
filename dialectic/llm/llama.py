@@ -11,18 +11,22 @@
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import DecoderLayer
+from dialectic.llm.components.rope import RopeScaling
 
 
-def create_qwen_decoder_layer(
+def create_llama_decoder_layer(
     d: int,
     *,
     attn_head_d: int,
     attn_num_heads: int,
     attn_num_kv_heads: int,
     mlp_hidden_d: int,
-    rope_base_value: float | None = None,
-    rms_norm_eps: float = 1e-6,
-    rope_max_position_embeddings: int = 32768,
+    rms_norm_eps: float,
+    rope_base_value: float = 1e-5,
+    rope_max_position_embeddings: int = 8192,
+    rope_scaling: RopeScaling = RopeScaling(
+        factor=32, high_freq_factor=4, low_freq_factor=1
+    ),
 ):
     return DecoderLayer(
         d=d,
@@ -32,13 +36,14 @@ def create_qwen_decoder_layer(
         mlp_hidden_d=mlp_hidden_d,
         rope_base_value=rope_base_value,
         causal=True,
-        apply_qk_rms_norm=True,
+        apply_qk_rms_norm=False,
         rms_norm_eps=rms_norm_eps,
         rope_max_position_embeddings=rope_max_position_embeddings,
+        rope_scaling=rope_scaling,
     )
 
 
-def create_qwen(
+def create_llama(
     d: int,
     vocab_size: int,
     n_decoder_layers: int,
@@ -46,7 +51,7 @@ def create_qwen(
     attn_num_heads: int,
     attn_num_kv_heads: int,
     mlp_hidden_d: int,
-    rope_base_value: int = 1000000,
+    rope_base_value: int = 500000,
 ):
     return BaseTransformer(
         d=d,
@@ -56,20 +61,20 @@ def create_qwen(
         attn_num_heads=attn_num_heads,
         attn_num_kv_heads=attn_num_kv_heads,
         mlp_hidden_d=mlp_hidden_d,
-        rms_norm_eps=1e-6,
+        rms_norm_eps=1e-5,
         rope_base_value=rope_base_value,
-        decoder_layer_factory=create_qwen_decoder_layer,
+        decoder_layer_factory=create_llama_decoder_layer,
     )
 
 
-def load_qwen_06b() -> BaseTransformer:
-    return create_qwen(
-        d=1024,
-        vocab_size=151936,
-        n_decoder_layers=28,
-        attn_head_d=128,
-        attn_num_heads=16,
+def load_llama_1b() -> BaseTransformer:
+    return create_llama(
+        d=2048,
+        vocab_size=128256,
+        n_decoder_layers=16,
+        attn_head_d=64,
+        attn_num_heads=32,
         attn_num_kv_heads=8,
-        mlp_hidden_d=3072,
-        rope_base_value=1000000,
+        mlp_hidden_d=8192,
+        rope_base_value=500000,
     )
