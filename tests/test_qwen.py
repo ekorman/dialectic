@@ -290,7 +290,7 @@ def test_qwen_generate_temperature():
         rope_base_value=rope_base_value,
     ).eval()
 
-    x = torch.randint(0, vocab_size, size=(1, 4))
+    x = torch.randint(0, vocab_size, size=(2, 4))
 
     out_greedy = generate_from_tokens(
         net=model,
