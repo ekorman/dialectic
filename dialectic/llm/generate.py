@@ -2,7 +2,7 @@ import sys
 from typing import Literal
 
 import torch
-from jaxtyping import Int
+from jaxtyping import Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
@@ -21,17 +21,22 @@ def generate_from_tokens(
     token_ids: Int[Tensor, "B L"],
     eos_token_id: int = 151645,
     pad_token_id: int = 151643,
-    sampling_strategy: Literal["greedy", "sample"] = "sample",
+    sampling_strategy: Literal["greedy", "sample"] | None = "sample",
     max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
     attention_mask: torch.Tensor | None = None,  # should be left-padded
     temperature: float = 1.0,
     use_bf16: bool = False,
+    soft_tokens: bool = False,
 ) -> Int[Tensor, "B L"]:
-    assert sampling_strategy in ["greedy", "sample"]
+    if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
+        raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 
     if pad_token_id is None:
         pad_token_id = eos_token_id
+
+    if soft_tokens:
+        shadow_seq = []
 
     if use_kv_cache:
         kv_caches = [
@@ -50,49 +55,75 @@ def generate_from_tokens(
     device = token_ids.device
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    all_token_ids = token_ids
-    input_ids = token_ids
+    if soft_tokens:
+        all_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
+        input_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
+    else:
+        all_tokens = token_ids
+        input_tokens = token_ids
 
     tokens_generated = 0
     while tokens_generated < max_tokens_generated:
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
-            logits: torch.Tensor = net(
-                input_ids, kv_caches=kv_caches, attention_mask=attention_mask
+            logits: Float[torch.Tensor, "B 1 V"] = net(
+                input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
             )
 
-        if sampling_strategy == "greedy":
-            next_token_id = logits.argmax(-1)
+        if (not soft_tokens) and (sampling_strategy == "greedy"):
+            next_token = logits.argmax(-1)
+            hard_token_id = next_token
+        elif not soft_tokens:
+            scaled_logits = logits / temperature
+
+            probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            hard_token_id = next_token
         else:
             scaled_logits = logits / temperature
-            probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
-            next_token_id = torch.multinomial(probs, num_samples=1)
+            probs = torch.softmax(scaled_logits, dim=-1)
+            shadow_seq.append(probs.argmax(-1))
+            next_token = probs  # need .detach()?
+            hard_token_id = shadow_seq[-1]
 
-        finished = finished | (next_token_id.squeeze(-1) == eos_token_id)
+        finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
 
-        next_token_id = torch.where(
-            finished.unsqueeze(-1),
-            torch.full_like(next_token_id, pad_token_id),
-            next_token_id,
-        )
+        # import pdb
+
+        # pdb.set_trace()
+        if not soft_tokens:
+            next_token = torch.where(
+                finished.unsqueeze(-1),
+                torch.full_like(next_token, pad_token_id),
+                next_token,
+            )
+        else:
+            # TODO: test this
+            next_token = torch.where(
+                finished.unsqueeze(-1).unsqueeze(-1),
+                torch.nn.functional.one_hot(
+                    torch.tensor(pad_token_id), logits.shape[-1]
+                ),
+                next_token,
+            )
 
         if finished.all():
             break
 
-        all_token_ids = torch.cat([all_token_ids, next_token_id], 1)
+        all_tokens = torch.cat([all_tokens, next_token], 1)
         tokens_generated += 1
 
         if use_kv_cache:
-            input_ids = next_token_id
+            input_tokens = next_token
         else:
-            input_ids = all_token_ids
+            input_tokens = all_tokens
 
         if attention_mask is not None:
             new_mask = finished.unsqueeze(-1)
             attention_mask = torch.cat([attention_mask, new_mask], 1)
 
-    return all_token_ids
+    return all_tokens
 
 
 def generate_from_text(
@@ -181,7 +212,6 @@ def llama_generate_from_chat(
         get_llama_input_text_from_messages(message, add_generation_prompt=True)
         for message in batch_messages
     ]
-    ## ['<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 29 Jan 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello who are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n']
 
     return generate_from_text(
         net=net,

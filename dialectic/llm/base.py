@@ -2,7 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-from jaxtyping import Int
+from jaxtyping import Float, Int
 
 from dialectic.llm.components import KVCache, RMSNorm
 
@@ -47,13 +47,17 @@ class BaseTransformer(nn.Module):
 
     def forward(
         self,
-        x: Int[torch.Tensor, "B L"],
+        x: Int[torch.Tensor, "B L"] | Float[torch.Tensor, "B L V"],
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
     ):
-        x = self.embed_tokens(x)
+        if isinstance(x, torch.LongTensor):
+            x = self.embed_tokens(x)  # [B, L, D]
+        else:
+            # soft-tokens, x is shape [B, L, V]
+            x = x @ self.embed_tokens.weight
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
