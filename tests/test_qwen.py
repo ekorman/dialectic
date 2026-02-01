@@ -18,6 +18,31 @@ from dialectic.llm.templates import Message
 torch.manual_seed(18)
 
 
+class MockGenerateModel(torch.nn.Module):
+    def __init__(self, token_schedule: list[torch.Tensor], vocab_size: int):
+        super().__init__()
+        self.token_schedule = token_schedule
+        self.vocab_size = vocab_size
+        self.step = 0
+        self.attn_num_kv_heads = 1
+        self.attn_head_d = 1
+        self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+        self.dummy_param = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, input_ids, kv_caches=None, attention_mask=None):
+        tokens = self.token_schedule[self.step].to(input_ids.device)
+        self.step += 1
+        batch_size = input_ids.shape[0]
+        assert tokens.shape[0] == batch_size
+        logits = torch.full(
+            (batch_size, 1, self.vocab_size),
+            fill_value=-1e4,
+            device=input_ids.device,
+        )
+        logits[torch.arange(batch_size), 0, tokens] = 0.0
+        return logits
+
+
 def test_qwen_decoder_layer():
     l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
     x = torch.rand(b, l, d)
@@ -271,6 +296,73 @@ def test_qwen_generate_attention_mask_with_kv_cache():
 
     assert (out1 == out_batched[:1, 3:]).all()
     assert (out2 == out_batched[1:]).all()
+
+
+def test_generate_from_tokens_stopping_condition_partial_batch():
+    pad_token_id = 0
+    eos_token_id = 2
+    vocab_size = 12
+    token_ids = torch.tensor([[4, 5], [6, 7], [8, 9]])
+    token_schedule = [
+        torch.tensor([3, 4, eos_token_id]),
+        torch.tensor([5, 6, 7]),
+        torch.tensor([6, 7, 8]),
+        torch.tensor([7, 8, 9]),
+    ]
+
+    model = MockGenerateModel(
+        token_schedule=token_schedule, vocab_size=vocab_size
+    ).eval()
+
+    max_tokens_generated = 4
+    output = generate_from_tokens(
+        net=model,
+        token_ids=token_ids,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        sampling_strategy="greedy",
+        max_tokens_generated=max_tokens_generated,
+        use_kv_cache=True,
+    )
+
+    assert output.shape == torch.Size((3, 2 + max_tokens_generated))
+    generated_tokens = output[:, 2:]
+    assert (generated_tokens[2] == pad_token_id).all()
+    assert (generated_tokens[:2] != pad_token_id).all()
+
+
+def test_generate_from_tokens_stopping_condition_full_batch():
+    pad_token_id = 0
+    eos_token_id = 2
+    vocab_size = 12
+    token_ids = torch.tensor([[4, 5], [6, 7], [8, 9]])
+    token_schedule = [
+        torch.tensor([eos_token_id, 5, 6]),
+        torch.tensor([7, eos_token_id, 8]),
+        torch.tensor([9, 10, eos_token_id]),
+    ]
+
+    model = MockGenerateModel(
+        token_schedule=token_schedule, vocab_size=vocab_size
+    ).eval()
+
+    max_tokens_generated = 5
+    output = generate_from_tokens(
+        net=model,
+        token_ids=token_ids,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        sampling_strategy="greedy",
+        max_tokens_generated=max_tokens_generated,
+        use_kv_cache=True,
+    )
+
+    assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
+    assert output.shape == torch.Size((3, 4))
+    generated_tokens = output[:, 2:]
+    assert (generated_tokens[0] == torch.tensor([pad_token_id, pad_token_id])).all()
+    assert (generated_tokens[1] == torch.tensor([5, pad_token_id])).all()
+    assert (generated_tokens[2] == torch.tensor([6, 8])).all()
 
 
 def test_qwen_generate_temperature():
