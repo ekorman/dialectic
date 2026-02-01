@@ -1,8 +1,38 @@
 import pytest
+import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import CountdownEnv
+
+
+@pytest.fixture
+def MockGenerateModel():
+    class _MockGenerateModel(torch.nn.Module):
+        def __init__(self, token_schedule: list[torch.Tensor], vocab_size: int):
+            super().__init__()
+            self.token_schedule = token_schedule
+            self.vocab_size = vocab_size
+            self.step = 0
+            self.attn_num_kv_heads = 1
+            self.attn_head_d = 1
+            self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+            self.dummy_param = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, input_ids, kv_caches=None, attention_mask=None):
+            tokens = self.token_schedule[self.step].to(input_ids.device)
+            self.step += 1
+            batch_size = input_ids.shape[0]
+            assert tokens.shape[0] == batch_size
+            logits = torch.full(
+                (batch_size, 1, self.vocab_size),
+                fill_value=-1e4,
+                device=input_ids.device,
+            )
+            logits[torch.arange(batch_size), 0, tokens] = 0.0
+            return logits
+
+    return _MockGenerateModel
 
 
 @pytest.fixture
