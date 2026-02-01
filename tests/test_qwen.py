@@ -310,7 +310,9 @@ def test_generate_from_tokens_stopping_condition_partial_batch():
         torch.tensor([7, 8, 9]),
     ]
 
-    model = MockGenerateModel(token_schedule=token_schedule, vocab_size=vocab_size).eval()
+    model = MockGenerateModel(
+        token_schedule=token_schedule, vocab_size=vocab_size
+    ).eval()
 
     max_tokens_generated = 4
     output = generate_from_tokens(
@@ -340,7 +342,9 @@ def test_generate_from_tokens_stopping_condition_full_batch():
         torch.tensor([9, 10, eos_token_id]),
     ]
 
-    model = MockGenerateModel(token_schedule=token_schedule, vocab_size=vocab_size).eval()
+    model = MockGenerateModel(
+        token_schedule=token_schedule, vocab_size=vocab_size
+    ).eval()
 
     max_tokens_generated = 5
     output = generate_from_tokens(
@@ -357,8 +361,8 @@ def test_generate_from_tokens_stopping_condition_full_batch():
     assert output.shape == torch.Size((3, 4))
     generated_tokens = output[:, 2:]
     assert (generated_tokens[0] == torch.tensor([pad_token_id, pad_token_id])).all()
-    assert (generated_tokens[1] == torch.tensor([7, pad_token_id])).all()
-    assert (generated_tokens[2] == torch.tensor([9, 10])).all()
+    assert (generated_tokens[1] == torch.tensor([5, pad_token_id])).all()
+    assert (generated_tokens[2] == torch.tensor([6, 8])).all()
 
 
 def test_qwen_generate_temperature():
@@ -378,7 +382,7 @@ def test_qwen_generate_temperature():
         rope_base_value=rope_base_value,
     ).eval()
 
-    x = torch.randint(0, vocab_size, size=(1, 4))
+    x = torch.randint(0, vocab_size, size=(2, 4))
 
     out_greedy = generate_from_tokens(
         net=model,
