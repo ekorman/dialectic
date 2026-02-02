@@ -15,6 +15,10 @@ from dialectic.llm.templates import (
 )
 
 
+class StopAndPrefillManager:
+    pass
+
+
 @torch.inference_mode()
 def generate_from_tokens(
     net: BaseTransformer,
@@ -49,9 +53,9 @@ def generate_from_tokens(
     else:
         kv_caches = None
 
-    batch_size = token_ids.shape[0]
+    # batch_size = token_ids.shape[0]
     device = token_ids.device
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    # finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     if soft_tokens:
         shadow_seq = token_ids
@@ -82,13 +86,18 @@ def generate_from_tokens(
         else:
             scaled_logits = logits / temperature
             probs = torch.softmax(scaled_logits, dim=-1)
-
             hard_token_id = probs.argmax(-1)
-            shadow_seq = torch.cat([shadow_seq, hard_token_id], 1)
 
             next_token = probs  # need .detach()?
 
-        finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
+        if soft_tokens:
+            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
+                shadow_seq[:, -1] == pad_token_id
+            )
+        else:
+            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
+                all_tokens[:, -1] == pad_token_id
+            )
 
         if not soft_tokens:
             next_token = torch.where(
@@ -104,11 +113,14 @@ def generate_from_tokens(
                 ),
                 next_token,
             )
+            hard_token_id = next_token.argmax(-1)
 
         if finished.all():
             break
 
         all_tokens = torch.cat([all_tokens, next_token], 1)
+        if soft_tokens:
+            shadow_seq = torch.cat([shadow_seq, hard_token_id], 1)
         tokens_generated += 1
 
         if use_kv_cache:
