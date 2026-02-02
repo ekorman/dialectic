@@ -15,8 +15,18 @@ from dialectic.llm.templates import (
 )
 
 
+# thinking through if we need this. need something to handle pre-filling, stopping condition
+# hard and soft tokens, etc
 class StateManager:
-    def sample(logits: Float[torch.Tensor, "B 1 V"]):
+    def __init__(self, vocab_size):
+        pass
+
+    def next_tokens(logits: Float[torch.Tensor, "B 1 V"]):
+        # here we could add more than 1 since we could prefill and these
+        # would not be appended by pre-pended? but would that mess up the KV-cache?
+        pass
+
+    def init(token_ids):
         pass
 
 
