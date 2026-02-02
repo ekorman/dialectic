@@ -270,8 +270,8 @@ def generate_rollout_batch(
 
     tokenizer.enable_padding(direction="left")
     tokens = tokenizer.encode_batch(prompts)
-    attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
     )
     token_ids = torch.tensor([t.ids for t in tokens], device=device)
 

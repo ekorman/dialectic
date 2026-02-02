@@ -11,7 +11,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from dialectic.llm.generate import generate_from_tokens, qwen_generate_from_chat
+from dialectic.llm.generate import (
+    generate_from_text,
+    generate_from_tokens,
+    qwen_generate_from_chat,
+)
 from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen_06b
 from dialectic.llm.templates import Message
 
@@ -125,7 +129,7 @@ def test_qwen():
     torch.testing.assert_close(out1, out2.logits[:, -1:])
 
 
-def test_qwen_generate():
+def test_qwen_generate_from_tokens():
     l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -178,7 +182,62 @@ def test_qwen_generate():
     torch.testing.assert_close(out_singleton, out_with_cache[:1])
 
 
-def test_qwen_generate_attention_mask():
+def test_qwen_generate_from_text_batch():
+    tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+
+    vocab_size = tokenizer.get_vocab_size()
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    text_batch = ["short text", "this is very long text"]
+
+    model = create_qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    # check we get the same thing if we cache or not
+    out_no_cache = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    out_with_cache = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    assert out_no_cache == out_with_cache
+
+    # test we get the same thing for a batch or not
+    out_singleton = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch[:1],
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    assert out_singleton == out_with_cache[:1]
+
+
+def test_qwen_generate_from_tokens_attention_mask():
     d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -203,8 +262,8 @@ def test_qwen_generate_attention_mask():
     x_batched[0, 3:] = x1
     x_batched[1] = x2
 
-    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
-    attention_mask[0, :3] = True
+    attention_mask = torch.ones((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = False
 
     out1 = generate_from_tokens(
         net=model,
@@ -263,8 +322,8 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     x_batched[0, 3:] = x1
     x_batched[1] = x2
 
-    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
-    attention_mask[0, :3] = True
+    attention_mask = torch.ones((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = False
 
     out1 = generate_from_tokens(
         net=model,

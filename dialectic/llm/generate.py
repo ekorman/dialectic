@@ -89,7 +89,7 @@ def generate_from_tokens(
             input_ids = all_token_ids
 
         if attention_mask is not None:
-            new_mask = finished.unsqueeze(-1)
+            new_mask = ~finished.unsqueeze(-1)
             attention_mask = torch.cat([attention_mask, new_mask], 1)
 
     return all_token_ids
@@ -114,9 +114,8 @@ def generate_from_text(
     tokenizer.enable_padding(pad_id=pad_token_id, pad_token=pad_token, direction="left")
     tokens = tokenizer.encode_batch(text_batch)
     token_ids = torch.tensor([t.ids for t in tokens]).to(device)
-    # attention mask is True where we want to mask (i.e. ignore)
     attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool) == 0
+        torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool)
     ).to(device)
 
     eos_token_id = tokenizer.token_to_id(eos_token)
