@@ -374,7 +374,7 @@ def test_qwen_generate_temperature():
         eos_token_id=-1,
         max_tokens_generated=10,
         sampling_strategy="sample",
-        temperature=0.001,
+        temperature=0.00001,
     )
 
     torch.testing.assert_close(out_greedy, out_low_temp)
