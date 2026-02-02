@@ -99,9 +99,7 @@ def generate_from_tokens(
                 probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 
-            hard_token_id = next_token
-
-            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
+            finished = (next_token.squeeze(-1) == eos_token_id) | (
                 all_tokens[:, -1] == pad_token_id
             )
             next_token = torch.where(
