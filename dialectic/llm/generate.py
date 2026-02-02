@@ -15,8 +15,9 @@ from dialectic.llm.templates import (
 )
 
 
-class StopAndPrefillManager:
-    pass
+class StateManager:
+    def sample(logits: Float[torch.Tensor, "B 1 V"]):
+        pass
 
 
 @torch.inference_mode()
@@ -72,38 +73,15 @@ def generate_from_tokens(
                 input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
             )
 
-        if (not soft_tokens) and (sampling_strategy == "greedy"):
-            next_token = logits.argmax(-1)
-            hard_token_id = next_token
-        elif not soft_tokens:
-            scaled_logits = logits / temperature
-
-            probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            hard_token_id = next_token
-        else:
+        if soft_tokens:
             scaled_logits = logits / temperature
             probs = torch.softmax(scaled_logits, dim=-1)
             hard_token_id = probs.argmax(-1)
 
             next_token = probs  # need .detach()?
-
-        if soft_tokens:
             finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
                 shadow_seq[:, -1] == pad_token_id
             )
-        else:
-            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
-                all_tokens[:, -1] == pad_token_id
-            )
-
-        if not soft_tokens:
-            next_token = torch.where(
-                finished.unsqueeze(-1),
-                torch.full_like(next_token, pad_token_id),
-                next_token,
-            )
-        else:
             next_token = torch.where(
                 finished.unsqueeze(-1).unsqueeze(-1),
                 torch.nn.functional.one_hot(
@@ -112,6 +90,25 @@ def generate_from_tokens(
                 next_token,
             )
             hard_token_id = next_token.argmax(-1)
+        else:
+            if sampling_strategy == "greedy":
+                next_token = logits.argmax(-1)
+            else:
+                scaled_logits = logits / temperature
+
+                probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+            hard_token_id = next_token
+
+            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
+                all_tokens[:, -1] == pad_token_id
+            )
+            next_token = torch.where(
+                finished.unsqueeze(-1),
+                torch.full_like(next_token, pad_token_id),
+                next_token,
+            )
 
         if finished.all():
             break
