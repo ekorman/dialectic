@@ -1,5 +1,5 @@
 import sys
-from typing import Literal
+from typing import Callable, Literal
 
 import torch
 from jaxtyping import Float, Int
@@ -28,15 +28,13 @@ def generate_from_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     soft_tokens: bool = False,
+    prefill_callback: Callable[[Int[Tensor, "B L"]], Int[Tensor, "B L"]] = lambda x: x,
 ) -> Int[Tensor, "B L"]:
     if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 
     if pad_token_id is None:
         pad_token_id = eos_token_id
-
-    if soft_tokens:
-        shadow_seq = []
 
     if use_kv_cache:
         kv_caches = [
@@ -56,6 +54,7 @@ def generate_from_tokens(
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     if soft_tokens:
+        shadow_seq = token_ids
         all_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
         input_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
     else:
@@ -83,9 +82,11 @@ def generate_from_tokens(
         else:
             scaled_logits = logits / temperature
             probs = torch.softmax(scaled_logits, dim=-1)
-            shadow_seq.append(probs.argmax(-1))
+
+            hard_token_id = probs.argmax(-1)
+            shadow_seq = torch.cat([shadow_seq, hard_token_id], 1)
+
             next_token = probs  # need .detach()?
-            hard_token_id = shadow_seq[-1]
 
         finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
 
