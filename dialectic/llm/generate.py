@@ -89,9 +89,6 @@ def generate_from_tokens(
 
         finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
 
-        # import pdb
-
-        # pdb.set_trace()
         if not soft_tokens:
             next_token = torch.where(
                 finished.unsqueeze(-1),
@@ -99,7 +96,6 @@ def generate_from_tokens(
                 next_token,
             )
         else:
-            # TODO: test this
             next_token = torch.where(
                 finished.unsqueeze(-1).unsqueeze(-1),
                 torch.nn.functional.one_hot(
