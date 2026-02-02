@@ -53,9 +53,7 @@ def generate_from_tokens(
     else:
         kv_caches = None
 
-    # batch_size = token_ids.shape[0]
     device = token_ids.device
-    # finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     if soft_tokens:
         shadow_seq = token_ids
