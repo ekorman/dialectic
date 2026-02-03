@@ -3,7 +3,7 @@ name = "dialectic"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "extty>=0.6.0",
+    "extty>=0.7.0",
     "jaxtyping>=0.3.3",
     "tokenizers>=0.22.1",
     "torch>=2.9.1",

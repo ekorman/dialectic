@@ -90,6 +90,7 @@ def train(
     seed: int,
     mu: int = 1,
     accumulation_steps: int = 16,
+    update_ref_net_batch_cadence: int = 100,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
@@ -145,7 +146,7 @@ def train(
             mu=mu,
             max_tokens_generated=max_tokens,
             max_episodes=max_episodes,
-            update_ref_net_batch_cadence=10,
+            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
             batch_size=batch_size,
             group_size=group_size,
             temperature=0.7,
@@ -166,6 +167,20 @@ if _is_modal_installed():
         "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
     )
 
+    # get `extty` variables
+    s3_conf = extty.S3Config.load()
+    if s3_conf is not None:
+        extty_env_dict = {
+            "EXTTY_S3_BUCKET": s3_conf.bucket,
+            "EXTTY_S3_PREFIX": s3_conf.prefix,
+            "EXTTY_S3_REGION": s3_conf.region,
+            "EXTTY_S3_ACCESS_KEY_ID": s3_conf.access_key_id,
+            "EXTTY_S3_SECRET_ACCESS_KEY": s3_conf.secret_access_key,
+            "EXTTY_S3_ENDPOINT_URL": s3_conf.endpoint_url,
+        }
+    else:
+        extty_env_dict = {}
+
     image = (
         modal.Image.debian_slim()
         .uv_sync()
@@ -184,6 +199,7 @@ if _is_modal_installed():
             )
         },
         timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
+        secrets=[modal.Secret.from_dict(extty_env_dict)],
     )(train)
 
 
@@ -240,6 +256,13 @@ def main():
         help="Chunk size for log prob computation (0 to disable chunking)",
     )
     parser.add_argument(
+        "--update-ref-net-batch-cadence",
+        type=int,
+        default=100,
+        help="How often to update the reference net",
+    )
+
+    parser.add_argument(
         "--use-bf16",
         action="store_true",
         default=True,
@@ -286,6 +309,7 @@ def main():
         n_ops=args.num_operands,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
+        update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
