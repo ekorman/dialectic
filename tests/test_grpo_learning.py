@@ -293,7 +293,7 @@ class TestChunkedLogProbs:
             )
             for _ in range(group_size)
         ]
-        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+        attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.bool)
 
         tiny_model.eval()
         with torch.no_grad():
@@ -339,7 +339,7 @@ class TestChunkedLogProbs:
             )
             for _ in range(group_size)
         ]
-        attention_mask = torch.zeros(batch_size, prompt_len, dtype=torch.bool)
+        attention_mask = torch.ones(batch_size, prompt_len, dtype=torch.bool)
 
         tiny_model.eval()
         with torch.no_grad():

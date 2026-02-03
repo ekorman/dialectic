@@ -87,7 +87,7 @@ def compute_logits_of_group(
 def compute_log_probs(
     *,
     net: BaseTransformer,
-    attention_mask: Integer[torch.Tensor, "B L_prompt"],
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
     completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
     pad_token_id: int,
     chunk_size: int = 0,
@@ -270,8 +270,8 @@ def generate_rollout_batch(
 
     tokenizer.enable_padding(direction="left")
     tokens = tokenizer.encode_batch(prompts)
-    attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
     )
     token_ids = torch.tensor([t.ids for t in tokens], device=device)
 

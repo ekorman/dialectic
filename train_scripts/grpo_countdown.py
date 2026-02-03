@@ -81,8 +81,8 @@ def train(
     max_tokens: int = 1024,
     lr: float = 1e-5,
     beta: float = 0.04,
-    weights_path: str = "/weights/qwen3-0.6b.pth",
-    tokenizer_path: str = "/weights/tokenizer.json",
+    weights_path: str = "/weights/qwen3/qwen3-0.6b.pth",
+    tokenizer_path: str = "/weights/qwen3/tokenizer.json",
     binary_reward: bool = False,
     n_larges: int = 2,
     n_total: int = 6,
@@ -203,11 +203,11 @@ def main():
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
     parser.add_argument(
-        "--weights-path", default="weights/qwen3-0.6b.pth", help="Path to model weights"
+        "--weights-path", default="qwen3/qwen3-0.6b.pth", help="Path to model weights"
     )
     parser.add_argument(
         "--tokenizer-path",
-        default="qwen-tokenizer/tokenizer.json",
+        default="qwen3/tokenizer.json",
         help="Path to tokenizer",
     )
     parser.add_argument(
