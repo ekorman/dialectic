@@ -67,7 +67,7 @@ def compute_logits_of_group(
 
     if attention_mask is not None:
         prompt_len = attention_mask.shape[1]
-        full_mask = torch.zeros(
+        full_mask = torch.ones(
             batch_size,
             seq_len,
             dtype=attention_mask.dtype,
@@ -158,7 +158,7 @@ def _compute_log_probs_chunked(
     flat_input_ids = input_ids.view(batch_size * group_size, seq_len)
 
     if attention_mask is not None:
-        full_mask = torch.zeros(
+        full_mask = torch.ones(
             batch_size,
             seq_len,
             dtype=attention_mask.dtype,
