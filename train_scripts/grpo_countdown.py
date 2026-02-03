@@ -15,6 +15,7 @@ import random
 
 import extty
 import torch
+from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
@@ -24,6 +25,8 @@ from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
+
+load_dotenv()
 
 
 def _is_modal_installed():
@@ -36,10 +39,6 @@ def _check_inside_modal_fn():
 
         return modal.current_function_call_id()
     return False
-
-
-bucket_name = "model-weights"
-r2_account_id = "a64c6da180648dd944675d311c296763"
 
 
 def get_state_to_str(enable_thinking: bool):
@@ -187,13 +186,16 @@ if _is_modal_installed():
         .add_local_python_source("dialectic", "extty")
     )
 
+    bucket_name = os.environ["WEIGHTS_BUCKET_NAME"]
+    bucket_endpoint_url = os.environ["WEIGHTS_BUCKET_ENDPOINT_URL"]
+
     train_modal = app.function(
         image=image,
         gpu="A100-80GB",
         volumes={
             "/weights": modal.CloudBucketMount(
                 bucket_name=bucket_name,
-                bucket_endpoint_url=f"https://{r2_account_id}.r2.cloudflarestorage.com",
+                bucket_endpoint_url=bucket_endpoint_url,
                 secret=secret,
                 read_only=True,
             )
