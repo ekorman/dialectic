@@ -67,7 +67,7 @@ def compute_logits_of_group(
 
     if attention_mask is not None:
         prompt_len = attention_mask.shape[1]
-        full_mask = torch.ones(
+        full_mask = torch.zeros(
             batch_size,
             seq_len,
             dtype=attention_mask.dtype,
@@ -87,7 +87,7 @@ def compute_logits_of_group(
 def compute_log_probs(
     *,
     net: BaseTransformer,
-    attention_mask: Integer[torch.Tensor, "B L_prompt"],
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
     completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
     pad_token_id: int,
     chunk_size: int = 0,
@@ -158,7 +158,7 @@ def _compute_log_probs_chunked(
     flat_input_ids = input_ids.view(batch_size * group_size, seq_len)
 
     if attention_mask is not None:
-        full_mask = torch.ones(
+        full_mask = torch.zeros(
             batch_size,
             seq_len,
             dtype=attention_mask.dtype,
