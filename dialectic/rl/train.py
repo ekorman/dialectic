@@ -694,7 +694,7 @@ def train_grpo(
                 step=step,
             )
 
-            if step % save_ckpt_freq:
+            if step % save_ckpt_freq == 0:
                 extty.save_checkpoint(
                     step=step,
                     state_dict=net.state_dict(),
