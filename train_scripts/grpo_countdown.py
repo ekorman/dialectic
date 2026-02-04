@@ -186,8 +186,8 @@ if _is_modal_installed():
         .add_local_python_source("dialectic", "extty")
     )
 
-    bucket_name = os.environ["WEIGHTS_BUCKET_NAME"]
-    bucket_endpoint_url = os.environ["WEIGHTS_BUCKET_ENDPOINT_URL"]
+    bucket_name = os.environ.get("WEIGHTS_BUCKET_NAME")
+    bucket_endpoint_url = os.environ.get("WEIGHTS_BUCKET_ENDPOINT_URL")
 
     train_modal = app.function(
         image=image,
