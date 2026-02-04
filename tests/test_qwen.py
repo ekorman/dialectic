@@ -558,8 +558,8 @@ def test_model_generation_against_qwen_06b():
 
 
 @pytest.mark.skipif(
-    os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+    os.getenv("TEST_LLM_AGAINST_HF") is None or os.getenv("TEST_COMPILED") is None,
+    reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` or TEST_COMPILED is not set",
 )
 def test_compiled_model_generation_against_qwen_06b():
     hf_model, model = _load_qwen_06b_model()
