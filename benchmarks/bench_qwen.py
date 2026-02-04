@@ -4,7 +4,7 @@ Usage:
     uv run python benchmarks/bench_qwen.py
     uv run python benchmarks/bench_qwen.py --devices cpu mps
     uv run python benchmarks/bench_qwen.py --batch-sizes 1 4 8
-    uv run python benchmarks/bench_qwen.py --vllm --model Qwen/Qwen3-0.6B
+    uv run python benchmarks/bench_qwen.py --vllm
 """
 
 import argparse
@@ -197,14 +197,14 @@ def benchmark_generation(
 
 def benchmark_vllm_generation(
     vllm_generator,
-    vocab_size: int,
+    config: BenchmarkConfig,
     batch_size: int,
     prompt_length: int,
     max_new_tokens: int,
     n_warmup: int = 2,
     n_iterations: int = 5,
 ) -> dict:
-    x = torch.randint(0, vocab_size, size=(batch_size, prompt_length))
+    x = torch.randint(0, config.vocab_size, size=(batch_size, prompt_length))
     total_tokens = max_new_tokens * batch_size
 
     warmup_times = []
@@ -252,7 +252,7 @@ def run_benchmarks(
     seq_lengths: list[int],
     generation_tokens: int,
     configs: list[BenchmarkConfig],
-    vllm_model: str | None = None,
+    use_vllm: bool = False,
 ):
     print("=" * 100)
     print("Qwen Benchmark")
@@ -262,8 +262,8 @@ def run_benchmarks(
     print(f"Batch sizes: {batch_sizes}")
     print(f"Sequence lengths: {seq_lengths}")
     print(f"Generation tokens: {generation_tokens}")
-    if vllm_model:
-        print(f"vLLM model: {vllm_model}")
+    if use_vllm:
+        print("vLLM: enabled")
     print()
 
     for config in configs:
@@ -354,17 +354,18 @@ def run_benchmarks(
             del model
             sync_device(device)
 
-    if vllm_model:
-        run_vllm_benchmarks(
-            vllm_model=vllm_model,
-            batch_sizes=batch_sizes,
-            seq_lengths=seq_lengths,
-            generation_tokens=generation_tokens,
-        )
+    if use_vllm:
+        for config in configs:
+            run_vllm_benchmarks(
+                config=config,
+                batch_sizes=batch_sizes,
+                seq_lengths=seq_lengths,
+                generation_tokens=generation_tokens,
+            )
 
 
 def run_vllm_benchmarks(
-    vllm_model: str,
+    config: BenchmarkConfig,
     batch_sizes: list[int],
     seq_lengths: list[int],
     generation_tokens: int,
@@ -373,11 +374,14 @@ def run_vllm_benchmarks(
 
     print()
     print("=" * 100)
-    print(f"vLLM Generation Benchmark (model: {vllm_model})")
+    print(
+        f"vLLM Generation Benchmark — Config: {config.name} "
+        f"(d={config.d}, layers={config.n_decoder_layers})"
+    )
     print("=" * 100)
 
-    generator = VLLMGenerator(vllm_model)
-    vocab_size = generator.llm.llm_engine.model_config.hf_config.vocab_size
+    model = create_model(config, "cpu")
+    generator = VLLMGenerator(model, model_type="qwen3")
 
     print()
     print("-" * 100)
@@ -390,7 +394,7 @@ def run_vllm_benchmarks(
         for seq_length in seq_lengths:
             result = benchmark_vllm_generation(
                 vllm_generator=generator,
-                vocab_size=vocab_size,
+                config=config,
                 batch_size=batch_size,
                 prompt_length=seq_length,
                 max_new_tokens=generation_tokens,
@@ -442,12 +446,6 @@ def main():
         action="store_true",
         help="Also run vLLM generation benchmark for comparison",
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen3-0.6B",
-        help="HuggingFace model name for vLLM benchmark (default: Qwen/Qwen3-0.6B)",
-    )
     args = parser.parse_args()
 
     devices = args.devices or get_available_devices()
@@ -468,7 +466,7 @@ def main():
         seq_lengths=args.seq_lengths,
         generation_tokens=args.generation_tokens,
         configs=configs,
-        vllm_model=args.model if args.vllm else None,
+        use_vllm=args.vllm,
     )
 
 

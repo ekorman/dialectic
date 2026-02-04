@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -9,8 +12,8 @@ from torch import Tensor
 
 if TYPE_CHECKING:
     from tokenizers import Tokenizer
-    from vllm import LLM
 
+from dialectic.llm.base import BaseTransformer
 from dialectic.llm.templates import (
     Message,
     get_llama_input_text_from_messages,
@@ -18,22 +21,105 @@ from dialectic.llm.templates import (
 )
 
 
+def _make_hf_config(net: BaseTransformer, model_type: str) -> dict:
+    """Build a minimal HuggingFace-compatible config.json from a BaseTransformer."""
+    mlp_hidden_d = net.layers[0].mlp.gate_proj.out_features
+    rms_norm_eps = net.norm.eps
+
+    base: dict = {
+        "hidden_size": net.d,
+        "intermediate_size": mlp_hidden_d,
+        "num_attention_heads": net.attn_num_heads,
+        "num_hidden_layers": len(net.layers),
+        "num_key_value_heads": net.attn_num_kv_heads,
+        "head_dim": net.attn_head_d,
+        "vocab_size": net.vocab_size,
+        "rms_norm_eps": rms_norm_eps,
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "torch_dtype": "float32",
+    }
+
+    if model_type == "qwen3":
+        base.update(
+            {
+                "architectures": ["Qwen3ForCausalLM"],
+                "model_type": "qwen3",
+                "max_position_embeddings": 32768,
+                "rope_theta": 1000000,
+            }
+        )
+    elif model_type == "llama":
+        base.update(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "max_position_embeddings": 131072,
+                "rope_theta": 500000,
+                "rope_scaling": {
+                    "factor": 32.0,
+                    "high_freq_factor": 4.0,
+                    "low_freq_factor": 1.0,
+                    "original_max_position_embeddings": 8192,
+                    "rope_type": "llama3",
+                },
+            }
+        )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type!r}. Use 'qwen3' or 'llama'.")
+
+    return base
+
+
+def _save_model_for_vllm(net: BaseTransformer, model_type: str, path: Path) -> None:
+    """Save a BaseTransformer's weights and config in HuggingFace format."""
+    from safetensors.torch import save_file
+
+    # Map dialectic state dict keys to HuggingFace convention:
+    #   lm_head.* stays as-is, everything else gets a "model." prefix.
+    hf_state_dict = {}
+    for k, v in net.state_dict().items():
+        hf_key = k if k.startswith("lm_head") else f"model.{k}"
+        hf_state_dict[hf_key] = v
+
+    save_file(hf_state_dict, path / "model.safetensors")
+
+    config = _make_hf_config(net, model_type)
+    (path / "config.json").write_text(json.dumps(config, indent=2))
+
+
 class VLLMGenerator:
-    """Wrapper around vLLM's LLM for generation, providing an interface
-    compatible with the existing dialectic generation functions.
+    """Use vLLM for fast inference with a :class:`BaseTransformer` model.
+
+    The constructor saves the model weights and a generated ``config.json``
+    to a temporary directory, then initialises ``vllm.LLM`` from that
+    directory.
 
     Parameters
     ----------
-    model : str
-        HuggingFace model name or path to load with vLLM.
-    **kwargs
-        Additional keyword arguments passed to ``vllm.LLM``.
+    net
+        A :class:`BaseTransformer` whose weights will be used.
+    model_type
+        Architecture identifier — ``"qwen3"`` or ``"llama"``.
+    **vllm_kwargs
+        Additional keyword arguments forwarded to ``vllm.LLM``
+        (e.g. ``tensor_parallel_size``, ``dtype``).
     """
 
-    def __init__(self, model: str, **kwargs) -> None:
+    def __init__(
+        self,
+        net: BaseTransformer,
+        model_type: Literal["qwen3", "llama"],
+        **vllm_kwargs,
+    ) -> None:
         from vllm import LLM
 
-        self.llm: LLM = LLM(model=model, **kwargs)
+        self._tmpdir = tempfile.TemporaryDirectory()
+        model_dir = Path(self._tmpdir.name)
+
+        _save_model_for_vllm(net, model_type, model_dir)
+
+        self.llm: LLM = LLM(model=str(model_dir), **vllm_kwargs)
 
     def generate_from_tokens(
         self,
@@ -84,7 +170,6 @@ class VLLMGenerator:
         prompt_token_ids_list: list[list[int]] = []
         for row in token_ids:
             ids = row.tolist()
-            # Find the first non-pad token.
             start = 0
             for start, tid in enumerate(ids):
                 if tid != pad_token_id:
