@@ -300,7 +300,7 @@ def main():
         "--seed",
         type=int,
         default=random.choice(range(1000)),
-        help="Chunk size for log prob computation (0 to disable chunking)",
+        help="Random seed for reproducibility",
     )
     parser.add_argument(
         "--save-ckpt-freq",
