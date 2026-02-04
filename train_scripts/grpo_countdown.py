@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import os
 import random
+import sys
 
 import extty
 import torch
@@ -95,6 +96,7 @@ def train(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
+    save_ckpt_freq: int = sys.maxsize,
 ):
     torch.manual_seed(seed)
     net = load_qwen_06b()
@@ -157,6 +159,7 @@ def train(
             max_grad_norm=max_grad_norm,
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
         )
     finally:
         extty.finish()
@@ -298,6 +301,12 @@ def main():
         type=int,
         default=random.choice(range(1000)),
         help="Chunk size for log prob computation (0 to disable chunking)",
+    )
+    parser.add_argument(
+        "--save-ckpt-freq",
+        type=int,
+        default=sys.maxsize,
+        help="How often to checkpoint",
     )
 
     parser.add_argument("--compile-model", action="store_true", help="compile model")

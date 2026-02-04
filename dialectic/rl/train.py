@@ -1,3 +1,4 @@
+import sys
 import time
 import warnings
 from copy import deepcopy
@@ -536,6 +537,7 @@ def train_grpo(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
 ) -> None:
     device = next(net.parameters()).device
     if use_bf16:
@@ -691,3 +693,10 @@ def train_grpo(
                 },
                 step=step,
             )
+
+            if step % save_ckpt_freq:
+                extty.save_checkpoint(
+                    step=step,
+                    state_dict=net.state_dict(),
+                    optimizer_state_dict=opt.state_dict(),
+                )
