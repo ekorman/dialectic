@@ -88,6 +88,7 @@ def train(
     n_total: int = 6,
     n_ops: int = 5,
     seed: int,
+    compile_model: bool,
     mu: int = 1,
     accumulation_steps: int = 16,
     max_grad_norm: float = 1.0,
@@ -100,6 +101,9 @@ def train(
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
     )
+
+    if compile_model:
+        net.compile()
 
     print(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
@@ -270,6 +274,8 @@ def main():
         default=random.choice(range(1000)),
         help="Chunk size for log prob computation (0 to disable chunking)",
     )
+
+    parser.add_argument("--compile-model", action="store_true", help="compile model")
     args = parser.parse_args()
 
     train(
@@ -290,6 +296,7 @@ def main():
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
         use_qwen_thinking=args.use_qwen_thinking,
+        compile_model=args.compile_model,
     )
 
 
