@@ -386,8 +386,14 @@ def test_generate_from_tokens_stopping_condition_partial_batch():
 
     assert output.shape == torch.Size((3, 2 + max_tokens_generated))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[2] == pad_token_id).all()
+    assert generated_tokens[2].tolist() == [
+        eos_token_id,
+        pad_token_id,
+        pad_token_id,
+        pad_token_id,
+    ]
     assert (generated_tokens[:2] != pad_token_id).all()
+    assert (generated_tokens[:2] != eos_token_id).all()
 
 
 def test_generate_from_tokens_stopping_condition_full_batch():
@@ -417,11 +423,11 @@ def test_generate_from_tokens_stopping_condition_full_batch():
     )
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 4))
+    assert output.shape == torch.Size((3, 5))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[0] == torch.tensor([pad_token_id, pad_token_id])).all()
-    assert (generated_tokens[1] == torch.tensor([5, pad_token_id])).all()
-    assert (generated_tokens[2] == torch.tensor([6, 8])).all()
+    assert generated_tokens[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
+    assert generated_tokens[1].tolist() == [5, eos_token_id, pad_token_id]
+    assert generated_tokens[2].tolist() == [6, 8, eos_token_id]
 
 
 def test_qwen_generate_temperature():
@@ -464,11 +470,7 @@ def test_qwen_generate_temperature():
     torch.testing.assert_close(out_greedy, out_low_temp)
 
 
-@pytest.mark.skipif(
-    os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
-)
-def test_model_generation_against_qwen_06b():
+def _test_model_generation_against_qwen_06b(hf_model, model):
     """Test model generation against HuggingFace. the expected output was obtained with the code
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -490,19 +492,6 @@ def test_model_generation_against_qwen_06b():
     outputs = model.generate(**inputs, do_sample=False, max_new_tokens=500)
     print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     """
-    model = load_qwen_06b()
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", dtype=torch.float32
-    ).eval()
-
-    def map_key(k: str):
-        if k.startswith("model"):
-            return k[6:]
-        return k
-
-    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
-    model.eval()
 
     x = torch.randint(0, hf_model.config.vocab_size, size=(1, 10))
 
@@ -546,3 +535,39 @@ Okay, the user is asking for the capital of France. I need to make sure I recall
 
 The capital of France is **Paris**."""
         )
+
+
+def _load_qwen_06b_model():
+    model = load_qwen_06b()
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
+
+    def map_key(k: str):
+        if k.startswith("model"):
+            return k[6:]
+        return k
+
+    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
+    model.eval()
+    return hf_model, model
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    _test_model_generation_against_qwen_06b(hf_model, model)
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None or os.getenv("TEST_COMPILED") is None,
+    reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` or TEST_COMPILED is not set",
+)
+def test_compiled_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    model = torch.compile(model)
+    _test_model_generation_against_qwen_06b(hf_model, model)

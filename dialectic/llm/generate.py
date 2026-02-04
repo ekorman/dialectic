@@ -69,19 +69,19 @@ def generate_from_tokens(
             probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
             next_token_id = torch.multinomial(probs, num_samples=1)
 
-        finished = finished | (next_token_id.squeeze(-1) == eos_token_id)
-
         next_token_id = torch.where(
             finished.unsqueeze(-1),
             torch.full_like(next_token_id, pad_token_id),
             next_token_id,
         )
 
-        if finished.all():
-            break
+        finished = finished | (next_token_id.squeeze(-1) == eos_token_id)
 
         all_token_ids = torch.cat([all_token_ids, next_token_id], 1)
         tokens_generated += 1
+
+        if finished.all():
+            break
 
         if use_kv_cache:
             input_ids = next_token_id
