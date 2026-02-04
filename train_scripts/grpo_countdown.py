@@ -111,7 +111,7 @@ def train(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
     )
 
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
     if binary_reward:
         reward_fn = CountdownRewardFn()
