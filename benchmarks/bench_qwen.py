@@ -1,4 +1,4 @@
-"""Benchmark script for Qwen model implementation.
+"""Benchmark script for BaseTransformer model implementation.
 
 Usage:
     uv run python benchmarks/bench_qwen.py
@@ -13,7 +13,9 @@ from dataclasses import dataclass
 
 import torch
 
-from dialectic.llm.qwen import Qwen, generate_from_tokens
+from dialectic.llm.base import BaseTransformer
+from dialectic.llm.generate import generate_from_tokens
+from dialectic.llm.qwen import create_qwen
 
 
 @dataclass
@@ -72,8 +74,10 @@ def get_available_devices() -> list[str]:
     return devices
 
 
-def create_model(config: BenchmarkConfig, device: str, compiled: bool = False) -> Qwen:
-    model = Qwen(
+def create_model(
+    config: BenchmarkConfig, device: str, compiled: bool = False
+) -> BaseTransformer:
+    model = create_qwen(
         d=config.d,
         vocab_size=config.vocab_size,
         n_decoder_layers=config.n_decoder_layers,
@@ -97,11 +101,11 @@ def sync_device(device: str):
 
 
 def benchmark_forward(
-    model: Qwen,
+    model: BaseTransformer,
     device: str,
     batch_size: int,
     seq_length: int,
-    n_warmup: int = 3,
+    n_warmup: int,
     n_iterations: int = 10,
 ) -> dict:
     x = torch.randint(0, model.vocab_size, size=(batch_size, seq_length), device=device)
@@ -136,13 +140,13 @@ def benchmark_forward(
 
 
 def benchmark_generation(
-    model: Qwen,
+    model: BaseTransformer,
     device: str,
     batch_size: int,
     prompt_length: int,
     max_new_tokens: int,
     use_kv_cache: bool,
-    n_warmup: int = 2,
+    n_warmup: int,
     n_iterations: int = 5,
 ) -> dict:
     x = torch.randint(
@@ -202,8 +206,11 @@ def _run_forward_benchmarks(
     batch_sizes: list[int],
     seq_lengths: list[int],
     compiled: bool,
+    n_warmup: int,
 ):
-    label = "Forward Pass Benchmark (compiled)" if compiled else "Forward Pass Benchmark"
+    label = (
+        "Forward Pass Benchmark (compiled)" if compiled else "Forward Pass Benchmark"
+    )
     print("-" * 100)
     print(label)
     print("-" * 100)
@@ -216,7 +223,9 @@ def _run_forward_benchmarks(
         model = create_model(config, device, compiled=compiled)
         for batch_size in batch_sizes:
             for seq_length in seq_lengths:
-                result = benchmark_forward(model, device, batch_size, seq_length)
+                result = benchmark_forward(
+                    model, device, batch_size, seq_length, n_warmup
+                )
                 print(
                     f"{device:<8} {batch_size:<6} {seq_length:<8} "
                     f"{result['warmup_first_ms']:<12.3f} {result['warmup_mean_ms']:<12.3f} "
@@ -234,6 +243,7 @@ def _run_generation_benchmarks(
     generation_tokens: int,
     use_kv_cache: bool,
     compiled: bool,
+    n_warmup: int,
 ):
     cache_label = "with KV cache" if use_kv_cache else "without KV cache"
     compiled_label = " (compiled)" if compiled else ""
@@ -257,6 +267,7 @@ def _run_generation_benchmarks(
                     batch_size,
                     seq_length,
                     generation_tokens,
+                    n_warmup=n_warmup,
                     use_kv_cache=use_kv_cache,
                 )
                 print(
@@ -274,10 +285,11 @@ def run_benchmarks(
     seq_lengths: list[int],
     generation_tokens: int,
     configs: list[BenchmarkConfig],
+    n_warmup: int,
     include_compiled: bool = True,
 ):
     print("=" * 100)
-    print("Qwen Benchmark")
+    print("BaseTransformer Benchmark")
     print("=" * 100)
     print(f"Configs: {[c.name for c in configs]}")
     print(f"Devices: {devices}")
@@ -296,36 +308,69 @@ def run_benchmarks(
         )
         print("=" * 100)
 
-        _run_forward_benchmarks(config, devices, batch_sizes, seq_lengths, compiled=False)
-
-        if include_compiled:
-            _run_forward_benchmarks(config, devices, batch_sizes, seq_lengths, compiled=True)
-
-        _run_generation_benchmarks(
-            config, devices, batch_sizes, seq_lengths, generation_tokens,
-            use_kv_cache=True, compiled=False,
+        _run_forward_benchmarks(
+            config, devices, batch_sizes, seq_lengths, compiled=False, n_warmup=n_warmup
         )
 
         if include_compiled:
-            _run_generation_benchmarks(
-                config, devices, batch_sizes, seq_lengths, generation_tokens,
-                use_kv_cache=True, compiled=True,
+            _run_forward_benchmarks(
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                compiled=True,
+                n_warmup=n_warmup,
             )
 
         _run_generation_benchmarks(
-            config, devices, batch_sizes, seq_lengths, generation_tokens,
-            use_kv_cache=False, compiled=False,
+            config,
+            devices,
+            batch_sizes,
+            seq_lengths,
+            generation_tokens,
+            use_kv_cache=True,
+            compiled=False,
+            n_warmup=n_warmup,
         )
 
         if include_compiled:
             _run_generation_benchmarks(
-                config, devices, batch_sizes, seq_lengths, generation_tokens,
-                use_kv_cache=False, compiled=True,
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                generation_tokens,
+                use_kv_cache=True,
+                compiled=True,
+                n_warmup=n_warmup,
+            )
+
+        _run_generation_benchmarks(
+            config,
+            devices,
+            batch_sizes,
+            seq_lengths,
+            generation_tokens,
+            use_kv_cache=False,
+            compiled=False,
+            n_warmup=n_warmup,
+        )
+
+        if include_compiled:
+            _run_generation_benchmarks(
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                generation_tokens,
+                use_kv_cache=False,
+                compiled=True,
+                n_warmup=n_warmup,
             )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Qwen model")
+    parser = argparse.ArgumentParser(description="Benchmark BaseTransformer model")
     parser.add_argument(
         "--devices",
         nargs="+",
@@ -360,6 +405,12 @@ def main():
         help="Number of tokens to generate",
     )
     parser.add_argument(
+        "--n-warmup",
+        type=int,
+        default=10,
+        help="Number of times to warmup",
+    )
+    parser.add_argument(
         "--no-compile",
         action="store_true",
         default=False,
@@ -386,6 +437,7 @@ def main():
         generation_tokens=args.generation_tokens,
         configs=configs,
         include_compiled=not args.no_compile,
+        n_warmup=args.n_warmup,
     )
 
 
