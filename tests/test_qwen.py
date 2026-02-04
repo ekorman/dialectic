@@ -386,8 +386,14 @@ def test_generate_from_tokens_stopping_condition_partial_batch():
 
     assert output.shape == torch.Size((3, 2 + max_tokens_generated))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[2] == pad_token_id).all()
+    assert generated_tokens[2].tolist() == [
+        eos_token_id,
+        pad_token_id,
+        pad_token_id,
+        pad_token_id,
+    ]
     assert (generated_tokens[:2] != pad_token_id).all()
+    assert (generated_tokens[:2] != eos_token_id).all()
 
 
 def test_generate_from_tokens_stopping_condition_full_batch():
@@ -417,11 +423,11 @@ def test_generate_from_tokens_stopping_condition_full_batch():
     )
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 4))
+    assert output.shape == torch.Size((3, 5))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[0] == torch.tensor([pad_token_id, pad_token_id])).all()
-    assert (generated_tokens[1] == torch.tensor([5, pad_token_id])).all()
-    assert (generated_tokens[2] == torch.tensor([6, 8])).all()
+    assert generated_tokens[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
+    assert generated_tokens[1].tolist() == [5, eos_token_id, pad_token_id]
+    assert generated_tokens[2].tolist() == [6, 8, eos_token_id]
 
 
 def test_qwen_generate_temperature():

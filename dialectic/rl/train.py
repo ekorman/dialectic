@@ -543,7 +543,6 @@ def train_grpo(
 
     n_episodes = 0
     step = 0
-    ref_net = deepcopy(net)
 
     while n_episodes < max_episodes:
         if step % update_ref_net_batch_cadence == 0:
