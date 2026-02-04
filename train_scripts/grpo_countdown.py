@@ -87,7 +87,7 @@ def train(
     n_total: int = 6,
     n_ops: int = 5,
     seed: int,
-    compile_model: bool,
+    compile_model: bool = False,
     mu: int = 1,
     accumulation_steps: int = 16,
     update_ref_net_batch_cadence: int = 100,
