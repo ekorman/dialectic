@@ -464,11 +464,7 @@ def test_qwen_generate_temperature():
     torch.testing.assert_close(out_greedy, out_low_temp)
 
 
-@pytest.mark.skipif(
-    os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
-)
-def test_model_generation_against_qwen_06b():
+def _test_model_generation_against_qwen_06b(hf_model, model):
     """Test model generation against HuggingFace. the expected output was obtained with the code
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -490,19 +486,6 @@ def test_model_generation_against_qwen_06b():
     outputs = model.generate(**inputs, do_sample=False, max_new_tokens=500)
     print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     """
-    model = load_qwen_06b()
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", dtype=torch.float32
-    ).eval()
-
-    def map_key(k: str):
-        if k.startswith("model"):
-            return k[6:]
-        return k
-
-    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
-    model.eval()
 
     x = torch.randint(0, hf_model.config.vocab_size, size=(1, 10))
 
@@ -546,3 +529,39 @@ Okay, the user is asking for the capital of France. I need to make sure I recall
 
 The capital of France is **Paris**."""
         )
+
+
+def _load_qwen_06b_model():
+    model = load_qwen_06b()
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
+
+    def map_key(k: str):
+        if k.startswith("model"):
+            return k[6:]
+        return k
+
+    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
+    model.eval()
+    return hf_model, model
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    _test_model_generation_against_qwen_06b(hf_model, model)
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_compiled_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    model = torch.compile(model)
+    _test_model_generation_against_qwen_06b(hf_model, model)
