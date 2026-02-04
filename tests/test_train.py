@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from dialectic.llm.generate import generate_from_tokens
 from dialectic.rl.train import compute_log_probs, compute_logits_of_group, stack_and_pad
 
 
@@ -112,6 +113,78 @@ def test_compute_log_probs():
 
     expected_mask = stacked[:, :, prompt_len:] != pad_token_id
     torch.testing.assert_close(completion_mask, expected_mask)
+
+
+def test_generate_from_tokens_preserves_eos():
+    """EOS token should be present in the generated output, not replaced with pad."""
+    vocab_size = 10
+    eos_token_id = 2
+    pad_token_id = 0
+
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy = nn.Parameter(torch.zeros(1))
+
+        def forward(self, x, kv_caches=None, attention_mask=None):
+            prompt_len = 2
+            step = x.shape[1] - prompt_len
+            tokens = [5, 6, eos_token_id]
+            logits = torch.full((x.shape[0], 1, vocab_size), -100.0)
+            idx = min(step, len(tokens) - 1)
+            logits[:, :, tokens[idx]] = 100.0
+            return logits
+
+    net = MockModel()
+    result = generate_from_tokens(
+        net=net,
+        token_ids=torch.tensor([[1, 3]]),
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        sampling_strategy="greedy",
+        use_kv_cache=False,
+    )
+
+    assert result[0].tolist() == [1, 3, 5, 6, eos_token_id]
+
+
+def test_generate_from_tokens_preserves_eos_batch():
+    """In a batch where sequences finish at different times, EOS should be
+    preserved for each sequence and padding should only appear after EOS."""
+    vocab_size = 10
+    eos_token_id = 2
+    pad_token_id = 0
+
+    class MockModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy = nn.Parameter(torch.zeros(1))
+
+        def forward(self, x, kv_caches=None, attention_mask=None):
+            prompt_len = 2
+            step = x.shape[1] - prompt_len
+            seq0_tokens = [5, eos_token_id, 9]
+            seq1_tokens = [5, 6, eos_token_id]
+            logits = torch.full((x.shape[0], 1, vocab_size), -100.0)
+            for b, tokens in enumerate([seq0_tokens, seq1_tokens]):
+                idx = min(step, len(tokens) - 1)
+                logits[b, :, tokens[idx]] = 100.0
+            return logits
+
+    net = MockModel()
+    result = generate_from_tokens(
+        net=net,
+        token_ids=torch.tensor([[1, 3], [1, 3]]),
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        sampling_strategy="greedy",
+        use_kv_cache=False,
+    )
+
+    # seq 0: generates [5, EOS], then waits for seq 1 → [1, 3, 5, EOS, pad]
+    # seq 1: generates [5, 6, EOS] → [1, 3, 5, 6, EOS]
+    assert result[0].tolist() == [1, 3, 5, eos_token_id, pad_token_id]
+    assert result[1].tolist() == [1, 3, 5, 6, eos_token_id]
 
 
 def test_compute_logits_of_group_attention_mask_extended():
