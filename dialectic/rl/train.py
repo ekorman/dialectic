@@ -387,9 +387,16 @@ def compute_grpo_loss(
     kl_loss = torch.exp(kl_diff) - kl_diff - 1
     kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
-    mask_sum = completion_mask.sum()
-    ppo_loss_scalar = -(ppo_obj * completion_mask).sum() / mask_sum
-    kl_loss_scalar = (kl_loss * completion_mask).sum() / mask_sum
+    # Normalize per-sequence to avoid length bias: longer sequences should not
+    # contribute more to the loss just because they have more tokens.
+    # Each sequence's contribution is its mean (over tokens), then we average
+    # across all sequences.
+    sequence_lengths = completion_mask.sum(dim=-1, keepdim=True)  # [B, G, 1]
+    ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+    kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+
+    ppo_loss_scalar = -ppo_obj_per_seq.mean()
+    kl_loss_scalar = kl_loss_per_seq.mean()
 
     loss = ppo_loss_scalar + beta * kl_loss_scalar
     return loss, ppo_loss_scalar.item(), kl_loss_scalar.item()

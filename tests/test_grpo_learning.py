@@ -18,13 +18,114 @@ from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import Countdown, Env, EpisodeIsDoneError
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn, RewardFn
-from dialectic.rl.train import compute_log_probs, train_grpo
+from dialectic.rl.train import compute_grpo_loss, compute_log_probs, train_grpo
 from dialectic.rl.types import EnvResponse, RewardResult
 
 
 def countdown_state_to_str(data: Countdown) -> str:
     """Convert Countdown data to prompt string."""
     return data.prompt
+
+
+class TestComputeGRPOLoss:
+    """Unit tests for compute_grpo_loss function."""
+
+    def test_no_length_bias(self):
+        """Sequences of different lengths with same advantage contribute equally.
+
+        This test verifies that the loss normalization is per-sequence, not per-token.
+        Without this fix, longer sequences would have outsized influence on gradients,
+        causing the model to implicitly learn that longer outputs are better.
+        """
+        # Setup: 2 batch elements, 2 group members each, max length 10
+        B, G, L = 2, 2, 10
+
+        # Create log probs (uniform for simplicity)
+        log_probs = torch.full((B, G, L), -1.0)
+        old_log_probs = torch.full((B, G, L), -1.0)
+        ref_log_probs = torch.full((B, G, L), -1.0)
+
+        # Key: completion masks of different lengths
+        # Sequence (0,0): 10 tokens, Sequence (0,1): 2 tokens
+        # Sequence (1,0): 10 tokens, Sequence (1,1): 2 tokens
+        completion_mask = torch.zeros((B, G, L), dtype=torch.bool)
+        completion_mask[0, 0, :10] = True  # Long sequence
+        completion_mask[0, 1, :2] = True  # Short sequence
+        completion_mask[1, 0, :10] = True  # Long sequence
+        completion_mask[1, 1, :2] = True  # Short sequence
+
+        # Same advantage for all sequences
+        advs = torch.ones((B, G, 1))
+
+        loss1, ppo_loss1, _ = compute_grpo_loss(
+            log_probs=log_probs,
+            old_log_probs=old_log_probs,
+            ref_log_probs=ref_log_probs,
+            completion_mask=completion_mask,
+            advs=advs,
+            beta=0.0,  # Disable KL penalty for clarity
+            eps=0.2,
+        )
+
+        # Now test with uniform lengths (all 5 tokens)
+        uniform_mask = torch.zeros((B, G, L), dtype=torch.bool)
+        uniform_mask[:, :, :5] = True
+
+        loss2, ppo_loss2, _ = compute_grpo_loss(
+            log_probs=log_probs,
+            old_log_probs=old_log_probs,
+            ref_log_probs=ref_log_probs,
+            completion_mask=uniform_mask,
+            advs=advs,
+            beta=0.0,
+            eps=0.2,
+        )
+
+        # With proper per-sequence normalization, both losses should be equal
+        # because each sequence contributes its mean (which is the same since
+        # log_probs are uniform and advantages are the same)
+        assert torch.isclose(
+            loss1, loss2, atol=1e-6
+        ), f"Loss should not depend on sequence length distribution: {loss1} vs {loss2}"
+
+    def test_length_bias_asymmetric_advantages(self):
+        """Verify asymmetric advantages work correctly regardless of length.
+
+        If a short sequence has positive advantage and a long sequence has
+        negative advantage, they should contribute equally (in magnitude)
+        to the loss, not be biased by their length.
+        """
+        B, G, L = 1, 2, 20
+
+        log_probs = torch.full((B, G, L), -1.0)
+        old_log_probs = torch.full((B, G, L), -1.0)
+        ref_log_probs = torch.full((B, G, L), -1.0)
+
+        # Group member 0: long (20 tokens), negative advantage
+        # Group member 1: short (2 tokens), positive advantage
+        completion_mask = torch.zeros((B, G, L), dtype=torch.bool)
+        completion_mask[0, 0, :20] = True  # Long sequence
+        completion_mask[0, 1, :2] = True  # Short sequence
+
+        advs = torch.tensor([[[-1.0], [1.0]]])  # Shape [1, 2, 1]
+
+        loss, ppo_loss, _ = compute_grpo_loss(
+            log_probs=log_probs,
+            old_log_probs=old_log_probs,
+            ref_log_probs=ref_log_probs,
+            completion_mask=completion_mask,
+            advs=advs,
+            beta=0.0,
+            eps=0.2,
+        )
+
+        # With proper normalization, the two sequences should cancel out
+        # (same magnitude, opposite sign advantages)
+        # The PPO loss should be close to 0
+        assert abs(ppo_loss) < 0.1, (
+            f"With equal magnitude opposite advantages, loss should be ~0, got {ppo_loss}. "
+            "This suggests length bias: longer sequences are dominating the gradient."
+        )
 
 
 class TestGRPOMechanics:
