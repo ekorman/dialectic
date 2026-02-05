@@ -1,7 +1,11 @@
 import torch
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import generate_from_tokens
+from dialectic.llm.generate import (
+    PreFill,
+    check_and_apply_prefill,
+    generate_from_tokens,
+)
 
 
 def test_generate_from_tokens_preserves_eos(MockGenerateModel):
@@ -215,3 +219,50 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
         generated_tokens[2]
         == torch.stack([_create_one_hot(6), _create_one_hot(8), eos_token_one_hot])
     ).all()
+
+
+def test_prefill_pos():
+    prefill = PreFill(
+        condition=torch.tensor([3, 2, 4]), filling=torch.tensor([30, 100])
+    )
+
+    token_ids = torch.tensor(
+        [
+            [1, 2, 3, 5],
+            [1, 3, 2, 4],
+            [0, 2, 4, 7],
+        ]
+    )
+
+    prefilled = check_and_apply_prefill(
+        token_ids=token_ids, prefill=prefill, pad_token_id=-1
+    )
+
+    assert (
+        prefilled
+        == torch.tensor(
+            [
+                [1, 2, 3, 5, -1, -1],
+                [1, 3, 2, 4, 30, 100],
+                [0, 2, 4, 7, -1, -1],
+            ]
+        )
+    ).all()
+
+
+def test_prefill_no_op():
+    prefill = PreFill(condition=torch.tensor([2, 10]), filling=torch.tensor([30, 100]))
+
+    token_ids = torch.tensor(
+        [
+            [1, 2, 3, 5],
+            [1, 3, 2, 4],
+            [0, 2, 4, 7],
+        ]
+    )
+
+    prefilled = check_and_apply_prefill(
+        token_ids=token_ids, prefill=prefill, pad_token_id=-1
+    )
+
+    assert (prefilled == token_ids).all()

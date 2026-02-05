@@ -3,6 +3,7 @@ from abc import abstractmethod
 from typing import Literal
 
 import torch
+from attr import dataclass
 from jaxtyping import Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
@@ -14,6 +15,41 @@ from dialectic.llm.templates import (
     get_llama_input_text_from_messages,
     get_qwen_input_text_from_messages,
 )
+
+
+@dataclass
+class PreFill:
+    condition: Int[torch.Tensor, " N"]  # (space necessary to avoid F821)
+    filling: Int[torch.Tensor, " M"]
+
+    def to(self, device: torch.device):
+        self.condition = self.condition.to(device)
+        self.filling = self.filling.to(device)
+
+
+def check_and_apply_prefill(
+    token_ids: Int[torch.Tensor, "B L"], prefill: PreFill, pad_token_id: int
+):
+    """Checks a batch of token ids and if any match the prefill condition, prefills it and then pads
+    the ones not meeting the condition
+    """
+    if len(token_ids) < len(prefill.condition):
+        return token_ids
+
+    # check if there are any elements in the batch meeting the condition
+    cond_met = (
+        token_ids[:, -len(prefill.condition) :] == prefill.condition.unsqueeze(0)
+    ).all(1)
+    if not cond_met.any():
+        return token_ids
+
+    new_tensors = torch.where(
+        cond_met.unsqueeze(-1),
+        prefill.filling.unsqueeze(0),
+        torch.full_like(prefill.filling, pad_token_id).unsqueeze(0),
+    )
+
+    return torch.cat([token_ids, new_tensors], -1)
 
 
 class BaseTokenGenerator:
@@ -33,6 +69,9 @@ class BaseTokenGenerator:
     @abstractmethod
     def finished(self) -> bool: ...
 
+    @abstractmethod
+    def get_all_tensors(self) -> torch.Tensor: ...
+
     def generate(
         self,
         net: BaseTransformer,
@@ -41,6 +80,7 @@ class BaseTokenGenerator:
         use_kv_cache: bool = True,
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
+        prefill: PreFill | None = None,
     ):
         if use_kv_cache:
             kv_caches = [
@@ -56,6 +96,8 @@ class BaseTokenGenerator:
             kv_caches = None
 
         device = token_ids.device
+        if prefill:
+            prefill = prefill.to(device)
         self.init_state(token_ids, attention_mask)
 
         input_tokens = token_ids
@@ -80,7 +122,7 @@ class BaseTokenGenerator:
 
             tokens_generated += 1
 
-        return self.all_inputs
+        return self.get_all_tensors()
 
 
 class HardGenerator(BaseTokenGenerator):
@@ -135,6 +177,9 @@ class HardGenerator(BaseTokenGenerator):
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
         return self.all_inputs, self.attention_mask
+
+    def get_all_tensors(self) -> torch.Tensor:
+        return self.all_inputs
 
     @property
     def finished(self) -> bool:
@@ -198,6 +243,9 @@ class SoftGenerator(BaseTokenGenerator):
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
         return self.all_inputs, self.attention_mask
+
+    def get_all_tensors(self) -> torch.Tensor:
+        return self.all_inputs
 
     @property
     def finished(self) -> bool:
