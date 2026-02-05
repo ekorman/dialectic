@@ -15,19 +15,117 @@ from dialectic.llm.templates import (
 )
 
 
-# thinking through if we need this. need something to handle pre-filling, stopping condition
-# hard and soft tokens, etc
-class StateManager:
-    def __init__(self, vocab_size):
-        pass
+class HardGenerationState:
+    # if we want pre-filling conditions then we need to track everything...
+    def __init__(
+        self,
+        batch_size: int,
+        device,
+        sampling_strategy: Literal["greedy", "sample"] | None = "sample",
+        temperature: float = 1.0,
+        eos_token_id: int = 151645,
+        pad_token_id: int = 151643,
+    ):
+        self.sampling_strategy = sampling_strategy
+        self.temperature = temperature
+        self._finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
 
-    def next_tokens(logits: Float[torch.Tensor, "B 1 V"]):
-        # here we could add more than 1 since we could prefill and these
-        # would not be appended by pre-pended? but would that mess up the KV-cache?
-        pass
+    def init(
+        self,
+        initial_input: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ):
+        self.all_inputs = initial_input
+        self.attention_mask = attention_mask
 
-    def init(token_ids):
-        pass
+    def get_next_inputs(
+        self, logits: Float[torch.Tensor, "B 1 V"]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.sampling_strategy == "greedy":
+            next_token = logits.argmax(-1)
+        else:
+            scaled_logits = logits / self.temperature
+            probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+        next_token = torch.where(
+            self._finished.unsqueeze(-1),
+            torch.full_like(next_token, self.pad_token_id),
+            next_token,
+        )
+
+        self._finished = self._finished | (next_token.squeeze(-1) == self.eos_token_id)
+
+        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+
+        if self._finished.all():
+            return None, None
+
+        if self.attention_mask is not None:
+            new_mask = ~self._finished.unsqueeze(-1)
+            self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
+        return self.all_inputs, self.attention_mask
+
+
+class SoftGenerationState:
+    # if we want pre-filling conditions then we need to track everything...
+    def __init__(
+        self,
+        batch_size: int,
+        device,
+        vocab_size: int,
+        temperature: float = 1.0,
+        eos_token_id: int = 151645,
+        pad_token_id: int = 151643,
+    ):
+        self.vocab_size = vocab_size
+        self._finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        self.temperature = temperature
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+
+    def init(
+        self,
+        initial_input: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ):
+        self.shadow_seq = initial_input
+        self.all_inputs = torch.nn.functional.one_hot(
+            initial_input, self.vocab_size
+        ).float()
+        self.attention_mask = attention_mask
+
+    def get_next_inputs(
+        self, logits: Float[torch.Tensor, "B 1 V"]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        scaled_logits = logits / self.temperature
+        probs = torch.softmax(scaled_logits, dim=-1)
+        next_token = probs  # need .detach()?
+
+        next_token = torch.where(
+            self._finished.unsqueeze(-1).unsqueeze(-1),
+            torch.nn.functional.one_hot(
+                torch.tensor(self.pad_token_id), logits.shape[-1]
+            ),
+            next_token,
+        )
+        hard_token_id = next_token.argmax(-1)
+        self._finished = self._finished | (
+            hard_token_id.squeeze(-1) == self.eos_token_id
+        )
+
+        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
+
+        if self._finished.all():
+            return None, None
+
+        if self.attention_mask is not None:
+            new_mask = ~self._finished.unsqueeze(-1)
+            self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
+        return self.all_inputs, self.attention_mask
 
 
 @torch.inference_mode()
@@ -65,17 +163,26 @@ def generate_from_tokens(
         kv_caches = None
 
     device = token_ids.device
-
     if soft_tokens:
-        shadow_seq = token_ids
-        all_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
-        input_tokens = torch.nn.functional.one_hot(token_ids, net.vocab_size).float()
+        state = SoftGenerationState(
+            batch_size=token_ids.shape[0],
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            device=device,
+            temperature=temperature,
+            vocab_size=net.vocab_size,
+        )
     else:
-        all_tokens = token_ids
-        input_tokens = token_ids
+        state = HardGenerationState(
+            batch_size=token_ids.shape[0],
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            temperature=temperature,
+            device=device,
+        )
+    state.init(token_ids, attention_mask)
 
-    finished = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=device)
-
+    input_tokens = token_ids
     tokens_generated = 0
     while tokens_generated < max_tokens_generated:
         with torch.autocast(
@@ -85,53 +192,19 @@ def generate_from_tokens(
                 input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
             )
 
-        if soft_tokens:
-            scaled_logits = logits / temperature
-            probs = torch.softmax(scaled_logits, dim=-1)
-            next_token = probs  # need .detach()?
+        all_inputs, attention_mask = state.get_next_inputs(logits)
 
-            next_token = torch.where(
-                finished.unsqueeze(-1).unsqueeze(-1),
-                torch.nn.functional.one_hot(
-                    torch.tensor(pad_token_id), logits.shape[-1]
-                ),
-                next_token,
-            )
-            hard_token_id = next_token.argmax(-1)
-            finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
-        else:
-            if sampling_strategy == "greedy":
-                next_token = logits.argmax(-1)
-            else:
-                scaled_logits = logits / temperature
-                probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-
-            next_token = torch.where(
-                finished.unsqueeze(-1),
-                torch.full_like(next_token, pad_token_id),
-                next_token,
-            )
-            finished = finished | (next_token.squeeze(-1) == eos_token_id)
-
-        all_tokens = torch.cat([all_tokens, next_token], 1)
-        if soft_tokens:
-            shadow_seq = torch.cat([shadow_seq, hard_token_id], 1)
-        tokens_generated += 1
-
-        if finished.all():
+        if all_inputs is None:
             break
 
         if use_kv_cache:
-            input_tokens = next_token
+            input_tokens = all_inputs[:, -1:]
         else:
-            input_tokens = all_tokens
+            input_tokens = all_inputs
 
-        if attention_mask is not None:
-            new_mask = ~finished.unsqueeze(-1)
-            attention_mask = torch.cat([attention_mask, new_mask], 1)
+        tokens_generated += 1
 
-    return all_tokens
+    return state.all_inputs
 
 
 def generate_from_text(
