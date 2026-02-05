@@ -60,13 +60,17 @@ class HardGenerationState:
 
         self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
 
-        if self._finished.all():
+        if self.finished:
             return None, None
 
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
         return self.all_inputs, self.attention_mask
+
+    @property
+    def finished(self) -> bool:
+        return bool(self._finished.all())
 
 
 class SoftGenerationState:
@@ -119,13 +123,17 @@ class SoftGenerationState:
         self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
         self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
 
-        if self._finished.all():
+        if self.finished:
             return None, None
 
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
         return self.all_inputs, self.attention_mask
+
+    @property
+    def finished(self) -> bool:
+        return bool(self._finished.all())
 
 
 @torch.inference_mode()
