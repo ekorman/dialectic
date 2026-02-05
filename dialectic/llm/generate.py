@@ -74,6 +74,8 @@ def generate_from_tokens(
         all_tokens = token_ids
         input_tokens = token_ids
 
+    finished = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=device)
+
     tokens_generated = 0
     while tokens_generated < max_tokens_generated:
         with torch.autocast(
@@ -86,12 +88,8 @@ def generate_from_tokens(
         if soft_tokens:
             scaled_logits = logits / temperature
             probs = torch.softmax(scaled_logits, dim=-1)
-            hard_token_id = probs.argmax(-1)
-
             next_token = probs  # need .detach()?
-            finished = (hard_token_id.squeeze(-1) == eos_token_id) | (
-                shadow_seq[:, -1] == pad_token_id
-            )
+
             next_token = torch.where(
                 finished.unsqueeze(-1).unsqueeze(-1),
                 torch.nn.functional.one_hot(
@@ -100,31 +98,29 @@ def generate_from_tokens(
                 next_token,
             )
             hard_token_id = next_token.argmax(-1)
+            finished = finished | (hard_token_id.squeeze(-1) == eos_token_id)
         else:
             if sampling_strategy == "greedy":
                 next_token = logits.argmax(-1)
             else:
                 scaled_logits = logits / temperature
-
                 probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 
-            finished = (next_token.squeeze(-1) == eos_token_id) | (
-                all_tokens[:, -1] == pad_token_id
-            )
             next_token = torch.where(
                 finished.unsqueeze(-1),
                 torch.full_like(next_token, pad_token_id),
                 next_token,
             )
-
-        if finished.all():
-            break
+            finished = finished | (next_token.squeeze(-1) == eos_token_id)
 
         all_tokens = torch.cat([all_tokens, next_token], 1)
         if soft_tokens:
             shadow_seq = torch.cat([shadow_seq, hard_token_id], 1)
         tokens_generated += 1
+
+        if finished.all():
+            break
 
         if use_kv_cache:
             input_tokens = next_token
@@ -132,7 +128,7 @@ def generate_from_tokens(
             input_tokens = all_tokens
 
         if attention_mask is not None:
-            new_mask = finished.unsqueeze(-1)
+            new_mask = ~finished.unsqueeze(-1)
             attention_mask = torch.cat([attention_mask, new_mask], 1)
 
     return all_tokens
@@ -157,9 +153,8 @@ def generate_from_text(
     tokenizer.enable_padding(pad_id=pad_token_id, pad_token=pad_token, direction="left")
     tokens = tokenizer.encode_batch(text_batch)
     token_ids = torch.tensor([t.ids for t in tokens]).to(device)
-    # attention mask is True where we want to mask (i.e. ignore)
     attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool) == 0
+        torch.tensor([t.attention_mask for t in tokens], dtype=torch.bool)
     ).to(device)
 
     eos_token_id = tokenizer.token_to_id(eos_token)

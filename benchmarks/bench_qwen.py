@@ -1,9 +1,10 @@
-"""Benchmark script for Qwen model implementation.
+"""Benchmark script for BaseTransformer model implementation.
 
 Usage:
     uv run python benchmarks/bench_qwen.py
     uv run python benchmarks/bench_qwen.py --devices cpu mps
     uv run python benchmarks/bench_qwen.py --batch-sizes 1 4 8
+    uv run python benchmarks/bench_qwen.py --no-compile
 """
 
 import argparse
@@ -12,7 +13,9 @@ from dataclasses import dataclass
 
 import torch
 
-from dialectic.llm.qwen import Qwen, generate_from_tokens
+from dialectic.llm.base import BaseTransformer
+from dialectic.llm.generate import generate_from_tokens
+from dialectic.llm.qwen import create_qwen
 
 
 @dataclass
@@ -71,8 +74,10 @@ def get_available_devices() -> list[str]:
     return devices
 
 
-def create_model(config: BenchmarkConfig, device: str) -> Qwen:
-    model = Qwen(
+def create_model(
+    config: BenchmarkConfig, device: str, compiled: bool = False
+) -> BaseTransformer:
+    model = create_qwen(
         d=config.d,
         vocab_size=config.vocab_size,
         n_decoder_layers=config.n_decoder_layers,
@@ -82,7 +87,10 @@ def create_model(config: BenchmarkConfig, device: str) -> Qwen:
         mlp_hidden_d=config.mlp_hidden_d,
         rope_base_value=config.rope_base_value,
     )
-    return model.to(device).eval()
+    model = model.to(device).eval()
+    if compiled:
+        model = torch.compile(model)
+    return model
 
 
 def sync_device(device: str):
@@ -93,11 +101,11 @@ def sync_device(device: str):
 
 
 def benchmark_forward(
-    model: Qwen,
+    model: BaseTransformer,
     device: str,
     batch_size: int,
     seq_length: int,
-    n_warmup: int = 3,
+    n_warmup: int,
     n_iterations: int = 10,
 ) -> dict:
     x = torch.randint(0, model.vocab_size, size=(batch_size, seq_length), device=device)
@@ -132,13 +140,13 @@ def benchmark_forward(
 
 
 def benchmark_generation(
-    model: Qwen,
+    model: BaseTransformer,
     device: str,
     batch_size: int,
     prompt_length: int,
     max_new_tokens: int,
     use_kv_cache: bool,
-    n_warmup: int = 2,
+    n_warmup: int,
     n_iterations: int = 5,
 ) -> dict:
     x = torch.randint(
@@ -192,21 +200,103 @@ def benchmark_generation(
     }
 
 
+def _run_forward_benchmarks(
+    config: BenchmarkConfig,
+    devices: list[str],
+    batch_sizes: list[int],
+    seq_lengths: list[int],
+    compiled: bool,
+    n_warmup: int,
+):
+    label = (
+        "Forward Pass Benchmark (compiled)" if compiled else "Forward Pass Benchmark"
+    )
+    print("-" * 100)
+    print(label)
+    print("-" * 100)
+    print(
+        f"{'Device':<8} {'Batch':<6} {'SeqLen':<8} {'Warmup 1st':<12} {'Warmup Mean':<12} {'Mean (ms)':<12} {'Min (ms)':<12}"
+    )
+    print("-" * 100)
+
+    for device in devices:
+        model = create_model(config, device, compiled=compiled)
+        for batch_size in batch_sizes:
+            for seq_length in seq_lengths:
+                result = benchmark_forward(
+                    model, device, batch_size, seq_length, n_warmup
+                )
+                print(
+                    f"{device:<8} {batch_size:<6} {seq_length:<8} "
+                    f"{result['warmup_first_ms']:<12.3f} {result['warmup_mean_ms']:<12.3f} "
+                    f"{result['mean_ms']:<12.3f} {result['min_ms']:<12.3f}"
+                )
+        del model
+        sync_device(device)
+
+
+def _run_generation_benchmarks(
+    config: BenchmarkConfig,
+    devices: list[str],
+    batch_sizes: list[int],
+    seq_lengths: list[int],
+    generation_tokens: int,
+    use_kv_cache: bool,
+    compiled: bool,
+    n_warmup: int,
+):
+    cache_label = "with KV cache" if use_kv_cache else "without KV cache"
+    compiled_label = " (compiled)" if compiled else ""
+    label = f"Generation Benchmark ({cache_label}){compiled_label}"
+    print()
+    print("-" * 100)
+    print(label)
+    print("-" * 100)
+    print(
+        f"{'Device':<8} {'Batch':<6} {'Prompt':<8} {'NewToks':<8} {'Warmup 1st':<12} {'Mean (ms)':<12} {'Warmup Tok/s':<14} {'Tok/s':<12}"
+    )
+    print("-" * 100)
+
+    for device in devices:
+        model = create_model(config, device, compiled=compiled)
+        for batch_size in batch_sizes:
+            for seq_length in seq_lengths:
+                result = benchmark_generation(
+                    model,
+                    device,
+                    batch_size,
+                    seq_length,
+                    generation_tokens,
+                    n_warmup=n_warmup,
+                    use_kv_cache=use_kv_cache,
+                )
+                print(
+                    f"{device:<8} {batch_size:<6} {seq_length:<8} {generation_tokens:<8} "
+                    f"{result['warmup_first_ms']:<12.3f} {result['mean_ms']:<12.3f} "
+                    f"{result['warmup_tokens_per_sec']:<14.1f} {result['tokens_per_sec']:<12.1f}"
+                )
+        del model
+        sync_device(device)
+
+
 def run_benchmarks(
     devices: list[str],
     batch_sizes: list[int],
     seq_lengths: list[int],
     generation_tokens: int,
     configs: list[BenchmarkConfig],
+    n_warmup: int,
+    include_compiled: bool = True,
 ):
     print("=" * 100)
-    print("Qwen Benchmark")
+    print("BaseTransformer Benchmark")
     print("=" * 100)
     print(f"Configs: {[c.name for c in configs]}")
     print(f"Devices: {devices}")
     print(f"Batch sizes: {batch_sizes}")
     print(f"Sequence lengths: {seq_lengths}")
     print(f"Generation tokens: {generation_tokens}")
+    print(f"Include compiled: {include_compiled}")
     print()
 
     for config in configs:
@@ -218,88 +308,69 @@ def run_benchmarks(
         )
         print("=" * 100)
 
-        print("-" * 100)
-        print("Forward Pass Benchmark")
-        print("-" * 100)
-        print(
-            f"{'Device':<8} {'Batch':<6} {'SeqLen':<8} {'Warmup 1st':<12} {'Warmup Mean':<12} {'Mean (ms)':<12} {'Min (ms)':<12}"
+        _run_forward_benchmarks(
+            config, devices, batch_sizes, seq_lengths, compiled=False, n_warmup=n_warmup
         )
-        print("-" * 100)
 
-        for device in devices:
-            model = create_model(config, device)
-            for batch_size in batch_sizes:
-                for seq_length in seq_lengths:
-                    result = benchmark_forward(model, device, batch_size, seq_length)
-                    print(
-                        f"{device:<8} {batch_size:<6} {seq_length:<8} "
-                        f"{result['warmup_first_ms']:<12.3f} {result['warmup_mean_ms']:<12.3f} "
-                        f"{result['mean_ms']:<12.3f} {result['min_ms']:<12.3f}"
-                    )
-            del model
-            sync_device(device)
+        if include_compiled:
+            _run_forward_benchmarks(
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                compiled=True,
+                n_warmup=n_warmup,
+            )
 
-        print()
-        print("-" * 100)
-        print("Generation Benchmark (with KV cache)")
-        print("-" * 100)
-        print(
-            f"{'Device':<8} {'Batch':<6} {'Prompt':<8} {'NewToks':<8} {'Warmup 1st':<12} {'Mean (ms)':<12} {'Warmup Tok/s':<14} {'Tok/s':<12}"
+        _run_generation_benchmarks(
+            config,
+            devices,
+            batch_sizes,
+            seq_lengths,
+            generation_tokens,
+            use_kv_cache=True,
+            compiled=False,
+            n_warmup=n_warmup,
         )
-        print("-" * 100)
 
-        for device in devices:
-            model = create_model(config, device)
-            for batch_size in batch_sizes:
-                for seq_length in seq_lengths:
-                    result = benchmark_generation(
-                        model,
-                        device,
-                        batch_size,
-                        seq_length,
-                        generation_tokens,
-                        use_kv_cache=True,
-                    )
-                    print(
-                        f"{device:<8} {batch_size:<6} {seq_length:<8} {generation_tokens:<8} "
-                        f"{result['warmup_first_ms']:<12.3f} {result['mean_ms']:<12.3f} "
-                        f"{result['warmup_tokens_per_sec']:<14.1f} {result['tokens_per_sec']:<12.1f}"
-                    )
-            del model
-            sync_device(device)
+        if include_compiled:
+            _run_generation_benchmarks(
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                generation_tokens,
+                use_kv_cache=True,
+                compiled=True,
+                n_warmup=n_warmup,
+            )
 
-        print()
-        print("-" * 100)
-        print("Generation Benchmark (without KV cache)")
-        print("-" * 100)
-        print(
-            f"{'Device':<8} {'Batch':<6} {'Prompt':<8} {'NewToks':<8} {'Warmup 1st':<12} {'Mean (ms)':<12} {'Warmup Tok/s':<14} {'Tok/s':<12}"
+        _run_generation_benchmarks(
+            config,
+            devices,
+            batch_sizes,
+            seq_lengths,
+            generation_tokens,
+            use_kv_cache=False,
+            compiled=False,
+            n_warmup=n_warmup,
         )
-        print("-" * 100)
 
-        for device in devices:
-            model = create_model(config, device)
-            for batch_size in batch_sizes:
-                for seq_length in seq_lengths:
-                    result = benchmark_generation(
-                        model,
-                        device,
-                        batch_size,
-                        seq_length,
-                        generation_tokens,
-                        use_kv_cache=False,
-                    )
-                    print(
-                        f"{device:<8} {batch_size:<6} {seq_length:<8} {generation_tokens:<8} "
-                        f"{result['warmup_first_ms']:<12.3f} {result['mean_ms']:<12.3f} "
-                        f"{result['warmup_tokens_per_sec']:<14.1f} {result['tokens_per_sec']:<12.1f}"
-                    )
-            del model
-            sync_device(device)
+        if include_compiled:
+            _run_generation_benchmarks(
+                config,
+                devices,
+                batch_sizes,
+                seq_lengths,
+                generation_tokens,
+                use_kv_cache=False,
+                compiled=True,
+                n_warmup=n_warmup,
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Qwen model")
+    parser = argparse.ArgumentParser(description="Benchmark BaseTransformer model")
     parser.add_argument(
         "--devices",
         nargs="+",
@@ -333,6 +404,18 @@ def main():
         default=24,
         help="Number of tokens to generate",
     )
+    parser.add_argument(
+        "--n-warmup",
+        type=int,
+        default=10,
+        help="Number of times to warmup",
+    )
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        default=False,
+        help="Skip compiled model benchmarks",
+    )
     args = parser.parse_args()
 
     devices = args.devices or get_available_devices()
@@ -353,6 +436,8 @@ def main():
         seq_lengths=args.seq_lengths,
         generation_tokens=args.generation_tokens,
         configs=configs,
+        include_compiled=not args.no_compile,
+        n_warmup=args.n_warmup,
     )
 
 

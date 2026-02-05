@@ -11,7 +11,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
-from dialectic.llm.generate import generate_from_tokens, qwen_generate_from_chat
+from dialectic.llm.generate import (
+    generate_from_text,
+    generate_from_tokens,
+    qwen_generate_from_chat,
+)
 from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen_06b
 from dialectic.llm.templates import Message
 
@@ -100,7 +104,7 @@ def test_qwen():
     torch.testing.assert_close(out1, out2.logits[:, -1:])
 
 
-def test_qwen_generate():
+def test_qwen_generate_from_tokens():
     l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -153,7 +157,62 @@ def test_qwen_generate():
     torch.testing.assert_close(out_singleton, out_with_cache[:1])
 
 
-def test_qwen_generate_attention_mask():
+def test_qwen_generate_from_text_batch():
+    tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
+
+    vocab_size = tokenizer.get_vocab_size()
+    n_decoder_layers = 3
+    rope_base_value = 10000
+
+    text_batch = ["short text", "this is very long text"]
+
+    model = create_qwen(
+        d=d,
+        vocab_size=vocab_size,
+        n_decoder_layers=n_decoder_layers,
+        attn_head_d=head_d,
+        attn_num_heads=num_heads,
+        attn_num_kv_heads=num_kv_heads,
+        mlp_hidden_d=mlp_hidden_d,
+        rope_base_value=rope_base_value,
+    ).eval()
+
+    # check we get the same thing if we cache or not
+    out_no_cache = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    out_with_cache = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch,
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    assert out_no_cache == out_with_cache
+
+    # test we get the same thing for a batch or not
+    out_singleton = generate_from_text(
+        net=model,
+        tokenizer=tokenizer,
+        text_batch=text_batch[:1],
+        max_tokens_generated=24,
+        use_kv_cache=False,
+        sampling_strategy="greedy",
+    )
+
+    assert out_singleton == out_with_cache[:1]
+
+
+def test_qwen_generate_from_tokens_attention_mask():
     d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -178,8 +237,8 @@ def test_qwen_generate_attention_mask():
     x_batched[0, 3:] = x1
     x_batched[1] = x2
 
-    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
-    attention_mask[0, :3] = True
+    attention_mask = torch.ones((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = False
 
     out1 = generate_from_tokens(
         net=model,
@@ -238,8 +297,8 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     x_batched[0, 3:] = x1
     x_batched[1] = x2
 
-    attention_mask = torch.zeros((2, 7), dtype=torch.bool)
-    attention_mask[0, :3] = True
+    attention_mask = torch.ones((2, 7), dtype=torch.bool)
+    attention_mask[0, :3] = False
 
     out1 = generate_from_tokens(
         net=model,
@@ -302,8 +361,14 @@ def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel
 
     assert output.shape == torch.Size((3, 2 + max_tokens_generated))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[2] == pad_token_id).all()
+    assert generated_tokens[2].tolist() == [
+        eos_token_id,
+        pad_token_id,
+        pad_token_id,
+        pad_token_id,
+    ]
     assert (generated_tokens[:2] != pad_token_id).all()
+    assert (generated_tokens[:2] != eos_token_id).all()
 
 
 def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
@@ -333,11 +398,11 @@ def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
     )
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 4))
+    assert output.shape == torch.Size((3, 5))
     generated_tokens = output[:, 2:]
-    assert (generated_tokens[0] == torch.tensor([pad_token_id, pad_token_id])).all()
-    assert (generated_tokens[1] == torch.tensor([5, pad_token_id])).all()
-    assert (generated_tokens[2] == torch.tensor([6, 8])).all()
+    assert generated_tokens[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
+    assert generated_tokens[1].tolist() == [5, eos_token_id, pad_token_id]
+    assert generated_tokens[2].tolist() == [6, 8, eos_token_id]
 
 
 def test_qwen_generate_temperature():
@@ -380,11 +445,7 @@ def test_qwen_generate_temperature():
     torch.testing.assert_close(out_greedy, out_low_temp)
 
 
-@pytest.mark.skipif(
-    os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
-)
-def test_model_generation_against_qwen_06b():
+def _test_model_generation_against_qwen_06b(hf_model, model):
     """Test model generation against HuggingFace. the expected output was obtained with the code
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -406,19 +467,6 @@ def test_model_generation_against_qwen_06b():
     outputs = model.generate(**inputs, do_sample=False, max_new_tokens=500)
     print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     """
-    model = load_qwen_06b()
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", dtype=torch.float32
-    ).eval()
-
-    def map_key(k: str):
-        if k.startswith("model"):
-            return k[6:]
-        return k
-
-    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
-    model.eval()
 
     x = torch.randint(0, hf_model.config.vocab_size, size=(1, 10))
 
@@ -462,3 +510,39 @@ Okay, the user is asking for the capital of France. I need to make sure I recall
 
 The capital of France is **Paris**."""
         )
+
+
+def _load_qwen_06b_model():
+    model = load_qwen_06b()
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
+
+    def map_key(k: str):
+        if k.startswith("model"):
+            return k[6:]
+        return k
+
+    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
+    model.eval()
+    return hf_model, model
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    _test_model_generation_against_qwen_06b(hf_model, model)
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None or os.getenv("TEST_COMPILED") is None,
+    reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` or TEST_COMPILED is not set",
+)
+def test_compiled_model_generation_against_qwen_06b():
+    hf_model, model = _load_qwen_06b_model()
+    model = torch.compile(model)
+    _test_model_generation_against_qwen_06b(hf_model, model)

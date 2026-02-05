@@ -72,11 +72,16 @@ def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerate
     assert output.shape == torch.Size((3, 2 + max_tokens_generated, vocab_size))
     generated_tokens = output[:, 2:]
 
-    pad_token_one_hot = torch.zeros(vocab_size)
-    pad_token_one_hot[pad_token_id] = 1
+    pad_token_one_hot = torch.nn.functional.one_hot(
+        torch.tensor(pad_token_id), vocab_size
+    )
+    eos_token_one_hot = torch.nn.functional.one_hot(
+        torch.tensor(eos_token_id), vocab_size
+    )
 
     # last element of batch should terminated immediately and just have pad token distribution
-    assert (generated_tokens[2] == pad_token_one_hot).all()
+    assert (generated_tokens[2, 0] == eos_token_one_hot).all()
+    assert (generated_tokens[2, 1:] == pad_token_one_hot).all()
 
     # others should always have no pad token component
     assert (generated_tokens[:2, :, pad_token_id] == 0).all()
@@ -110,22 +115,24 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
     )
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 4, vocab_size))
+    assert output.shape == torch.Size((3, 5, vocab_size))
     generated_tokens = output[:, 2:]
 
     def _create_one_hot(token_id):
-        ret = torch.zeros(vocab_size)
-        ret[token_id] = 1
-        return ret
+        return torch.nn.functional.one_hot(torch.tensor(token_id), vocab_size)
 
     pad_token_one_hot = _create_one_hot(pad_token_id)
+    eos_token_one_hot = _create_one_hot(eos_token_id)
 
     assert (
-        generated_tokens[0] == torch.stack([pad_token_one_hot, pad_token_one_hot])
+        generated_tokens[0]
+        == torch.stack([eos_token_one_hot, pad_token_one_hot, pad_token_one_hot])
     ).all()
     assert (
-        generated_tokens[1] == torch.stack([_create_one_hot(5), pad_token_one_hot])
+        generated_tokens[1]
+        == torch.stack([_create_one_hot(5), eos_token_one_hot, pad_token_one_hot])
     ).all()
     assert (
-        generated_tokens[2] == torch.stack([_create_one_hot(6), _create_one_hot(8)])
+        generated_tokens[2]
+        == torch.stack([_create_one_hot(6), _create_one_hot(8), eos_token_one_hot])
     ).all()

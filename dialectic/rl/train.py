@@ -1,3 +1,4 @@
+import sys
 import time
 import warnings
 from copy import deepcopy
@@ -87,7 +88,7 @@ def compute_logits_of_group(
 def compute_log_probs(
     *,
     net: BaseTransformer,
-    attention_mask: Integer[torch.Tensor, "B L_prompt"],
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
     completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
     pad_token_id: int,
     chunk_size: int = 0,
@@ -270,8 +271,8 @@ def generate_rollout_batch(
 
     tokenizer.enable_padding(direction="left")
     tokens = tokenizer.encode_batch(prompts)
-    attention_mask = (
-        torch.tensor([t.attention_mask for t in tokens], device=device) == 0
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
     )
     token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
@@ -387,9 +388,16 @@ def compute_grpo_loss(
     kl_loss = torch.exp(kl_diff) - kl_diff - 1
     kl_loss = torch.clamp(kl_loss, min=-10, max=10)
 
-    mask_sum = completion_mask.sum()
-    ppo_loss_scalar = -(ppo_obj * completion_mask).sum() / mask_sum
-    kl_loss_scalar = (kl_loss * completion_mask).sum() / mask_sum
+    # Normalize per-sequence to avoid length bias: longer sequences should not
+    # contribute more to the loss just because they have more tokens.
+    # Each sequence's contribution is its mean (over tokens), then we average
+    # across all sequences.
+    sequence_lengths = completion_mask.sum(dim=-1, keepdim=True)  # [B, G, 1]
+    ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+    kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+
+    ppo_loss_scalar = -ppo_obj_per_seq.mean()
+    kl_loss_scalar = kl_loss_per_seq.mean()
 
     loss = ppo_loss_scalar + beta * kl_loss_scalar
     return loss, ppo_loss_scalar.item(), kl_loss_scalar.item()
@@ -536,6 +544,7 @@ def train_grpo(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
 ) -> None:
     device = next(net.parameters()).device
     if use_bf16:
@@ -543,7 +552,6 @@ def train_grpo(
 
     n_episodes = 0
     step = 0
-    ref_net = deepcopy(net)
 
     while n_episodes < max_episodes:
         if step % update_ref_net_batch_cadence == 0:
@@ -692,3 +700,10 @@ def train_grpo(
                 },
                 step=step,
             )
+
+            if step % save_ckpt_freq == 0:
+                extty.save_checkpoint(
+                    step=step,
+                    state_dict=net.state_dict(),
+                    optimizer_state_dict=opt.state_dict(),
+                )

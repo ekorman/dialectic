@@ -12,9 +12,11 @@ import argparse
 import importlib.util
 import os
 import random
+import sys
 
 import extty
 import torch
+from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
 from dialectic.llm.qwen import load_qwen_06b
@@ -24,6 +26,8 @@ from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
+
+load_dotenv()
 
 
 def _is_modal_installed():
@@ -36,10 +40,6 @@ def _check_inside_modal_fn():
 
         return modal.current_function_call_id()
     return False
-
-
-bucket_name = "model-weights"
-r2_account_id = "a64c6da180648dd944675d311c296763"
 
 
 def get_state_to_str(enable_thinking: bool):
@@ -81,19 +81,22 @@ def train(
     max_tokens: int = 1024,
     lr: float = 1e-5,
     beta: float = 0.04,
-    weights_path: str = "/weights/qwen3-0.6b.pth",
-    tokenizer_path: str = "/weights/tokenizer.json",
+    weights_path: str = "/weights/qwen3/qwen3-0.6b.pth",
+    tokenizer_path: str = "/weights/qwen3/tokenizer.json",
     binary_reward: bool = False,
     n_larges: int = 2,
     n_total: int = 6,
     n_ops: int = 5,
     seed: int,
+    compile_model: bool = False,
     mu: int = 1,
     accumulation_steps: int = 16,
+    update_ref_net_batch_cadence: int = 100,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
+    save_ckpt_freq: int = sys.maxsize,
 ):
     torch.manual_seed(seed)
     net = load_qwen_06b()
@@ -101,11 +104,14 @@ def train(
         torch.load(weights_path, map_location=device, weights_only=True)
     )
 
+    if compile_model:
+        net.compile()
+
     print(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
     )
 
-    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
     if binary_reward:
         reward_fn = CountdownRewardFn()
@@ -145,7 +151,7 @@ def train(
             mu=mu,
             max_tokens_generated=max_tokens,
             max_episodes=max_episodes,
-            update_ref_net_batch_cadence=10,
+            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
             batch_size=batch_size,
             group_size=group_size,
             temperature=0.7,
@@ -153,6 +159,7 @@ def train(
             max_grad_norm=max_grad_norm,
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
         )
     finally:
         extty.finish()
@@ -166,11 +173,28 @@ if _is_modal_installed():
         "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
     )
 
+    # get `extty` variables
+    s3_conf = extty.S3Config.load()
+    if s3_conf is not None:
+        extty_env_dict = {
+            "EXTTY_S3_BUCKET": s3_conf.bucket,
+            "EXTTY_S3_PREFIX": s3_conf.prefix,
+            "EXTTY_S3_REGION": s3_conf.region,
+            "EXTTY_S3_ACCESS_KEY_ID": s3_conf.access_key_id,
+            "EXTTY_S3_SECRET_ACCESS_KEY": s3_conf.secret_access_key,
+            "EXTTY_S3_ENDPOINT_URL": s3_conf.endpoint_url,
+        }
+    else:
+        extty_env_dict = {}
+
     image = (
         modal.Image.debian_slim()
         .uv_sync()
         .add_local_python_source("dialectic", "extty")
     )
+
+    bucket_name = os.environ.get("WEIGHTS_BUCKET_NAME")
+    bucket_endpoint_url = os.environ.get("WEIGHTS_BUCKET_ENDPOINT_URL")
 
     train_modal = app.function(
         image=image,
@@ -178,12 +202,13 @@ if _is_modal_installed():
         volumes={
             "/weights": modal.CloudBucketMount(
                 bucket_name=bucket_name,
-                bucket_endpoint_url=f"https://{r2_account_id}.r2.cloudflarestorage.com",
+                bucket_endpoint_url=bucket_endpoint_url,
                 secret=secret,
                 read_only=True,
             )
         },
         timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
+        secrets=[modal.Secret.from_dict(extty_env_dict)],
     )(train)
 
 
@@ -203,11 +228,11 @@ def main():
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
     parser.add_argument(
-        "--weights-path", default="weights/qwen3-0.6b.pth", help="Path to model weights"
+        "--weights-path", default="qwen3/qwen3-0.6b.pth", help="Path to model weights"
     )
     parser.add_argument(
         "--tokenizer-path",
-        default="qwen-tokenizer/tokenizer.json",
+        default="qwen3/tokenizer.json",
         help="Path to tokenizer",
     )
     parser.add_argument(
@@ -240,6 +265,13 @@ def main():
         help="Chunk size for log prob computation (0 to disable chunking)",
     )
     parser.add_argument(
+        "--update-ref-net-batch-cadence",
+        type=int,
+        default=100,
+        help="How often to update the reference net",
+    )
+
+    parser.add_argument(
         "--use-bf16",
         action="store_true",
         default=True,
@@ -268,8 +300,16 @@ def main():
         "--seed",
         type=int,
         default=random.choice(range(1000)),
-        help="Chunk size for log prob computation (0 to disable chunking)",
+        help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--save-ckpt-freq",
+        type=int,
+        default=sys.maxsize,
+        help="How often to checkpoint",
+    )
+
+    parser.add_argument("--compile-model", action="store_true", help="compile model")
     args = parser.parse_args()
 
     train(
@@ -286,10 +326,12 @@ def main():
         n_ops=args.num_operands,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
+        update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
         use_qwen_thinking=args.use_qwen_thinking,
+        compile_model=args.compile_model,
     )
 
 

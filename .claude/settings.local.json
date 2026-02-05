@@ -20,7 +20,10 @@
       "Bash(python:*)",
       "Bash(source ~/.nvm/nvm.sh)",
       "Bash(ls:*)",
-      "Bash(uv run pyright:*)"
+      "Bash(uv run pyright:*)",
+      "Bash(gh api:*)",
+      "Bash(gh search code:*)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }
