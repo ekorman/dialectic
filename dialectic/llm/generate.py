@@ -1,5 +1,6 @@
 import sys
-from typing import Callable, Literal
+from abc import abstractmethod
+from typing import Literal
 
 import torch
 from jaxtyping import Float, Int
@@ -15,7 +16,74 @@ from dialectic.llm.templates import (
 )
 
 
-class HardGenerationState:
+class BaseTokenGenerator:
+    @abstractmethod
+    def init_state(
+        self,
+        initial_input: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ): ...
+
+    @abstractmethod
+    def get_next_inputs(
+        self, logits: Float[torch.Tensor, "B 1 V"]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
+
+    @property
+    @abstractmethod
+    def finished(self) -> bool: ...
+
+    def generate(
+        self,
+        net: BaseTransformer,
+        token_ids: Int[Tensor, "B L"],
+        max_tokens_generated: int = sys.maxsize,
+        use_kv_cache: bool = True,
+        attention_mask: torch.Tensor | None = None,  # should be left-padded
+        use_bf16: bool = False,
+    ):
+        if use_kv_cache:
+            kv_caches = [
+                KVCache(
+                    max_seq_len=max_tokens_generated + token_ids.shape[1],
+                    num_heads=net.attn_num_kv_heads,
+                    head_dim=net.attn_head_d,
+                    device=next(net.parameters()).device,
+                )
+                for _ in range(len(net.layers))
+            ]
+        else:
+            kv_caches = None
+
+        device = token_ids.device
+        self.init_state(token_ids, attention_mask)
+
+        input_tokens = token_ids
+        tokens_generated = 0
+        while tokens_generated < max_tokens_generated:
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                logits: Float[torch.Tensor, "B 1 V"] = net(
+                    input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
+                )
+
+            all_inputs, attention_mask = self.get_next_inputs(logits)
+
+            if all_inputs is None:
+                break
+
+            if use_kv_cache:
+                input_tokens = all_inputs[:, -1:]
+            else:
+                input_tokens = all_inputs
+
+            tokens_generated += 1
+
+        return self.all_inputs
+
+
+class HardGenerator(BaseTokenGenerator):
     # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
@@ -29,7 +97,7 @@ class HardGenerationState:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
-    def init(
+    def init_state(
         self,
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
@@ -73,7 +141,7 @@ class HardGenerationState:
         return bool(self._finished.all())
 
 
-class SoftGenerationState:
+class SoftGenerator(BaseTokenGenerator):
     # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
@@ -87,7 +155,7 @@ class SoftGenerationState:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
-    def init(
+    def init_state(
         self,
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
@@ -149,7 +217,6 @@ def generate_from_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     soft_tokens: bool = False,
-    prefill_callback: Callable[[Int[Tensor, "B L"]], Int[Tensor, "B L"]] = lambda x: x,
 ) -> Int[Tensor, "B L"]:
     if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
@@ -157,58 +224,24 @@ def generate_from_tokens(
     if pad_token_id is None:
         pad_token_id = eos_token_id
 
-    if use_kv_cache:
-        kv_caches = [
-            KVCache(
-                max_seq_len=max_tokens_generated + token_ids.shape[1],
-                num_heads=net.attn_num_kv_heads,
-                head_dim=net.attn_head_d,
-                device=next(net.parameters()).device,
-            )
-            for _ in range(len(net.layers))
-        ]
-    else:
-        kv_caches = None
-
-    device = token_ids.device
     if soft_tokens:
-        state = SoftGenerationState(
+        return SoftGenerator(
+            vocab_size=net.vocab_size,
+            temperature=temperature,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
-            temperature=temperature,
-            vocab_size=net.vocab_size,
+        ).generate(
+            net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
         )
     else:
-        state = HardGenerationState(
+        return HardGenerator(
+            sampling_strategy=sampling_strategy,
+            temperature=temperature,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
-            temperature=temperature,
+        ).generate(
+            net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
         )
-    state.init(token_ids, attention_mask)
-
-    input_tokens = token_ids
-    tokens_generated = 0
-    while tokens_generated < max_tokens_generated:
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-        ):
-            logits: Float[torch.Tensor, "B 1 V"] = net(
-                input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
-            )
-
-        all_inputs, attention_mask = state.get_next_inputs(logits)
-
-        if all_inputs is None:
-            break
-
-        if use_kv_cache:
-            input_tokens = all_inputs[:, -1:]
-        else:
-            input_tokens = all_inputs
-
-        tokens_generated += 1
-
-    return state.all_inputs
 
 
 def generate_from_text(
