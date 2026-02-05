@@ -19,8 +19,6 @@ class HardGenerationState:
     # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
-        batch_size: int,
-        device,
         sampling_strategy: Literal["greedy", "sample"] | None = "sample",
         temperature: float = 1.0,
         eos_token_id: int = 151645,
@@ -28,7 +26,6 @@ class HardGenerationState:
     ):
         self.sampling_strategy = sampling_strategy
         self.temperature = temperature
-        self._finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
 
@@ -39,6 +36,9 @@ class HardGenerationState:
     ):
         self.all_inputs = initial_input
         self.attention_mask = attention_mask
+        self._finished = torch.zeros(
+            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
+        )
 
     def get_next_inputs(
         self, logits: Float[torch.Tensor, "B 1 V"]
@@ -77,15 +77,12 @@ class SoftGenerationState:
     # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
-        batch_size: int,
-        device,
         vocab_size: int,
         temperature: float = 1.0,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
     ):
         self.vocab_size = vocab_size
-        self._finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         self.temperature = temperature
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
@@ -100,6 +97,9 @@ class SoftGenerationState:
             initial_input, self.vocab_size
         ).float()
         self.attention_mask = attention_mask
+        self._finished = torch.zeros(
+            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
+        )
 
     def get_next_inputs(
         self, logits: Float[torch.Tensor, "B 1 V"]
@@ -173,20 +173,16 @@ def generate_from_tokens(
     device = token_ids.device
     if soft_tokens:
         state = SoftGenerationState(
-            batch_size=token_ids.shape[0],
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
-            device=device,
             temperature=temperature,
             vocab_size=net.vocab_size,
         )
     else:
         state = HardGenerationState(
-            batch_size=token_ids.shape[0],
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             temperature=temperature,
-            device=device,
         )
     state.init(token_ids, attention_mask)
 
