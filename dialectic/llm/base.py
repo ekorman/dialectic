@@ -53,7 +53,7 @@ class BaseTransformer(nn.Module):
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
     ):
-        if isinstance(x, torch.LongTensor):
+        if x.dtype == torch.int64:
             x = self.embed_tokens(x)  # [B, L, D]
         else:
             # soft-tokens, x is shape [B, L, V]
