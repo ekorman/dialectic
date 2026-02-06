@@ -154,7 +154,6 @@ class BaseTokenGenerator:
 
 
 class HardGenerator(BaseTokenGenerator):
-    # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
         sampling_strategy: Literal["greedy", "sample"] | None = "sample",
@@ -219,7 +218,6 @@ class HardGenerator(BaseTokenGenerator):
 
 
 class SoftGenerator(BaseTokenGenerator):
-    # if we want pre-filling conditions then we need to track everything...
     def __init__(
         self,
         vocab_size: int,
