@@ -73,17 +73,21 @@ def check_and_apply_prefill(
 
 
 class BaseTokenGenerator:
-    @abstractmethod
     def init_state(
         self,
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
-    ): ...
+    ):
+        self.all_inputs = initial_input
+        self.attention_mask = attention_mask
+        self._finished = torch.zeros(
+            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
+        )
+        self.n_generated = 0
+        return self
 
     @abstractmethod
-    def get_next_inputs(
-        self, logits: Float[torch.Tensor, "B 1 V"]
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
+    def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool: ...
 
     @property
     @abstractmethod
@@ -121,26 +125,28 @@ class BaseTokenGenerator:
         self.init_state(token_ids, attention_mask)
 
         input_tokens = token_ids
-        tokens_generated = 0
-        while tokens_generated < max_tokens_generated:
+
+        while self.n_generated < max_tokens_generated:
             with torch.autocast(
                 device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
             ):
                 logits: Float[torch.Tensor, "B 1 V"] = net(
-                    input_tokens, kv_caches=kv_caches, attention_mask=attention_mask
+                    input_tokens,
+                    kv_caches=kv_caches,
+                    attention_mask=self.attention_mask,
                 )
 
-            all_inputs, attention_mask = self.get_next_inputs(logits)
+            is_done = self.get_next_inputs(logits)
 
-            if all_inputs is None:
+            if is_done:
                 break
 
             if use_kv_cache:
-                input_tokens = all_inputs[:, -1:]
+                input_tokens = self.all_inputs[:, -1:]
             else:
-                input_tokens = all_inputs
+                input_tokens = self.all_inputs
 
-            tokens_generated += 1
+            self.n_generated += 1
 
         return self.get_all_tensors()
 
@@ -192,7 +198,7 @@ class HardGenerator(BaseTokenGenerator):
 
         self._finished = self._finished | (self.all_inputs[:, -1] == self.eos_token_id)
         if self.finished:
-            return None, None
+            return True
 
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
@@ -211,9 +217,9 @@ class HardGenerator(BaseTokenGenerator):
             )
 
             if self.finished:
-                return None, None
+                return True
 
-        return self.all_inputs, self.attention_mask
+        return False
 
     def get_all_tensors(self) -> torch.Tensor:
         return self.all_inputs
@@ -242,18 +248,24 @@ class SoftGenerator(BaseTokenGenerator):
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ):
+        super().init_state(initial_input=initial_input, attention_mask=attention_mask)
+
         self.shadow_seq = initial_input
         self.all_inputs = torch.nn.functional.one_hot(
-            initial_input, self.vocab_size
+            self.all_inputs, self.vocab_size
         ).float()
-        self.attention_mask = attention_mask
-        self._finished = torch.zeros(
-            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
-        )
 
-    def get_next_inputs(
-        self, logits: Float[torch.Tensor, "B 1 V"]
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        self.switched_to_hard_tokens_step = None
+
+    def _check_if_switch_to_hard(self):
+        # do check, update _generating_soft_tokens
+        if self.switched_to_hard_tokens_step is not None:
+            return True
+        # check for update
+
+        return self.switched_to_hard_tokens_step is not None
+
+    def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
         next_token = probs  # need .detach()?
@@ -274,12 +286,12 @@ class SoftGenerator(BaseTokenGenerator):
         self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
 
         if self.finished:
-            return None, None
+            return True
 
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
-        return self.all_inputs, self.attention_mask
+        return False
 
     def get_all_tensors(self) -> torch.Tensor:
         return self.all_inputs
