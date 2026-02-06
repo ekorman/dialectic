@@ -1,9 +1,9 @@
 import sys
 from abc import abstractmethod
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from attr import dataclass
 from jaxtyping import Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
