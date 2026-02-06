@@ -28,20 +28,28 @@ class PreFill:
 
 
 def check_and_apply_prefill(
-    token_ids: Int[torch.Tensor, "B L"], prefill: PreFill, pad_token_id: int
+    token_ids: Int[torch.Tensor, "B L"],
+    prefill: PreFill,
+    pad_token_id: int,
+    attention_mask: torch.Tensor | None,
 ):
     """Checks a batch of token ids and if any match the prefill condition, prefills it and then pads
     the ones not meeting the condition
     """
+    if attention_mask is not None:
+        if token_ids.shape != attention_mask.shape:
+            raise RuntimeError(
+                "`token_ids` and `attention_mask` should have the same shape."
+            )
     if len(token_ids) < len(prefill.condition):
-        return token_ids
+        return token_ids, attention_mask
 
     # check if there are any elements in the batch meeting the condition
     cond_met = (
         token_ids[:, -len(prefill.condition) :] == prefill.condition.unsqueeze(0)
     ).all(1)
     if not cond_met.any():
-        return token_ids
+        return token_ids, attention_mask
 
     new_tensors = torch.where(
         cond_met.unsqueeze(-1),
@@ -49,7 +57,19 @@ def check_and_apply_prefill(
         torch.full_like(prefill.filling, pad_token_id).unsqueeze(0),
     )
 
-    return torch.cat([token_ids, new_tensors], -1)
+    if attention_mask is not None:
+        new_attention_mask = torch.where(
+            cond_met.unsqueeze(-1),
+            torch.ones_like(new_tensors, dtype=torch.bool),
+            torch.zeros_like(new_tensors, dtype=torch.bool),
+        )
+
+        attention_mask = torch.cat(
+            [attention_mask, new_attention_mask],
+            1,
+        )
+
+    return torch.cat([token_ids, new_tensors], -1), attention_mask
 
 
 class BaseTokenGenerator:
@@ -133,11 +153,13 @@ class HardGenerator(BaseTokenGenerator):
         temperature: float = 1.0,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
+        prefill: PreFill | None = None,
     ):
         self.sampling_strategy = sampling_strategy
         self.temperature = temperature
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
+        self.prefill = prefill
 
     def init_state(
         self,
@@ -166,16 +188,31 @@ class HardGenerator(BaseTokenGenerator):
             next_token,
         )
 
-        self._finished = self._finished | (next_token.squeeze(-1) == self.eos_token_id)
-
         self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
 
+        self._finished = self._finished | (self.all_inputs[:, -1] == self.eos_token_id)
         if self.finished:
             return None, None
 
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
+
+        if self.prefill:
+            self.all_inputs, self.attention_mask = check_and_apply_prefill(
+                token_ids=self.all_inputs,
+                prefill=self.prefill,
+                pad_token_id=self.pad_token_id,
+                attention_mask=self.attention_mask,
+            )
+
+            self._finished = self._finished | (
+                self.all_inputs[:, -1] == self.eos_token_id
+            )
+
+            if self.finished:
+                return None, None
+
         return self.all_inputs, self.attention_mask
 
     def get_all_tensors(self) -> torch.Tensor:

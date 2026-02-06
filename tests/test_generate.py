@@ -234,8 +234,11 @@ def test_prefill_pos():
         ]
     )
 
-    prefilled = check_and_apply_prefill(
-        token_ids=token_ids, prefill=prefill, pad_token_id=-1
+    prefilled, attention_mask = check_and_apply_prefill(
+        token_ids=token_ids,
+        prefill=prefill,
+        pad_token_id=-1,
+        attention_mask=torch.ones_like(token_ids, dtype=torch.bool),
     )
 
     assert (
@@ -246,6 +249,13 @@ def test_prefill_pos():
                 [1, 3, 2, 4, 30, 100],
                 [0, 2, 4, 7, -1, -1],
             ]
+        )
+    ).all()
+
+    assert (
+        attention_mask
+        == torch.tensor(
+            [[True] * 4 + [False, False], [True] * 6, [True] * 4 + [False, False]]
         )
     ).all()
 
@@ -261,8 +271,136 @@ def test_prefill_no_op():
         ]
     )
 
-    prefilled = check_and_apply_prefill(
-        token_ids=token_ids, prefill=prefill, pad_token_id=-1
+    prefilled, _ = check_and_apply_prefill(
+        token_ids=token_ids, prefill=prefill, pad_token_id=-1, attention_mask=None
     )
 
     assert (prefilled == token_ids).all()
+
+
+def test_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
+    """When using prefill with an attention mask (left-padded batch), the output
+    for each batch element should match what we'd get running them individually.
+
+    This tests the tricky case where:
+    - Batch element 0 has left-padding (shorter prompt)
+    - Batch element 1 has no padding (longer prompt)
+    - Only element 0 triggers the prefill condition
+    - Element 1 gets pad tokens for those positions with attention_mask=False
+
+    The key correctness check: element 1's output should be identical to running
+    it individually, proving the prefill padding didn't corrupt its KV cache.
+    """
+    from dialectic.llm.generate import HardGenerator, PreFill
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    pad_token_id = 0
+    eos_token_id = -1
+
+    x1 = torch.randint(1, vocab_size, size=(1, 4))
+    x2 = torch.randint(1, vocab_size, size=(1, 7))
+
+    out1 = HardGenerator(
+        sampling_strategy="greedy",
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    ).generate(
+        net=model,
+        token_ids=x1,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+    )
+
+    generated1 = out1[0, x1.shape[1] :]
+    trigger = generated1[:3]
+    fill = generated1[3:5]
+
+    out2 = HardGenerator(
+        sampling_strategy="greedy",
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    ).generate(
+        net=model,
+        token_ids=x2,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+    )
+
+    x_batched = torch.full((2, 7), pad_token_id, dtype=torch.long)
+    x_batched[0, 3:] = x1
+    x_batched[1] = x2
+
+    attention_mask = torch.ones(2, 7, dtype=torch.bool)
+    attention_mask[0, :3] = False
+
+    prefill = PreFill(condition=trigger, filling=fill)
+
+    out_batched = HardGenerator(
+        sampling_strategy="greedy",
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net=model,
+        token_ids=x_batched,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+        attention_mask=attention_mask,
+    )
+
+    assert (out1[0] == out_batched[0, 3:]).all(), (
+        "Batch element 0 (with prefill) doesn't match individual generation"
+    )
+    assert (out2[0] == out_batched[1]).all(), (
+        "Batch element 1 (no prefill) doesn't match individual generation. "
+        "Prefill padding may have corrupted the KV cache or attention mask."
+    )
+
+
+def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
+    """Without KV cache, the full sequence is passed each time. This tests that
+    prefill works correctly in this mode and produces identical output to running
+    with the fill tokens naturally generated.
+    """
+    from dialectic.llm.generate import HardGenerator, PreFill
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    pad_token_id = 0
+    eos_token_id = -1
+
+    x = torch.randint(1, vocab_size, size=(1, 4))
+
+    out_normal = HardGenerator(
+        sampling_strategy="greedy",
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=20,
+        use_kv_cache=False,
+    )
+
+    generated = out_normal[0, x.shape[1] :]
+    trigger = generated[:3]
+    fill = generated[3:5]
+
+    prefill = PreFill(condition=trigger, filling=fill)
+
+    out_prefill = HardGenerator(
+        sampling_strategy="greedy",
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=20,
+        use_kv_cache=False,
+    )
+
+    torch.testing.assert_close(out_normal, out_prefill)
