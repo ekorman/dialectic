@@ -117,7 +117,7 @@ def test_soft_tokens_generation(tiny_model: BaseTransformer):
         eos_token_id=-1,
         pad_token_id=2,
         max_tokens_generated=24,
-        use_kv_cache=False,
+        use_kv_cache=True,
         sampling_strategy=None,
         soft_tokens=True,
     )
@@ -404,3 +404,186 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
     )
 
     torch.testing.assert_close(out_normal, out_prefill)
+
+
+def _is_one_hot(tensor: torch.Tensor, tol: float = 1e-6) -> bool:
+    """Check if a tensor is approximately one-hot encoded."""
+    max_val = tensor.max()
+    num_ones = (tensor > 1 - tol).sum()
+    num_zeros = (tensor < tol).sum()
+    return abs(max_val - 1.0) < tol and num_ones == 1 and num_zeros == len(tensor) - 1
+
+
+def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
+    """After the switch condition is met, generated tokens should be one-hot
+    (hard) instead of soft probability distributions.
+    """
+    from dialectic.llm.generate import SoftGenerator
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+
+    x = torch.randint(1, vocab_size, size=(1, 4))
+
+    out_no_switch = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=None,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+
+    generated_no_switch = out_no_switch[0, x.shape[1] :]
+    shadow_tokens = generated_no_switch.argmax(-1)
+    switch_condition = shadow_tokens[:3]
+
+    out_with_switch = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=switch_condition,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+
+    generated_with_switch = out_with_switch[0, x.shape[1] :]
+
+    for i in range(3):
+        token_dist = generated_with_switch[i]
+        assert not _is_one_hot(token_dist), (
+            f"Token {i} should be soft (before switch condition met)"
+        )
+
+    for i in range(3, 10):
+        token_dist = generated_with_switch[i]
+        assert _is_one_hot(token_dist), (
+            f"Token {i} should be one-hot (after switch condition met)"
+        )
+
+
+def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer):
+    """In a batch, different elements may hit the switch condition at different
+    times. Each element should switch independently.
+    """
+    from dialectic.llm.generate import SoftGenerator
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+
+    x1 = torch.randint(1, vocab_size, size=(1, 4))
+    x2 = torch.randint(1, vocab_size, size=(1, 4))
+
+    out1 = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+    ).generate(
+        net=model,
+        token_ids=x1,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+    shadow1 = out1[0, x1.shape[1] :].argmax(-1)
+
+    out2 = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+    ).generate(
+        net=model,
+        token_ids=x2,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+    shadow2 = out2[0, x2.shape[1] :].argmax(-1)
+
+    switch_condition = shadow1[:2]
+
+    switch_step_1 = 2
+    switch_step_2 = None
+    for i in range(10 - len(switch_condition)):
+        if (shadow2[i : i + len(switch_condition)] == switch_condition).all():
+            switch_step_2 = i + len(switch_condition)
+            break
+
+    x_batched = torch.cat([x1, x2], dim=0)
+
+    out_batched = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=switch_condition,
+    ).generate(
+        net=model,
+        token_ids=x_batched,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+
+    generated_batched = out_batched[:, x1.shape[1] :]
+
+    for i in range(switch_step_1):
+        assert not _is_one_hot(generated_batched[0, i]), (
+            f"Batch 0, token {i}: should be soft (before switch)"
+        )
+    for i in range(switch_step_1, 10):
+        assert _is_one_hot(generated_batched[0, i]), (
+            f"Batch 0, token {i}: should be hard (after switch)"
+        )
+
+    if switch_step_2 is not None:
+        for i in range(switch_step_2):
+            assert not _is_one_hot(generated_batched[1, i]), (
+                f"Batch 1, token {i}: should be soft (before switch)"
+            )
+        for i in range(switch_step_2, 10):
+            assert _is_one_hot(generated_batched[1, i]), (
+                f"Batch 1, token {i}: should be hard (after switch)"
+            )
+    else:
+        for i in range(10):
+            assert not _is_one_hot(generated_batched[1, i]), (
+                f"Batch 1, token {i}: should be soft (never switched)"
+            )
+
+
+def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer):
+    """Without a switch condition, all generated tokens should remain soft
+    (not one-hot).
+    """
+    from dialectic.llm.generate import SoftGenerator
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+
+    x = torch.randint(1, vocab_size, size=(1, 4))
+
+    out = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=None,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=10,
+        use_kv_cache=True,
+    )
+
+    generated = out[0, x.shape[1] :]
+
+    for i in range(10):
+        token_dist = generated[i]
+        assert not _is_one_hot(token_dist), (
+            f"Token {i} should be soft (no switch condition set)"
+        )

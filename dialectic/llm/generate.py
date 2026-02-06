@@ -79,9 +79,11 @@ class BaseTokenGenerator:
         attention_mask: torch.Tensor | None,
     ):
         self.all_inputs = initial_input
+        self.device = initial_input.device
+        self.batch_size = initial_input.shape[0]
         self.attention_mask = attention_mask
         self._finished = torch.zeros(
-            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
+            initial_input.shape[0], dtype=torch.bool, device=self.device
         )
         self.n_generated = 0
         return self
@@ -167,20 +169,7 @@ class HardGenerator(BaseTokenGenerator):
         self.pad_token_id = pad_token_id
         self.prefill = prefill
 
-    def init_state(
-        self,
-        initial_input: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ):
-        self.all_inputs = initial_input
-        self.attention_mask = attention_mask
-        self._finished = torch.zeros(
-            initial_input.shape[0], dtype=torch.bool, device=initial_input.device
-        )
-
-    def get_next_inputs(
-        self, logits: Float[torch.Tensor, "B 1 V"]
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
         if self.sampling_strategy == "greedy":
             next_token = logits.argmax(-1)
         else:
@@ -237,11 +226,18 @@ class SoftGenerator(BaseTokenGenerator):
         temperature: float = 1.0,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
+        switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
     ):
+        """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
+        determines when to switch from soft token generation to hard token generation: once
+        the shadow token sequence ends with `switch_to_hard_tokens_condition` we start sampling
+        hard tokens. note to keep the shape the same as the soft tokens, we will one-hot encode them
+        """
         self.vocab_size = vocab_size
         self.temperature = temperature
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
+        self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
 
     def init_state(
         self,
@@ -254,18 +250,18 @@ class SoftGenerator(BaseTokenGenerator):
         self.all_inputs = torch.nn.functional.one_hot(
             self.all_inputs, self.vocab_size
         ).float()
+        if self.switch_to_hard_tokens_condition is not None:
+            self.switch_to_hard_tokens_condition = (
+                self.switch_to_hard_tokens_condition.to(self.device)
+            )
+            # batch size length tensor for when we moved to hard token sampling
+            self.switched_to_hard_tokens_step = -1 * torch.ones(
+                self.batch_size, dtype=torch.int64, device=self.device
+            )
 
-        self.switched_to_hard_tokens_step = None
-
-    def _check_if_switch_to_hard(self):
-        # do check, update _generating_soft_tokens
-        if self.switched_to_hard_tokens_step is not None:
-            return True
-        # check for update
-
-        return self.switched_to_hard_tokens_step is not None
-
+    # TODO: rename this to update inputs?
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
+        # TODO: need to check prefill
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
         next_token = probs  # need .detach()?
@@ -277,7 +273,33 @@ class SoftGenerator(BaseTokenGenerator):
             ),
             next_token,
         )
+
         hard_token_id = next_token.argmax(-1)
+
+        if self.switch_to_hard_tokens_condition is not None:
+            # update self.switched_to_hard_tokens_step
+            cond_met = (
+                self.shadow_seq[:, -len(self.switch_to_hard_tokens_condition) :]
+                == self.switch_to_hard_tokens_condition
+            ).all(1)
+            self.switched_to_hard_tokens_step = torch.where(
+                cond_met & (self.switched_to_hard_tokens_step == -1),
+                self.n_generated,
+                self.switched_to_hard_tokens_step,
+            )
+
+            # update next_token to one-hot where self.switched_to_hard_tokens_step > -1
+            # next_token = torch.nn.functional.one_hot(hard_token_id, logits.shape[-1])
+            c = self.switched_to_hard_tokens_step > -1
+            if c.any():
+                next_token = torch.where(
+                    c.unsqueeze(-1).unsqueeze(-1),
+                    torch.nn.functional.one_hot(
+                        hard_token_id, num_classes=next_token.shape[-1]
+                    ),
+                    next_token,
+                )
+
         self._finished = self._finished | (
             hard_token_id.squeeze(-1) == self.eos_token_id
         )
