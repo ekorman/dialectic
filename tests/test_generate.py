@@ -2,6 +2,7 @@ import torch
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import (
+    HardGenerator,
     PreFill,
     check_and_apply_prefill,
     generate_from_tokens,
@@ -291,7 +292,6 @@ def test_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
     The key correctness check: element 1's output should be identical to running
     it individually, proving the prefill padding didn't corrupt its KV cache.
     """
-    from dialectic.llm.generate import HardGenerator, PreFill
 
     torch.manual_seed(42)
     model = tiny_model.eval()
