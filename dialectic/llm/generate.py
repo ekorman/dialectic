@@ -1,5 +1,5 @@
 import sys
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
@@ -70,7 +70,7 @@ def check_and_apply_prefill(
     return torch.cat([token_ids, new_tensors], -1), attention_mask
 
 
-class BaseTokenGenerator:
+class BaseTokenGenerator(ABC):
     def init_state(
         self,
         initial_input: torch.Tensor,
@@ -112,7 +112,7 @@ class BaseTokenGenerator:
         if use_kv_cache:
             kv_caches = [
                 KVCache(
-                    max_seq_len=(max_tokens_generated)
+                    max_seq_len=max_tokens_generated
                     * (1 + self._extra_tokens_per_step_bound)
                     + token_ids.shape[1],
                     num_heads=net.attn_num_kv_heads,
@@ -171,7 +171,7 @@ class BaseTokenGenerator:
             else:
                 input_tokens = self.all_inputs
 
-            self.n_generated += 1
+            self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
 
         return self.get_all_tensors()
 
@@ -299,17 +299,16 @@ class SoftGenerator(BaseTokenGenerator):
                 self.batch_size, dtype=torch.int64, device=self.device
             )
 
-    # TODO: rename this to update inputs?
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
-        # TODO: need to check prefill. that's a condition on the shadow sequence
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
-        next_token = probs  # need .detach()?
+        next_token = probs
 
         next_token = torch.where(
             self._finished.unsqueeze(-1).unsqueeze(-1),
             torch.nn.functional.one_hot(
-                torch.tensor(self.pad_token_id), logits.shape[-1]
+                torch.tensor(self.pad_token_id, device=logits.device),
+                logits.shape[-1],
             ),
             next_token,
         )
@@ -405,7 +404,7 @@ def generate_from_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     soft_tokens: bool = False,
-) -> Int[Tensor, "B L"]:
+) -> Int[Tensor, "B L"] | Float[Tensor, "B L V"]:
     if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 

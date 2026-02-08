@@ -53,11 +53,10 @@ class BaseTransformer(nn.Module):
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
     ):
-        if x.dtype == torch.int64:
+        if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
         else:
-            # soft-tokens, x is shape [B, L, V]
-            x = x @ self.embed_tokens.weight
+            x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
