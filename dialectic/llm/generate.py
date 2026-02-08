@@ -106,7 +106,6 @@ class BaseTokenGenerator:
         use_kv_cache: bool = True,
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
-        prefill: PreFill | None = None,
     ):
         if use_kv_cache:
             kv_caches = [
@@ -122,8 +121,6 @@ class BaseTokenGenerator:
             kv_caches = None
 
         device = token_ids.device
-        if prefill:
-            prefill = prefill.to(device)
         self.init_state(token_ids, attention_mask)
 
         input_tokens = token_ids
@@ -229,7 +226,8 @@ class SoftGenerator(BaseTokenGenerator):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
         the shadow token sequence ends with `switch_to_hard_tokens_condition` we start sampling
-        hard tokens. note to keep the shape the same as the soft tokens, we will one-hot encode them
+        hard tokens. note to keep the shape the same as the soft tokens, we will one-hot encode them.
+        this includes the prefilling
         """
         self.vocab_size = vocab_size
         self.temperature = temperature
@@ -259,7 +257,7 @@ class SoftGenerator(BaseTokenGenerator):
 
     # TODO: rename this to update inputs?
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
-        # TODO: need to check prefill
+        # TODO: need to check prefill. that's a condition on the shadow sequence
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
         next_token = probs  # need .detach()?
