@@ -4,6 +4,7 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import (
     HardGenerator,
     PreFill,
+    SoftGenerator,
     check_and_apply_prefill,
     generate_from_tokens,
 )
@@ -359,7 +360,6 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
     """Without KV cache, the full sequence is passed each time. This tests that
     prefill correctly inserts fill tokens that differ from the natural continuation.
     """
-    from dialectic.llm.generate import HardGenerator, PreFill
 
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -420,7 +420,6 @@ def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
     """After the switch condition is met, generated tokens should be one-hot
     (hard) instead of soft probability distributions.
     """
-    from dialectic.llm.generate import SoftGenerator
 
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -475,7 +474,6 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
     """In a batch, different elements may hit the switch condition at different
     times. Each element should switch independently.
     """
-    from dialectic.llm.generate import SoftGenerator
 
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -562,7 +560,6 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
     """Without a switch condition, all generated tokens should remain soft
     (not one-hot).
     """
-    from dialectic.llm.generate import SoftGenerator
 
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -589,3 +586,135 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
         assert not _is_one_hot(token_dist), (
             f"Token {i} should be soft (no switch condition set)"
         )
+
+
+def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
+    """Soft generator prefill should insert one-hot encoded fill tokens into the
+    output at the position where the shadow sequence matches the trigger.
+    """
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    pad_token_id = 0
+    eos_token_id = -1
+
+    x = torch.randint(1, vocab_size, size=(1, 4))
+
+    out_natural = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=20,
+        use_kv_cache=False,
+    )
+
+    shadow_tokens = out_natural[0, x.shape[1] :].argmax(-1)
+    trigger = shadow_tokens[:3]
+    natural_fill = shadow_tokens[3:5]
+    fill = (natural_fill + 1) % vocab_size
+    fill = torch.where(fill == pad_token_id, (fill + 1) % vocab_size, fill)
+
+    prefill = PreFill(condition=trigger, filling=fill)
+
+    out_prefill = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=20,
+        use_kv_cache=False,
+    )
+
+    torch.testing.assert_close(
+        out_prefill[0, : x.shape[1] + 3],
+        out_natural[0, : x.shape[1] + 3],
+        msg="Output before trigger should match natural generation",
+    )
+
+    fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
+    assert (out_prefill[0, x.shape[1] + 3 : x.shape[1] + 5] == fill_one_hot).all(), (
+        "Prefill did not fire: one-hot fill tokens not found after trigger"
+    )
+
+
+def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
+    """Soft generator prefill with a left-padded batch should fire for the
+    element that hits the condition, and the batched output for that element
+    should match its individual generation.
+    """
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    pad_token_id = 0
+    eos_token_id = -1
+
+    x1 = torch.randint(1, vocab_size, size=(1, 4))
+    x2 = torch.randint(1, vocab_size, size=(1, 7))
+
+    out1_natural = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+    ).generate(
+        net=model,
+        token_ids=x1,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+    )
+
+    shadow_tokens = out1_natural[0, x1.shape[1] :].argmax(-1)
+    trigger = shadow_tokens[:3]
+    natural_fill = shadow_tokens[3:5]
+    fill = (natural_fill + 1) % vocab_size
+    fill = torch.where(fill == pad_token_id, (fill + 1) % vocab_size, fill)
+
+    prefill = PreFill(condition=trigger, filling=fill)
+
+    out1 = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net=model,
+        token_ids=x1,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+    )
+
+    fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
+    assert (out1[0, x1.shape[1] + 3 : x1.shape[1] + 5] == fill_one_hot).all(), (
+        "Prefill did not fire: one-hot fill tokens not found after trigger"
+    )
+
+    x_batched = torch.full((2, 7), pad_token_id, dtype=torch.long)
+    x_batched[0, 3:] = x1
+    x_batched[1] = x2
+
+    attention_mask = torch.ones(2, 7, dtype=torch.bool)
+    attention_mask[0, :3] = False
+
+    out_batched = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net=model,
+        token_ids=x_batched,
+        max_tokens_generated=20,
+        use_kv_cache=True,
+        attention_mask=attention_mask,
+    )
+
+    torch.testing.assert_close(
+        out1[0],
+        out_batched[0, 3:],
+        msg="Batch element 0 (with prefill) doesn't match individual generation",
+    )

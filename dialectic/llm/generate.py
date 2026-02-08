@@ -25,6 +25,7 @@ class PreFill:
     def to(self, device: torch.device):
         self.condition = self.condition.to(device)
         self.filling = self.filling.to(device)
+        return self
 
 
 def check_and_apply_prefill(
@@ -64,10 +65,7 @@ def check_and_apply_prefill(
             torch.zeros_like(new_tensors, dtype=torch.bool),
         )
 
-        attention_mask = torch.cat(
-            [attention_mask, new_attention_mask],
-            1,
-        )
+        attention_mask = torch.cat([attention_mask, new_attention_mask], 1)
 
     return torch.cat([token_ids, new_tensors], -1), attention_mask
 
@@ -193,6 +191,15 @@ class HardGenerator(BaseTokenGenerator):
         self.pad_token_id = pad_token_id
         self.prefill = prefill
 
+    def init_state(
+        self,
+        initial_input: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ):
+        super().init_state(initial_input=initial_input, attention_mask=attention_mask)
+        if self.prefill is not None:
+            self.prefill = self.prefill.to(self.device)
+
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
         if self.sampling_strategy == "greedy":
             next_token = logits.argmax(-1)
@@ -256,6 +263,7 @@ class SoftGenerator(BaseTokenGenerator):
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
         switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
+        prefill: PreFill | None = None,
     ):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
@@ -268,6 +276,7 @@ class SoftGenerator(BaseTokenGenerator):
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
+        self.prefill = prefill
 
     def init_state(
         self,
@@ -275,7 +284,8 @@ class SoftGenerator(BaseTokenGenerator):
         attention_mask: torch.Tensor | None,
     ):
         super().init_state(initial_input=initial_input, attention_mask=attention_mask)
-
+        if self.prefill is not None:
+            self.prefill = self.prefill.to(self.device)
         self.shadow_seq = initial_input
         self.all_inputs = torch.nn.functional.one_hot(
             self.all_inputs, self.vocab_size
@@ -343,6 +353,29 @@ class SoftGenerator(BaseTokenGenerator):
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
+
+        if self.prefill:
+            self.shadow_seq, self.attention_mask = check_and_apply_prefill(
+                token_ids=self.shadow_seq,
+                prefill=self.prefill,
+                pad_token_id=self.pad_token_id,
+                attention_mask=self.attention_mask,
+            )
+
+            n_added = self.shadow_seq.shape[1] - self.all_inputs.shape[1]
+            if n_added > 0:
+                new_hard_tokens = self.shadow_seq[:, -n_added:]
+                new_hard_tokens = torch.nn.functional.one_hot(
+                    new_hard_tokens, self.vocab_size
+                )
+                self.all_inputs = torch.cat([self.all_inputs, new_hard_tokens], 1)
+
+            self._finished = self._finished | (
+                self.shadow_seq[:, -1] == self.eos_token_id
+            )
+            if self.finished:
+                return True
+
         return False
 
     def get_all_tensors(self) -> torch.Tensor:
@@ -351,6 +384,12 @@ class SoftGenerator(BaseTokenGenerator):
     @property
     def finished(self) -> bool:
         return bool(self._finished.all())
+
+    @property
+    def _extra_tokens_per_step_bound(self) -> int:
+        if self.prefill:
+            return len(self.prefill.filling)
+        return 0
 
 
 @torch.inference_mode()
