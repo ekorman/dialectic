@@ -41,7 +41,7 @@ def check_and_apply_prefill(
             raise RuntimeError(
                 "`token_ids` and `attention_mask` should have the same shape."
             )
-    if len(token_ids) < len(prefill.condition):
+    if token_ids.shape[1] < len(prefill.condition):
         return token_ids, attention_mask
 
     # check if there are any elements in the batch meeting the condition
@@ -98,6 +98,10 @@ class BaseTokenGenerator:
     @abstractmethod
     def get_all_tensors(self) -> torch.Tensor: ...
 
+    @property
+    def _extra_tokens_per_step_bound(self) -> int:
+        return 0
+
     def generate(
         self,
         net: BaseTransformer,
@@ -110,7 +114,9 @@ class BaseTokenGenerator:
         if use_kv_cache:
             kv_caches = [
                 KVCache(
-                    max_seq_len=max_tokens_generated + token_ids.shape[1],
+                    max_seq_len=(max_tokens_generated)
+                    * (1 + self._extra_tokens_per_step_bound)
+                    + token_ids.shape[1],
                     num_heads=net.attn_num_kv_heads,
                     head_dim=net.attn_head_d,
                     device=next(net.parameters()).device,
@@ -135,12 +141,28 @@ class BaseTokenGenerator:
                     attention_mask=self.attention_mask,
                 )
 
+            prev_len = self.all_inputs.shape[1]
             is_done = self.get_next_inputs(logits)
 
             if is_done:
                 break
 
             if use_kv_cache:
+                n_new = self.all_inputs.shape[1] - prev_len
+                for i in range(n_new - 1):
+                    mask = (
+                        self.attention_mask[:, : prev_len + i + 1]
+                        if self.attention_mask is not None
+                        else None
+                    )
+                    with torch.autocast(
+                        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+                    ):
+                        net(
+                            self.all_inputs[:, prev_len + i : prev_len + i + 1],
+                            kv_caches=kv_caches,
+                            attention_mask=mask,
+                        )
                 input_tokens = self.all_inputs[:, -1:]
             else:
                 input_tokens = self.all_inputs
@@ -208,6 +230,12 @@ class HardGenerator(BaseTokenGenerator):
 
     def get_all_tensors(self) -> torch.Tensor:
         return self.all_inputs
+
+    @property
+    def _extra_tokens_per_step_bound(self) -> int:
+        if self.prefill:
+            return len(self.prefill.filling)
+        return 0
 
     @property
     def finished(self) -> bool:
