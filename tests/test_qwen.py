@@ -22,31 +22,6 @@ from dialectic.llm.templates import Message
 torch.manual_seed(18)
 
 
-class MockGenerateModel(torch.nn.Module):
-    def __init__(self, token_schedule: list[torch.Tensor], vocab_size: int):
-        super().__init__()
-        self.token_schedule = token_schedule
-        self.vocab_size = vocab_size
-        self.step = 0
-        self.attn_num_kv_heads = 1
-        self.attn_head_d = 1
-        self.layers = torch.nn.ModuleList([torch.nn.Identity()])
-        self.dummy_param = torch.nn.Parameter(torch.zeros(1))
-
-    def forward(self, input_ids, kv_caches=None, attention_mask=None):
-        tokens = self.token_schedule[self.step].to(input_ids.device)
-        self.step += 1
-        batch_size = input_ids.shape[0]
-        assert tokens.shape[0] == batch_size
-        logits = torch.full(
-            (batch_size, 1, self.vocab_size),
-            fill_value=-1e4,
-            device=input_ids.device,
-        )
-        logits[torch.arange(batch_size), 0, tokens] = 0.0
-        return logits
-
-
 def test_qwen_decoder_layer():
     l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
     x = torch.rand(b, l, d)
@@ -357,7 +332,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     assert (out2 == out_batched[1:]).all()
 
 
-def test_generate_from_tokens_stopping_condition_partial_batch():
+def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel):
     pad_token_id = 0
     eos_token_id = 2
     vocab_size = 12
@@ -396,7 +371,7 @@ def test_generate_from_tokens_stopping_condition_partial_batch():
     assert (generated_tokens[:2] != eos_token_id).all()
 
 
-def test_generate_from_tokens_stopping_condition_full_batch():
+def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
     pad_token_id = 0
     eos_token_id = 2
     vocab_size = 12
@@ -464,7 +439,7 @@ def test_qwen_generate_temperature():
         eos_token_id=-1,
         max_tokens_generated=10,
         sampling_strategy="sample",
-        temperature=0.001,
+        temperature=0.00001,
     )
 
     torch.testing.assert_close(out_greedy, out_low_temp)

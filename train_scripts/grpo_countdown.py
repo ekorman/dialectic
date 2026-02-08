@@ -78,7 +78,7 @@ def train(
     max_episodes: int = 1000,
     batch_size: int = 2,
     group_size: int = 8,
-    max_tokens: int = 1024,
+    max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
     weights_path: str = "/weights/qwen3/qwen3-0.6b.pth",
@@ -241,7 +241,13 @@ def main():
         help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
     )
     parser.add_argument(
-        "--num-operands", type=int, default=2, help="Number of operands"
+        "--n-ops", type=int, default=5, help="Number of operands for Countdown"
+    )
+    parser.add_argument(
+        "--n-total", type=int, default=6, help="Number of large numbers for Countdown"
+    )
+    parser.add_argument(
+        "--n-larges", type=int, default=2, help="Number of operands for Countdown"
     )
     parser.add_argument(
         "--mu", type=int, default=1, help="Optimization passes per batch"
@@ -323,7 +329,9 @@ def main():
         weights_path=args.weights_path,
         tokenizer_path=args.tokenizer_path,
         binary_reward=args.binary_reward,
-        n_ops=args.num_operands,
+        n_larges=args.n_larges,
+        n_ops=args.n_ops,
+        n_total=args.n_total,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
@@ -332,6 +340,7 @@ def main():
         use_bf16=args.use_bf16,
         use_qwen_thinking=args.use_qwen_thinking,
         compile_model=args.compile_model,
+        seed=args.seed,
     )
 
 
