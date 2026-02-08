@@ -148,6 +148,12 @@ class BaseTokenGenerator:
                 break
 
             if use_kv_cache:
+                # When get_next_inputs adds >1 token (e.g. prefill), process
+                # the intermediate ones through the model to keep the KV cache
+                # in sync. Note: in batched generation, non-triggering elements
+                # get pad tokens here which shifts their RoPE positions. This is
+                # negligible for small fill lengths since the relative distances
+                # between the element's own real tokens are preserved.
                 n_new = self.all_inputs.shape[1] - prev_len
                 for i in range(n_new - 1):
                     mask = (
