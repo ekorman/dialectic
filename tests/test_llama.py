@@ -90,7 +90,7 @@ token.
 )
 @torch.no_grad()
 def test_llama_against_hf_generation():
-    tokenizer = Tokenizer.from_file("weights/llama3.2-tokenizer.json")
+    tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
     model = load_llama_1b()
 
