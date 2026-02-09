@@ -9,6 +9,9 @@
 - 'VC': vocab size
 """
 
+from safetensors.torch import load_file
+
+from dialectic.artifacts import Artifact, get_artifact, map_hf_key_to_dialectic
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import DecoderLayer
 
@@ -62,8 +65,14 @@ def create_qwen(
     )
 
 
-def load_qwen_06b() -> BaseTransformer:
-    return create_qwen(
+QWEN3_06B_WEIGHTS = Artifact(
+    url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/model.safetensors?download=true",
+    filename="qwen3-0.6b/model.safetensors",
+)
+
+
+def load_qwen_06b(pretrained_weights: bool = False) -> BaseTransformer:
+    net = create_qwen(
         d=1024,
         vocab_size=151936,
         n_decoder_layers=28,
@@ -73,3 +82,9 @@ def load_qwen_06b() -> BaseTransformer:
         mlp_hidden_d=3072,
         rope_base_value=1000000,
     )
+    if pretrained_weights:
+        sd = load_file(get_artifact(artifact=QWEN3_06B_WEIGHTS))
+        sd = {map_hf_key_to_dialectic(k): v for k, v in sd.items()}
+        net.load_state_dict(sd)
+
+    return net

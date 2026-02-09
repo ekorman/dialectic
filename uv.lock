@@ -299,6 +299,7 @@ dependencies = [
     { name = "extty" },
     { name = "jaxtyping" },
     { name = "python-dotenv" },
+    { name = "safetensors" },
     { name = "tokenizers" },
     { name = "torch" },
 ]
@@ -319,6 +320,7 @@ requires-dist = [
     { name = "extty", specifier = ">=0.7.0" },
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
+    { name = "safetensors", specifier = ">=0.7.0" },
     { name = "tokenizers", specifier = ">=0.22.1" },
     { name = "torch", specifier = ">=2.9.1" },
 ]
