@@ -92,18 +92,7 @@ token.
 def test_llama_against_hf_generation():
     tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
-    model = load_llama_1b()
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct", dtype=torch.float32
-    ).eval()
-
-    sd = hf_model.state_dict()
-
-    sd = {k[6:] if k.startswith("model.") else k: v for k, v in sd.items()}
-    model.load_state_dict(sd)
-
-    model.eval()
+    model = load_llama_1b(True).eval()
 
     messages = [[Message(role="user", content="Hello who are you?")]]
 

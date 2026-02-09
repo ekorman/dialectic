@@ -541,6 +541,8 @@ def test_tie_weights():
     )
 
     assert len(list(net2.parameters())) == 1 + len(list(net1.parameters()))
+    assert net1.lm_head.weight.data_ptr() == net1.embed_tokens.weight.data_ptr()
+    assert net2.lm_head.weight.data_ptr() != net2.embed_tokens.weight.data_ptr()
 
 
 @pytest.mark.skipif(
