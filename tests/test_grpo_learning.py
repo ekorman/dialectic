@@ -328,6 +328,7 @@ class TestGRPOMechanics:
                 attn_num_heads=4,
                 attn_num_kv_heads=2,
                 mlp_hidden_d=64,
+                tie_weights=True,
             )
             model.load_state_dict(base_state)
             env = FixedCountdownEnv(deepcopy(fixed_responses))

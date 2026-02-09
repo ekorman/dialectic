@@ -86,6 +86,7 @@ def create_model(
         attn_num_kv_heads=config.num_kv_heads,
         mlp_hidden_d=config.mlp_hidden_d,
         rope_base_value=config.rope_base_value,
+        tie_weights=True,
     )
     model = model.to(device).eval()
     if compiled:
