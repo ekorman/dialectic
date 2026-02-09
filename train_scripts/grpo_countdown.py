@@ -169,7 +169,7 @@ def train(
     if binary_reward:
         reward_fn = CountdownRewardFn()
     else:
-        reward_fn = CountdownWithFormatRewardFn(reasoning_tag)
+        reward_fn = CountdownWithFormatRewardFn(reasoning_tag, True)
 
     env = CountdownEnv(
         seed=seed,

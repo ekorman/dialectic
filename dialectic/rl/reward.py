@@ -291,13 +291,15 @@ class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
     Plus small length bonus (up to 0.05) to create variance between similar outputs.
     """
 
-    def __init__(self, thinking_tag_name: str):
+    def __init__(self, thinking_tag_name: str, thinking_tag_prefilled_open: bool):
         self._composite = CompositeRewardFn(
             [
                 CountdownCorrectComponent(),
                 CountdownParseableComponent(),
                 CountdownAnswerTagsComponent(),
-                CountdownThinkTagsComponent(thinking_tag_name),
+                CountdownThinkTagsComponent(
+                    thinking_tag_name, prefilled_open=thinking_tag_prefilled_open
+                ),
             ]
         )
 
