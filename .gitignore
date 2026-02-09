@@ -8,3 +8,5 @@ weights
 data
 weights
 .env
+.claude
+.exttyignore
