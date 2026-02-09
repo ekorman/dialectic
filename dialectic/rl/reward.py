@@ -122,14 +122,12 @@ class LengthBonusComponent(RewardComponent[T, E]):
 
 
 def _evaluate_and_verify_countdown(expr: str, numbers: list[int], target: int) -> bool:
-    used_numbers = [int(n) for n in re.findall(r"\d+", expr)]
+    if not re.match(r"^[\d+\-*/()\s]+$", expr):
+        return False
 
-    available = numbers.copy()
-    for n in used_numbers:
-        if n in available:
-            available.remove(n)
-        else:
-            return False
+    used_numbers = sorted(int(n) for n in re.findall(r"\d+", expr))
+    if used_numbers != sorted(numbers):
+        return False
 
     try:
         result = eval(expr, {"__builtins__": {}}, {})
@@ -217,14 +215,22 @@ class CountdownAnswerTagsComponent(RewardComponent[Countdown, str | None]):
         raw_model_output: str | None = None,
         extracted_model_output: str | None,
     ) -> float:
-        return 0.1 if extracted_model_output is not None else 0.0
+        if not raw_model_output:
+            return 0.0
+        if (
+            raw_model_output.count("<answer>") == 1
+            and raw_model_output.count("</answer>") == 1
+        ):
+            return 0.1
+        return 0.0
 
 
 class CountdownThinkTagsComponent(RewardComponent[Countdown, str | None]):
     """0.05 if has <think> tags."""
 
-    def __init__(self, tag_name: str):
+    def __init__(self, tag_name: str, prefilled_open: bool = False):
         self.tag_name = tag_name
+        self.prefilled_open = prefilled_open
 
     @property
     def name(self) -> str:
@@ -241,12 +247,19 @@ class CountdownThinkTagsComponent(RewardComponent[Countdown, str | None]):
         raw_model_output: str | None = None,
         extracted_model_output: str | None,
     ) -> float:
-        if (
-            raw_model_output
-            and f"<{self.tag_name}>" in raw_model_output
-            and f"</{self.tag_name}>" in raw_model_output
-        ):
-            return 0.05
+        if not raw_model_output:
+            return 0.0
+        open_tag = f"<{self.tag_name}>"
+        close_tag = f"</{self.tag_name}>"
+        if self.prefilled_open:
+            if raw_model_output.count(close_tag) == 1:
+                return 0.05
+        else:
+            if (
+                raw_model_output.count(open_tag) == 1
+                and raw_model_output.count(close_tag) == 1
+            ):
+                return 0.05
         return 0.0
 
 
@@ -278,13 +291,15 @@ class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
     Plus small length bonus (up to 0.05) to create variance between similar outputs.
     """
 
-    def __init__(self, thinking_tag_name: str):
+    def __init__(self, thinking_tag_name: str, thinking_tag_prefilled_open: bool):
         self._composite = CompositeRewardFn(
             [
                 CountdownCorrectComponent(),
                 CountdownParseableComponent(),
                 CountdownAnswerTagsComponent(),
-                CountdownThinkTagsComponent(thinking_tag_name),
+                CountdownThinkTagsComponent(
+                    thinking_tag_name, prefilled_open=thinking_tag_prefilled_open
+                ),
             ]
         )
 

@@ -393,8 +393,12 @@ def compute_grpo_loss(
     # Each sequence's contribution is its mean (over tokens), then we average
     # across all sequences.
     sequence_lengths = completion_mask.sum(dim=-1, keepdim=True)  # [B, G, 1]
-    ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
-    kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+    ppo_obj_per_seq = (ppo_obj * completion_mask).sum(
+        dim=-1, keepdim=True
+    ) / sequence_lengths
+    kl_loss_per_seq = (kl_loss * completion_mask).sum(
+        dim=-1, keepdim=True
+    ) / sequence_lengths
 
     ppo_loss_scalar = -ppo_obj_per_seq.mean()
     kl_loss_scalar = kl_loss_per_seq.mean()
@@ -642,12 +646,6 @@ def train_grpo(
         step += 1
         n_episodes += batch_size * accumulation_steps
 
-        all_output_strs = [
-            s
-            for g in range(group_size)
-            for mb in micro_batches
-            for s in mb["output_strs"][g]
-        ]
         all_output_strs_nested: list[list[str]] = [
             [mb["output_strs"][g][b] for g in range(group_size)]
             for mb in micro_batches

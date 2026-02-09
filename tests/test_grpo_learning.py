@@ -84,9 +84,9 @@ class TestComputeGRPOLoss:
         # With proper per-sequence normalization, both losses should be equal
         # because each sequence contributes its mean (which is the same since
         # log_probs are uniform and advantages are the same)
-        assert torch.isclose(
-            loss1, loss2, atol=1e-6
-        ), f"Loss should not depend on sequence length distribution: {loss1} vs {loss2}"
+        assert torch.isclose(loss1, loss2, atol=1e-6), (
+            f"Loss should not depend on sequence length distribution: {loss1} vs {loss2}"
+        )
 
     def test_length_bias_asymmetric_advantages(self):
         """Verify asymmetric advantages work correctly regardless of length.
@@ -553,7 +553,9 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_correct_answer(self):
         """Max selection: correct (1.0) beats all other accuracy components."""
-        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
+        reward_fn = CountdownWithFormatRewardFn(
+            thinking_tag_name="think", thinking_tag_prefilled_open=False
+        )
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -574,7 +576,9 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_parseable_only(self):
         """Max selection: parseable (0.3) wins when correct fails."""
-        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
+        reward_fn = CountdownWithFormatRewardFn(
+            thinking_tag_name="think", thinking_tag_prefilled_open=False
+        )
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -593,7 +597,9 @@ class TestCompositeRewardFn:
 
     def test_countdown_with_format_think_tags_only(self):
         """Max selection: think_tags (0.05) wins when no answer tags."""
-        reward_fn = CountdownWithFormatRewardFn(thinking_tag_name="think")
+        reward_fn = CountdownWithFormatRewardFn(
+            thinking_tag_name="think", thinking_tag_prefilled_open=True
+        )
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
