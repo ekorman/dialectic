@@ -6,6 +6,8 @@ dependencies = [
     "extty>=0.7.0",
     "jaxtyping>=0.3.3",
     "python-dotenv>=1.2.1",
+    "requests>=2.31.0",
+    "safetensors>=0.7.0",
     "tokenizers>=0.22.1",
     "torch>=2.9.1",
 ]

@@ -13,14 +13,22 @@ import importlib.util
 import os
 import random
 import sys
+from dataclasses import dataclass
+from typing import Callable
 
 import extty
 import torch
 from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
+from dialectic.artifacts import Artifact, get_artifact
+from dialectic.llm.llama import LLAMA_32_1B_TOKENIZER, load_llama_1b
 from dialectic.llm.qwen import load_qwen_06b
-from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
+from dialectic.llm.templates import (
+    Message,
+    get_llama_input_text_from_messages,
+    get_qwen_input_text_from_messages,
+)
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -28,6 +36,43 @@ from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
 
 load_dotenv()
+
+
+@dataclass
+class ModelInfo:
+    net_factory: Callable
+    tokenizer: str | Artifact
+    eos_token_id: int
+    pad_token_id: int
+    format_messages: Callable[[list[Message], bool], str]
+
+    def load_net(self):
+        return self.net_factory()
+
+    def load_tokenizer(self) -> Tokenizer:
+        if isinstance(self.tokenizer, str):
+            return Tokenizer.from_pretrained(self.tokenizer)
+        return Tokenizer.from_file(str(get_artifact(self.tokenizer)))
+
+
+MODEL_REGISTRY: dict[str, ModelInfo] = {
+    "qwen3-0.6b": ModelInfo(
+        net_factory=lambda: load_qwen_06b(True),
+        tokenizer="Qwen/Qwen3-0.6B",
+        eos_token_id=151645,
+        pad_token_id=151643,
+        format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
+            msgs, gen, enable_thinking=False
+        ),
+    ),
+    "llama-3.2-1b-instruct": ModelInfo(
+        net_factory=lambda: load_llama_1b(True),
+        tokenizer=LLAMA_32_1B_TOKENIZER,
+        eos_token_id=128009,
+        pad_token_id=128009,
+        format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
+    ),
+}
 
 
 def _is_modal_installed():
@@ -42,17 +87,16 @@ def _check_inside_modal_fn():
     return False
 
 
-def get_state_to_str(enable_thinking: bool):
+def get_state_to_str(
+    format_messages: Callable[[list[Message], bool], str],
+    reasoning_tag: str,
+):
     def _state_to_str(data: Countdown) -> str:
-        reasoning_tag = "think" if enable_thinking else "reasoning"
-        ret = get_qwen_input_text_from_messages(
+        ret = format_messages(
             [Message(role="user", content=data.prompt)],
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
+            True,
         )
-
         ret += f"Let me solve this step by step\n<{reasoning_tag}>"
-
         return ret
 
     return _state_to_str
@@ -74,6 +118,7 @@ MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 @extty.experiment(project="grpo-countdown", server=_check_inside_modal_fn)
 def train(
     *,
+    model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
     batch_size: int = 2,
@@ -81,8 +126,6 @@ def train(
     max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
-    weights_path: str = "/weights/qwen3/qwen3-0.6b.pth",
-    tokenizer_path: str = "/weights/qwen3/tokenizer.json",
     binary_reward: bool = False,
     n_larges: int = 2,
     n_total: int = 6,
@@ -98,11 +141,12 @@ def train(
     use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
 ):
+    assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
-    net = load_qwen_06b()
-    net.load_state_dict(
-        torch.load(weights_path, map_location=device, weights_only=True)
-    )
+
+    model_info = MODEL_REGISTRY[model_name]
+    net = model_info.load_net()
+    tokenizer = model_info.load_tokenizer()
 
     if compile_model:
         net.compile()
@@ -113,14 +157,19 @@ def train(
 
     opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
+    if use_qwen_thinking:
+        reasoning_tag = "think"
+
+        def format_messages(msgs: list[Message], gen: bool) -> str:
+            return get_qwen_input_text_from_messages(msgs, gen, enable_thinking=True)
+    else:
+        reasoning_tag = "reasoning"
+        format_messages = model_info.format_messages
+
     if binary_reward:
         reward_fn = CountdownRewardFn()
     else:
-        reward_fn = CountdownWithFormatRewardFn(
-            "think" if use_qwen_thinking else "reasoning"
-        )
-
-    tokenizer = Tokenizer.from_file(tokenizer_path)
+        reward_fn = CountdownWithFormatRewardFn(reasoning_tag)
 
     env = CountdownEnv(
         seed=seed,
@@ -133,7 +182,7 @@ def train(
     print(f"device: {device}")
     net = net.to(device)
 
-    state_to_str = get_state_to_str(enable_thinking=use_qwen_thinking)
+    state_to_str = get_state_to_str(format_messages, reasoning_tag)
 
     try:
         train_grpo(
@@ -143,8 +192,8 @@ def train(
             reward_fn=reward_fn,
             state_to_str=state_to_str,
             tokenizer=tokenizer,
-            eos_token_id=151645,  # <|im_end|>
-            pad_token_id=151643,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
             extractor=extract_from_answer_tags,
             beta=beta,
             eps=0.2,
@@ -169,9 +218,6 @@ if _is_modal_installed():
     import modal
 
     app = modal.App()
-    secret = modal.Secret.from_name(
-        "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
-    )
 
     # get `extty` variables
     s3_conf = extty.S3Config.load()
@@ -193,20 +239,9 @@ if _is_modal_installed():
         .add_local_python_source("dialectic", "extty")
     )
 
-    bucket_name = os.environ.get("WEIGHTS_BUCKET_NAME")
-    bucket_endpoint_url = os.environ.get("WEIGHTS_BUCKET_ENDPOINT_URL")
-
     train_modal = app.function(
         image=image,
         gpu="A100-80GB",
-        volumes={
-            "/weights": modal.CloudBucketMount(
-                bucket_name=bucket_name,
-                bucket_endpoint_url=bucket_endpoint_url,
-                secret=secret,
-                read_only=True,
-            )
-        },
         timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
         secrets=[modal.Secret.from_dict(extty_env_dict)],
     )(train)
@@ -214,6 +249,8 @@ if _is_modal_installed():
 
 def main():
     parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
+
+    parser.add_argument("--model", type=str, default="qwen3-0.6b")
     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
     parser.add_argument(
         "--max-episodes", type=int, default=1000, help="Max training episodes"
@@ -226,14 +263,6 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument(
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
-    )
-    parser.add_argument(
-        "--weights-path", default="qwen3/qwen3-0.6b.pth", help="Path to model weights"
-    )
-    parser.add_argument(
-        "--tokenizer-path",
-        default="qwen3/tokenizer.json",
-        help="Path to tokenizer",
     )
     parser.add_argument(
         "--binary-reward",
@@ -319,6 +348,7 @@ def main():
     args = parser.parse_args()
 
     train(
+        model_name=args.model,
         device=args.device,
         max_episodes=args.max_episodes,
         batch_size=args.batch_size,
@@ -326,8 +356,6 @@ def main():
         max_tokens=args.max_tokens,
         lr=args.lr,
         beta=args.beta,
-        weights_path=args.weights_path,
-        tokenizer_path=args.tokenizer_path,
         binary_reward=args.binary_reward,
         n_larges=args.n_larges,
         n_ops=args.n_ops,
