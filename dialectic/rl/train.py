@@ -653,9 +653,14 @@ def train_grpo(
             for mb in micro_batches
             for b in range(batch_size)
         ]
-        completion_len_mean = sum(len(s) for s in all_output_strs) / len(
-            all_output_strs
+        total_completion_tokens = sum(
+            mb["completion_mask"].sum().item() for mb in micro_batches
         )
+        total_completions = sum(
+            mb["completion_mask"].shape[0] * mb["completion_mask"].shape[1]
+            for mb in micro_batches
+        )
+        completion_token_len_mean = total_completion_tokens / total_completions
 
         all_prompts = [p for mb in micro_batches for p in mb["prompts"]]
         all_reward_results = [
@@ -688,7 +693,7 @@ def train_grpo(
                     "train/kl_loss": total_kl_loss / mu,
                     "train/reward_mean": all_rewards.mean().item(),
                     "train/reward_std": all_rewards.std().item(),
-                    "train/completion_len_mean": completion_len_mean,
+                    "train/completion_token_len_mean": completion_token_len_mean,
                     "train/example": examples,
                     "train/generation_time": t_gen_total,
                     "train/logprobs_time": t_logprobs_total,
