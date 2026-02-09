@@ -71,8 +71,13 @@ def create_llama(
 
 
 LLAMA_32_1B_INSTRUCT_WEIGHTS = Artifact(
-    url="",
+    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/model.safetensors",
     filename="llama-3.2-1b-instruct/model.safetensors",
+)
+
+LLAMA_32_1B_TOKENIZER = Artifact(
+    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/llama3.2-tokenizer.json",
+    filename="llama-3.2-1b-instruct/llama3.2-tokenizer.json",
 )
 
 

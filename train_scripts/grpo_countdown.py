@@ -21,7 +21,8 @@ import torch
 from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
-from dialectic.llm.llama import load_llama_1b
+from dialectic.artifacts import Artifact, get_artifact
+from dialectic.llm.llama import LLAMA_32_1B_TOKENIZER, load_llama_1b
 from dialectic.llm.qwen import load_qwen_06b
 from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
@@ -36,13 +37,22 @@ load_dotenv()
 @dataclass
 class ModelInfo:
     net_factory: Callable
-    tokenizer: str
+    tokenizer: str | Artifact
+
+    def load_net(self):
+        return self.net_factory()
+
+    def load_tokenizer(self):
+        if isinstance(self.tokenizer, str):
+            return Tokenizer.from_pretrained(self.tokenizer)
+        if isinstance(self.tokenizer, Artifact):
+            return Tokenizer.from_file(str(get_artifact(self.tokenizer)))
 
 
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(lambda: load_qwen_06b(True), "Qwen/Qwen3-0.6B"),
     "llama-3.2-1b-instruct": ModelInfo(
-        lambda: load_llama_1b(True), "meta-llama/Llama-3.2-1B-Instruct"
+        lambda: load_llama_1b(True), LLAMA_32_1B_TOKENIZER
     ),
 }
 
@@ -119,7 +129,7 @@ def train(
 
     model_info = MODEL_REGISTRY[model]
     net = model_info.net_factory()
-    tokenizer = Tokenizer.from_pretrained(model_info.tokenizer)
+    tokenizer = model_info.load_tokenizer()
 
     if compile_model:
         net.compile()

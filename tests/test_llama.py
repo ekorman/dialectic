@@ -90,7 +90,8 @@ token.
 )
 @torch.no_grad()
 def test_llama_against_hf_generation():
-    tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+    tokenizer = Tokenizer.from_file("weights/llama3.2-tokenizer.json")
+
     model = load_llama_1b()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
