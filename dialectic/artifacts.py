@@ -18,11 +18,14 @@ class Artifact:
 def get_artifact(artifact: Artifact) -> Path:
     local_path = WEIGHTS_CACHE / artifact.filename
     if not local_path.exists():
+        print(f"artifact {artifact} not found in cache, downloading, to {local_path}")
         local_path.parent.mkdir(parents=True, exist_ok=True)
         response = requests.get(artifact.url)
         response.raise_for_status()
         with open(local_path, "wb") as f:
             f.write(response.content)
+    else:
+        print(f"artfiact {artifact} found at {local_path}")
 
     return local_path
 

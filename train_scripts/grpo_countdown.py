@@ -13,12 +13,15 @@ import importlib.util
 import os
 import random
 import sys
+from dataclasses import dataclass
+from typing import Callable
 
 import extty
 import torch
 from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
+from dialectic.llm.llama import load_llama_1b
 from dialectic.llm.qwen import load_qwen_06b
 from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
@@ -28,6 +31,20 @@ from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
 from dialectic.rl.train import train_grpo
 
 load_dotenv()
+
+
+@dataclass
+class ModelInfo:
+    net_factory: Callable
+    tokenizer: str
+
+
+MODEL_REGISTRY: dict[str, ModelInfo] = {
+    "qwen3-0.6b": ModelInfo(lambda: load_qwen_06b(True), "Qwen/Qwen3-0.6B"),
+    "llama-3.2-1b-instruct": ModelInfo(
+        lambda: load_llama_1b(True), "meta-llama/Llama-3.2-1B-Instruct"
+    ),
+}
 
 
 def _is_modal_installed():
@@ -74,6 +91,7 @@ MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 @extty.experiment(project="grpo-countdown", server=_check_inside_modal_fn)
 def train(
     *,
+    model: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
     batch_size: int = 2,
@@ -81,8 +99,6 @@ def train(
     max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
-    weights_path: str = "/weights/qwen3/qwen3-0.6b.pth",
-    tokenizer_path: str = "/weights/qwen3/tokenizer.json",
     binary_reward: bool = False,
     n_larges: int = 2,
     n_total: int = 6,
@@ -98,11 +114,12 @@ def train(
     use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
 ):
+    assert model in MODEL_REGISTRY.keys()
     torch.manual_seed(seed)
-    net = load_qwen_06b()
-    net.load_state_dict(
-        torch.load(weights_path, map_location=device, weights_only=True)
-    )
+
+    model_info = MODEL_REGISTRY[model]
+    net = model_info.net_factory()
+    tokenizer = Tokenizer.from_pretrained(model_info.tokenizer)
 
     if compile_model:
         net.compile()
@@ -119,8 +136,6 @@ def train(
         reward_fn = CountdownWithFormatRewardFn(
             "think" if use_qwen_thinking else "reasoning"
         )
-
-    tokenizer = Tokenizer.from_file(tokenizer_path)
 
     env = CountdownEnv(
         seed=seed,
@@ -169,9 +184,6 @@ if _is_modal_installed():
     import modal
 
     app = modal.App()
-    secret = modal.Secret.from_name(
-        "r2-secret", required_keys=["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
-    )
 
     # get `extty` variables
     s3_conf = extty.S3Config.load()
@@ -193,20 +205,9 @@ if _is_modal_installed():
         .add_local_python_source("dialectic", "extty")
     )
 
-    bucket_name = os.environ.get("WEIGHTS_BUCKET_NAME")
-    bucket_endpoint_url = os.environ.get("WEIGHTS_BUCKET_ENDPOINT_URL")
-
     train_modal = app.function(
         image=image,
         gpu="A100-80GB",
-        volumes={
-            "/weights": modal.CloudBucketMount(
-                bucket_name=bucket_name,
-                bucket_endpoint_url=bucket_endpoint_url,
-                secret=secret,
-                read_only=True,
-            )
-        },
         timeout=60 * 60 * MODAL_TIMEOUT_HOURS,
         secrets=[modal.Secret.from_dict(extty_env_dict)],
     )(train)
@@ -214,6 +215,8 @@ if _is_modal_installed():
 
 def main():
     parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
+
+    parser.add_argument("--model", type=str, default="qwen3-0.6b")
     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
     parser.add_argument(
         "--max-episodes", type=int, default=1000, help="Max training episodes"
