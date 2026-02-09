@@ -518,23 +518,6 @@ The capital of France is **Paris**."""
         )
 
 
-def _load_qwen_06b_model():
-    model = load_qwen_06b()
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", dtype=torch.float32
-    ).eval()
-
-    def map_key(k: str):
-        if k.startswith("model"):
-            return k[6:]
-        return k
-
-    model.load_state_dict({map_key(k): v for k, v in hf_model.state_dict().items()})
-    model.eval()
-    return hf_model, model
-
-
 def test_tie_weights():
     net1 = create_qwen(
         d=32,
@@ -565,7 +548,10 @@ def test_tie_weights():
     reason="skipping `test_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
 def test_model_generation_against_qwen_06b():
-    hf_model, model = _load_qwen_06b_model()
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
+    model = load_qwen_06b(True).eval()
     _test_model_generation_against_qwen_06b(hf_model, model)
 
 
@@ -574,6 +560,9 @@ def test_model_generation_against_qwen_06b():
     reason="skipping `test_compiled_model_generation_against_qwen_06b` since env variable `TEST_LLM_AGAINST_HF` or TEST_COMPILED is not set",
 )
 def test_compiled_model_generation_against_qwen_06b():
-    hf_model, model = _load_qwen_06b_model()
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", dtype=torch.float32
+    ).eval()
+    model = load_qwen_06b(True).eval()
     model = torch.compile(model)
     _test_model_generation_against_qwen_06b(hf_model, model)

@@ -88,6 +88,11 @@ def load_qwen_06b(pretrained_weights: bool = False) -> BaseTransformer:
     if pretrained_weights:
         sd = load_file(get_artifact(artifact=QWEN3_06B_WEIGHTS))
         sd = {map_hf_key_to_dialectic(k): v for k, v in sd.items()}
+
+        if not (sd["lm_head.weight"] == sd["embed_tokens.weight"]).all():
+            raise ValueError(
+                "Expected `lm_head.weight` and `embed_tokens.weight` to be identical."
+            )
         net.load_state_dict(sd)
 
     return net
