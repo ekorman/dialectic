@@ -49,6 +49,7 @@ def create_qwen(
     attn_num_heads: int,
     attn_num_kv_heads: int,
     mlp_hidden_d: int,
+    tie_weights: bool,
     rope_base_value: int = 1000000,
 ):
     return BaseTransformer(
@@ -62,6 +63,7 @@ def create_qwen(
         rms_norm_eps=1e-6,
         rope_base_value=rope_base_value,
         decoder_layer_factory=create_qwen_decoder_layer,
+        tie_weights=tie_weights,
     )
 
 
@@ -81,6 +83,7 @@ def load_qwen_06b(pretrained_weights: bool = False) -> BaseTransformer:
         attn_num_kv_heads=8,
         mlp_hidden_d=3072,
         rope_base_value=1000000,
+        tie_weights=True,
     )
     if pretrained_weights:
         sd = load_file(get_artifact(artifact=QWEN3_06B_WEIGHTS))

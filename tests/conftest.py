@@ -37,6 +37,7 @@ def MockGenerateModel():
 
 @pytest.fixture
 def tiny_model():
+    torch.manual_seed(1000)
     return create_qwen(
         d=32,
         vocab_size=151936,
@@ -45,6 +46,7 @@ def tiny_model():
         attn_num_heads=4,
         attn_num_kv_heads=2,
         mlp_hidden_d=64,
+        tie_weights=True,
     )
 
 

@@ -20,6 +20,7 @@ class BaseTransformer(nn.Module):
         rms_norm_eps: float,
         rope_base_value: float,
         decoder_layer_factory: Callable,
+        tie_weights: bool = False,
     ):
         super().__init__()
         self.d = d
@@ -44,6 +45,8 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
+        if tie_weights:
+            self.lm_head.weight = self.embed_tokens.weight
 
     def forward(
         self,

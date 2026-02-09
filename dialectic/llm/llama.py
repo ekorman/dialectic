@@ -54,6 +54,7 @@ def create_llama(
     attn_num_heads: int,
     attn_num_kv_heads: int,
     mlp_hidden_d: int,
+    tie_weights: bool,
     rope_base_value: int = 500000,
 ):
     return BaseTransformer(
@@ -66,6 +67,7 @@ def create_llama(
         mlp_hidden_d=mlp_hidden_d,
         rms_norm_eps=1e-5,
         rope_base_value=rope_base_value,
+        tie_weights=tie_weights,
         decoder_layer_factory=create_llama_decoder_layer,
     )
 
@@ -91,12 +93,12 @@ def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
         attn_num_kv_heads=8,
         mlp_hidden_d=8192,
         rope_base_value=500000,
+        tie_weights=True,
     )
 
     if pretrained_weights:
         sd = load_file(get_artifact(artifact=LLAMA_32_1B_INSTRUCT_WEIGHTS))
         sd = {map_hf_key_to_dialectic(k): v for k, v in sd.items()}
-        # no copy here, seems like they share the same weight
         sd["lm_head.weight"] = sd["embed_tokens.weight"]
 
         net.load_state_dict(sd)
