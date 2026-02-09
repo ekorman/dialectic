@@ -9,6 +9,9 @@
 - 'VC': vocab size
 """
 
+from safetensors.torch import load_file
+
+from dialectic.artifacts import Artifact, get_artifact, map_hf_key_to_dialectic
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import DecoderLayer
 from dialectic.llm.components.rope import RopeScaling
@@ -67,8 +70,19 @@ def create_llama(
     )
 
 
-def load_llama_1b() -> BaseTransformer:
-    return create_llama(
+LLAMA_32_1B_INSTRUCT_WEIGHTS = Artifact(
+    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/model.safetensors",
+    filename="llama-3.2-1b-instruct/model.safetensors",
+)
+
+LLAMA_32_1B_TOKENIZER = Artifact(
+    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/llama3.2-tokenizer.json",
+    filename="llama-3.2-1b-instruct/llama3.2-tokenizer.json",
+)
+
+
+def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
+    net = create_llama(
         d=2048,
         vocab_size=128256,
         n_decoder_layers=16,
@@ -78,3 +92,13 @@ def load_llama_1b() -> BaseTransformer:
         mlp_hidden_d=8192,
         rope_base_value=500000,
     )
+
+    if pretrained_weights:
+        sd = load_file(get_artifact(artifact=LLAMA_32_1B_INSTRUCT_WEIGHTS))
+        sd = {map_hf_key_to_dialectic(k): v for k, v in sd.items()}
+        # no copy here, seems like they share the same weight
+        sd["lm_head.weight"] = sd["embed_tokens.weight"]
+
+        net.load_state_dict(sd)
+
+    return net
