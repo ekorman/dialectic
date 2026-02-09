@@ -122,7 +122,7 @@ class LengthBonusComponent(RewardComponent[T, E]):
 
 
 def _evaluate_and_verify_countdown(expr: str, numbers: list[int], target: int) -> bool:
-    if not re.match(r"^[\d+\-*/().\s]+$", expr):
+    if not re.match(r"^[\d+\-*/()\s]+$", expr):
         return False
 
     used_numbers = sorted(int(n) for n in re.findall(r"\d+", expr))

@@ -28,6 +28,9 @@ class TestEvaluateAndVerifyCountdown:
     def test_invalid_characters_rejected(self):
         assert not _evaluate_and_verify_countdown("__import__('os')", [1], 1)
 
+    def test_decimal_rejected(self):
+        assert not _evaluate_and_verify_countdown("1.5 + 2.5", [1, 5, 2, 5], 4)
+
     def test_division(self):
         assert _evaluate_and_verify_countdown("10 / 2", [10, 2], 5)
 
