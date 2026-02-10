@@ -23,7 +23,10 @@ def weighted_reward(
     """Create a reward function as a weighted sum of components."""
 
     def fn(
-        *, env_response, raw_model_output=None, extracted_model_output
+        *,
+        env_response: EnvResponse,
+        raw_model_output: str | None = None,
+        extracted_model_output: object,
     ) -> RewardResult:
         values: dict[str, float] = {}
         total = 0.0
@@ -73,16 +76,6 @@ def countdown_correct(
             )
             else 0.0
         )
-    except Exception:
-        return 0.0
-
-
-def countdown_parseable(*, extracted_model_output: str | None, **_) -> float:
-    if extracted_model_output is None:
-        return 0.0
-    try:
-        eval(extracted_model_output, {"__builtins__": {}}, {})
-        return 1.0
     except Exception:
         return 0.0
 

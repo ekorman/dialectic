@@ -5,7 +5,6 @@ from dialectic.rl.reward import (
     _evaluate_and_verify_countdown,
     answer_tags,
     countdown_correct,
-    countdown_parseable,
     think_tags,
     weighted_reward,
 )
@@ -70,20 +69,6 @@ class TestCountdownCorrect:
             env_response=_make_env_response([1, 3, 1], 4),
             extracted_model_output=None,
         )
-        assert result == 0.0
-
-
-class TestCountdownParseable:
-    def test_parseable_expression(self):
-        result = countdown_parseable(extracted_model_output="1 + 2")
-        assert result == 1.0
-
-    def test_unparseable_expression(self):
-        result = countdown_parseable(extracted_model_output="not valid python")
-        assert result == 0.0
-
-    def test_none_output(self):
-        result = countdown_parseable(extracted_model_output=None)
         assert result == 0.0
 
 
