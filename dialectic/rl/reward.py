@@ -1,13 +1,13 @@
 import re
-from abc import ABC, abstractmethod
-from typing import Generic, Sequence
+from typing import Callable, Protocol, Sequence
 
 from dialectic.rl.env import Countdown
 from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
+RewardComponentFn = Callable[..., float]
 
-class RewardFn(ABC, Generic[T, E]):
-    @abstractmethod
+
+class RewardFn(Protocol[T, E]):
     def __call__(
         self,
         *,
@@ -17,108 +17,30 @@ class RewardFn(ABC, Generic[T, E]):
     ) -> RewardResult: ...
 
 
-class RewardComponent(ABC, Generic[T, E]):
-    """A single reward component."""
+def weighted_reward(
+    components: Sequence[tuple[str, float, RewardComponentFn]],
+) -> RewardFn:
+    """Create a reward function as a weighted sum of components."""
 
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Unique identifier for logging."""
-        ...
-
-    @property
-    def group(self) -> str | None:
-        """Optional group name for max() selection. None = additive."""
-        return None
-
-    @property
-    def weight(self) -> float:
-        """Weight applied to this component's value."""
-        return 1.0
-
-    @abstractmethod
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[T],
-        raw_model_output: str | None = None,
-        extracted_model_output: E,
-    ) -> float: ...
-
-
-class CompositeRewardFn(RewardFn[T, E]):
-    def __init__(self, components: Sequence[RewardComponent[T, E]]):
-        self.components = list(components)
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[T],
-        raw_model_output: str | None = None,
-        extracted_model_output: E,
+    def fn(
+        *, env_response, raw_model_output=None, extracted_model_output
     ) -> RewardResult:
-        component_values: dict[str, float] = {}
-        for comp in self.components:
-            component_values[comp.name] = comp(
+        values: dict[str, float] = {}
+        total = 0.0
+        for name, weight, component in components:
+            value = component(
                 env_response=env_response,
                 raw_model_output=raw_model_output,
                 extracted_model_output=extracted_model_output,
             )
+            values[name] = value
+            total += weight * value
+        return RewardResult(total=total, components=values)
 
-        groups: dict[str, list[tuple[str, float, float]]] = {}
-        additive: list[tuple[str, float, float]] = []
-
-        for comp in self.components:
-            value = component_values[comp.name]
-            if comp.group is not None:
-                groups.setdefault(comp.group, []).append(
-                    (comp.name, value, comp.weight)
-                )
-            else:
-                additive.append((comp.name, value, comp.weight))
-
-        total = sum(value * weight for _, value, weight in additive)
-        for group_components in groups.values():
-            max_value, max_weight = max(
-                ((v, w) for _, v, w in group_components),
-                key=lambda x: x[0] * x[1],
-            )
-            total += max_value * max_weight
-
-        return RewardResult(total=total, components=component_values)
+    return fn
 
 
-class LengthBonusComponent(RewardComponent[T, E]):
-    """Adds bonus based on output length. Task-agnostic."""
-
-    def __init__(
-        self,
-        max_bonus: float = 0.05,
-        normalize_length: int = 500,
-        weight: float = 1.0,
-    ):
-        self._max_bonus = max_bonus
-        self._normalize_length = normalize_length
-        self._weight = weight
-
-    @property
-    def name(self) -> str:
-        return "length_bonus"
-
-    @property
-    def weight(self) -> float:
-        return self._weight
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[T],
-        raw_model_output: str | None = None,
-        extracted_model_output: E,
-    ) -> float:
-        if raw_model_output is None:
-            return 0.0
-        return min(len(raw_model_output) / self._normalize_length, self._max_bonus)
+# --- Countdown-specific ---
 
 
 def _evaluate_and_verify_countdown(expr: str, numbers: list[int], target: int) -> bool:
@@ -136,200 +58,93 @@ def _evaluate_and_verify_countdown(expr: str, numbers: list[int], target: int) -
         return False
 
 
-class CountdownCorrectComponent(RewardComponent[Countdown, str | None]):
-    """1.0 if expression evaluates to target using valid numbers."""
-
-    @property
-    def name(self) -> str:
-        return "correct"
-
-    @property
-    def group(self) -> str:
-        return "accuracy"
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> float:
-        if extracted_model_output is None:
-            return 0.0
-        try:
-            return (
-                1.0
-                if _evaluate_and_verify_countdown(
-                    extracted_model_output,
-                    env_response.data.numbers,
-                    env_response.data.target,
-                )
-                else 0.0
+def countdown_correct(
+    *, env_response: EnvResponse[Countdown], extracted_model_output: str | None, **_
+) -> float:
+    if extracted_model_output is None:
+        return 0.0
+    try:
+        return (
+            1.0
+            if _evaluate_and_verify_countdown(
+                extracted_model_output,
+                env_response.data.numbers,
+                env_response.data.target,
             )
-        except Exception:
-            return 0.0
+            else 0.0
+        )
+    except Exception:
+        return 0.0
 
 
-class CountdownParseableComponent(RewardComponent[Countdown, str | None]):
-    """0.3 if has <answer> tags with parseable expression (regardless of correctness)."""
-
-    @property
-    def name(self) -> str:
-        return "parseable"
-
-    @property
-    def group(self) -> str:
-        return "accuracy"
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> float:
-        if extracted_model_output is None:
-            return 0.0
-        try:
-            eval(extracted_model_output, {"__builtins__": {}}, {})
-            return 0.3
-        except Exception:
-            return 0.0
+def countdown_parseable(*, extracted_model_output: str | None, **_) -> float:
+    if extracted_model_output is None:
+        return 0.0
+    try:
+        eval(extracted_model_output, {"__builtins__": {}}, {})
+        return 1.0
+    except Exception:
+        return 0.0
 
 
-class CountdownAnswerTagsComponent(RewardComponent[Countdown, str | None]):
-    """0.1 if has <answer> tags (even if unparseable)."""
+# --- Generic (environment-agnostic) ---
 
-    @property
-    def name(self) -> str:
-        return "answer_tags"
 
-    @property
-    def group(self) -> str:
-        return "accuracy"
+def answer_tags(*, raw_model_output: str | None, **_) -> float:
+    if not raw_model_output:
+        return 0.0
+    if (
+        raw_model_output.count("<answer>") == 1
+        and raw_model_output.count("</answer>") == 1
+    ):
+        return 1.0
+    return 0.0
 
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> float:
+
+def think_tags(
+    tag_name: str = "think", prefilled_open: bool = False
+) -> RewardComponentFn:
+    """Return a component fn that checks for thinking tags."""
+
+    def fn(*, raw_model_output: str | None, **_) -> float:
         if not raw_model_output:
             return 0.0
+        close_tag = f"</{tag_name}>"
+        if prefilled_open:
+            return 1.0 if raw_model_output.count(close_tag) == 1 else 0.0
+        open_tag = f"<{tag_name}>"
         if (
-            raw_model_output.count("<answer>") == 1
-            and raw_model_output.count("</answer>") == 1
+            raw_model_output.count(open_tag) == 1
+            and raw_model_output.count(close_tag) == 1
         ):
-            return 0.1
+            return 1.0
         return 0.0
 
+    return fn
 
-class CountdownThinkTagsComponent(RewardComponent[Countdown, str | None]):
-    """0.05 if has <think> tags."""
 
-    def __init__(self, tag_name: str, prefilled_open: bool = False):
-        self.tag_name = tag_name
-        self.prefilled_open = prefilled_open
-
-    @property
-    def name(self) -> str:
-        return "think_tags"
-
-    @property
-    def group(self) -> str:
-        return "accuracy"
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> float:
-        if not raw_model_output:
+def length_bonus(
+    max_bonus: float = 0.05, normalize_length: int = 500
+) -> RewardComponentFn:
+    def fn(*, raw_model_output: str | None, **_) -> float:
+        if raw_model_output is None:
             return 0.0
-        open_tag = f"<{self.tag_name}>"
-        close_tag = f"</{self.tag_name}>"
-        if self.prefilled_open:
-            if raw_model_output.count(close_tag) == 1:
-                return 0.05
-        else:
-            if (
-                raw_model_output.count(open_tag) == 1
-                and raw_model_output.count(close_tag) == 1
-            ):
-                return 0.05
-        return 0.0
+        return min(len(raw_model_output) / normalize_length, max_bonus)
+
+    return fn
 
 
-class CountdownRewardFn(RewardFn[Countdown, str | None]):
-    """Binary reward: 1.0 if equation is valid and equals target, else 0.0"""
+# --- Arithmetic ---
 
-    def __init__(self):
-        self._composite = CompositeRewardFn([CountdownCorrectComponent()])
 
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> RewardResult:
-        return self._composite(
-            env_response=env_response,
-            raw_model_output=raw_model_output,
-            extracted_model_output=extracted_model_output,
+def arithmetic_correct(tolerance: float = 1e-6) -> RewardComponentFn:
+    def fn(
+        *, env_response: EnvResponse[QA[float]], extracted_model_output: float, **_
+    ) -> float:
+        return (
+            1.0
+            if abs(env_response.data.answer - extracted_model_output) < tolerance
+            else 0.0
         )
 
-
-class CountdownWithFormatRewardFn(RewardFn[Countdown, str | None]):
-    """
-    Reward with format shaping to ensure learning signal.
-
-    Components in "accuracy" group: max() selects highest (1.0 > 0.3 > 0.1 > 0.05)
-    Plus small length bonus (up to 0.05) to create variance between similar outputs.
-    """
-
-    def __init__(self, thinking_tag_name: str, thinking_tag_prefilled_open: bool):
-        self._composite = CompositeRewardFn(
-            [
-                CountdownCorrectComponent(),
-                CountdownParseableComponent(),
-                CountdownAnswerTagsComponent(),
-                CountdownThinkTagsComponent(
-                    thinking_tag_name, prefilled_open=thinking_tag_prefilled_open
-                ),
-            ]
-        )
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[Countdown],
-        raw_model_output: str | None = None,
-        extracted_model_output: str | None,
-    ) -> RewardResult:
-        return self._composite(
-            env_response=env_response,
-            raw_model_output=raw_model_output,
-            extracted_model_output=extracted_model_output,
-        )
-
-
-class ArithmeticRewardFn(RewardFn[QA[float], float]):
-    def __init__(self, tolerance: float = 1e-6):
-        self.tolerance = tolerance
-
-    def __call__(
-        self,
-        *,
-        env_response: EnvResponse[QA[float]],
-        raw_model_output: str | None = None,
-        extracted_model_output: float,
-    ) -> RewardResult:
-        correct = (
-            abs(env_response.data.answer - extracted_model_output) < self.tolerance
-        )
-        value = 1.0 if correct else 0.0
-        return RewardResult(total=value, components={"correct": value})
+    return fn

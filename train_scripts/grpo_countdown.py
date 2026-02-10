@@ -32,7 +32,12 @@ from dialectic.llm.templates import (
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn
+from dialectic.rl.reward import (
+    answer_tags,
+    countdown_correct,
+    think_tags,
+    weighted_reward,
+)
 from dialectic.rl.train import train_grpo
 
 load_dotenv()
@@ -167,9 +172,15 @@ def train(
         format_messages = model_info.format_messages
 
     if binary_reward:
-        reward_fn = CountdownRewardFn()
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
     else:
-        reward_fn = CountdownWithFormatRewardFn(reasoning_tag, True)
+        reward_fn = weighted_reward(
+            [
+                ("correct", 1.0, countdown_correct),
+                ("answer_tags", 0.1, answer_tags),
+                ("think_tags", 0.05, think_tags(reasoning_tag, prefilled_open=True)),
+            ]
+        )
 
     env = CountdownEnv(
         seed=seed,

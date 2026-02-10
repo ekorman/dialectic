@@ -17,7 +17,12 @@ import torch
 from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import Countdown, Env, EpisodeIsDoneError
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn, CountdownWithFormatRewardFn, RewardFn
+from dialectic.rl.reward import (
+    answer_tags,
+    countdown_correct,
+    think_tags,
+    weighted_reward,
+)
 from dialectic.rl.train import compute_grpo_loss, compute_log_probs, train_grpo
 from dialectic.rl.types import EnvResponse, RewardResult
 
@@ -139,7 +144,7 @@ class TestGRPOMechanics:
             net=tiny_model,
             opt=opt,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -165,7 +170,7 @@ class TestGRPOMechanics:
             net=tiny_model,
             opt=opt,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -190,21 +195,14 @@ class TestGRPOMechanics:
         which creates non-zero advantages and allows gradients to flow.
         """
 
-        class LengthRewardFn(RewardFn[Countdown, str | None]):
-            """Reward based on output length to ensure variance."""
-
-            def __call__(
-                self,
-                *,
-                env_response: EnvResponse[Countdown],
-                raw_model_output: str | None = None,
-                extracted_model_output: str | None,
-            ) -> RewardResult:
-                if raw_model_output is None:
-                    value = 0.0
-                else:
-                    value = len(raw_model_output) / 100.0
-                return RewardResult(total=value, components={"length": value})
+        def length_reward_fn(
+            *, env_response, raw_model_output=None, extracted_model_output
+        ) -> RewardResult:
+            if raw_model_output is None:
+                value = 0.0
+            else:
+                value = len(raw_model_output) / 100.0
+            return RewardResult(total=value, components={"length": value})
 
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-2)
 
@@ -216,7 +214,7 @@ class TestGRPOMechanics:
             net=tiny_model,
             opt=opt,
             env=env,
-            reward_fn=LengthRewardFn(),
+            reward_fn=length_reward_fn,
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -250,7 +248,7 @@ class TestGRPOMechanics:
             net=tiny_model,
             opt=opt,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -338,7 +336,7 @@ class TestGRPOMechanics:
                 net=model,
                 opt=opt,
                 env=env,
-                reward_fn=CountdownRewardFn(),
+                reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
                 state_to_str=countdown_state_to_str,
                 tokenizer=tokenizer,
                 eos_token_id=151643,
@@ -480,7 +478,7 @@ class TestCountdownReward:
         """Reward is 1.0 for correct answers."""
         from dialectic.rl.types import EnvResponse
 
-        reward_fn = CountdownRewardFn()
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -498,7 +496,7 @@ class TestCountdownReward:
         """Reward is 0.0 for wrong answers."""
         from dialectic.rl.types import EnvResponse
 
-        reward_fn = CountdownRewardFn()
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -516,7 +514,7 @@ class TestCountdownReward:
         """Reward is 0.0 when using numbers not in the set."""
         from dialectic.rl.types import EnvResponse
 
-        reward_fn = CountdownRewardFn()
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -534,7 +532,7 @@ class TestCountdownReward:
         """Reward is 0.0 when no answer extracted."""
         from dialectic.rl.types import EnvResponse
 
-        reward_fn = CountdownRewardFn()
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -549,14 +547,21 @@ class TestCountdownReward:
         assert result.components["correct"] == 0.0
 
 
-class TestCompositeRewardFn:
-    """Test the composite reward function and components."""
+class TestWeightedReward:
+    """Test the weighted reward function composition."""
 
-    def test_countdown_with_format_correct_answer(self):
-        """Max selection: correct (1.0) beats all other accuracy components."""
-        reward_fn = CountdownWithFormatRewardFn(
-            thinking_tag_name="think", thinking_tag_prefilled_open=False
+    def _make_reward_fn(self):
+        return weighted_reward(
+            [
+                ("correct", 1.0, countdown_correct),
+                ("answer_tags", 0.1, answer_tags),
+                ("think_tags", 0.05, think_tags("think")),
+            ]
         )
+
+    def test_all_components_fire(self):
+        """Weighted sum: correct + answer_tags + think_tags."""
+        reward_fn = self._make_reward_fn()
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -569,17 +574,13 @@ class TestCompositeRewardFn:
         )
 
         assert result.components["correct"] == 1.0
-        assert result.components["parseable"] == 0.3
-        assert result.components["answer_tags"] == 0.1
-        assert result.components["think_tags"] == 0.05
+        assert result.components["answer_tags"] == 1.0
+        assert result.components["think_tags"] == 1.0
+        assert abs(result.total - 1.15) < 1e-9
 
-        assert result.total == 1.0  # since all components are in the same group
-
-    def test_countdown_with_format_parseable_only(self):
-        """Max selection: parseable (0.3) wins when correct fails."""
-        reward_fn = CountdownWithFormatRewardFn(
-            thinking_tag_name="think", thinking_tag_prefilled_open=False
-        )
+    def test_format_only_wrong_answer(self):
+        """Only format components fire when answer is wrong."""
+        reward_fn = self._make_reward_fn()
         env_response = EnvResponse(
             is_done=True,
             data=Countdown(prompt="...", numbers=[2, 3, 5], target=10),
@@ -587,19 +588,23 @@ class TestCompositeRewardFn:
 
         result = reward_fn(
             env_response=env_response,
-            raw_model_output="<answer>2 + 3</answer>",
+            raw_model_output="<think>thinking</think><answer>2 + 3</answer>",
             extracted_model_output="2 + 3",
         )
 
         assert result.components["correct"] == 0.0
-        assert result.components["parseable"] == 0.3
-        assert result.components["answer_tags"] == 0.1
-        assert result.total >= 0.3
+        assert result.components["answer_tags"] == 1.0
+        assert result.components["think_tags"] == 1.0
+        assert abs(result.total - 0.15) < 1e-9
 
-    def test_countdown_with_format_think_tags_only(self):
-        """Max selection: think_tags (0.05) wins when no answer tags."""
-        reward_fn = CountdownWithFormatRewardFn(
-            thinking_tag_name="think", thinking_tag_prefilled_open=True
+    def test_think_tags_only(self):
+        """Only think_tags fires when no answer tags present."""
+        reward_fn = weighted_reward(
+            [
+                ("correct", 1.0, countdown_correct),
+                ("answer_tags", 0.1, answer_tags),
+                ("think_tags", 0.05, think_tags("think", prefilled_open=True)),
+            ]
         )
         env_response = EnvResponse(
             is_done=True,
@@ -608,15 +613,14 @@ class TestCompositeRewardFn:
 
         result = reward_fn(
             env_response=env_response,
-            raw_model_output="<think>Let me think about this...</think>",
+            raw_model_output="Let me think about this...</think>",
             extracted_model_output=None,
         )
 
         assert result.components["correct"] == 0.0
-        assert result.components["parseable"] == 0.0
         assert result.components["answer_tags"] == 0.0
-        assert result.components["think_tags"] == 0.05
-        assert result.total >= 0.05
+        assert result.components["think_tags"] == 1.0
+        assert abs(result.total - 0.05) < 1e-9
 
 
 class TestAnswerExtractor:
