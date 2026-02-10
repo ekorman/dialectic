@@ -5,7 +5,7 @@ import torch
 from dialectic.rl.env import Countdown
 from dialectic.rl.evaluate import EvaluationResult, evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import CountdownRewardFn
+from dialectic.rl.reward import countdown_correct, weighted_reward
 from dialectic.rl.train import RolloutBatch, generate_rollout_batch
 
 
@@ -19,7 +19,7 @@ class TestEvaluate:
         result, _ = evaluate(
             net=tiny_model,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -39,7 +39,7 @@ class TestEvaluate:
         result, _ = evaluate(
             net=tiny_model,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -59,7 +59,7 @@ class TestEvaluate:
         result, _ = evaluate(
             net=tiny_model,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -81,7 +81,7 @@ class TestEvaluate:
         result, _ = evaluate(
             net=tiny_model,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
@@ -107,7 +107,7 @@ class TestGenerateRolloutBatch:
         rollout = generate_rollout_batch(
             net=tiny_model,
             env=env,
-            reward_fn=CountdownRewardFn(),
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
             eos_token_id=151643,
