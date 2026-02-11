@@ -58,8 +58,6 @@ class BaseTransformer(nn.Module):
     ):
         if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
-        else:
-            x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)

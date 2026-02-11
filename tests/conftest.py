@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 from tokenizers import Tokenizer
@@ -9,15 +11,23 @@ from dialectic.rl.env import CountdownEnv
 @pytest.fixture
 def MockGenerateModel():
     class _MockGenerateModel(torch.nn.Module):
-        def __init__(self, token_schedule: list[torch.Tensor], vocab_size: int):
+        def __init__(
+            self,
+            token_schedule: list[torch.Tensor],
+            vocab_size: int,
+            hidden_dim: int = 8,
+        ):
             super().__init__()
             self.token_schedule = token_schedule
             self.vocab_size = vocab_size
             self.step = 0
             self.attn_num_kv_heads = 1
             self.attn_head_d = 1
+            self.hidden_dim = hidden_dim
             self.layers = torch.nn.ModuleList([torch.nn.Identity()])
             self.dummy_param = torch.nn.Parameter(torch.zeros(1))
+            self.embed_tokens = MagicMock()
+            self.embed_tokens.weight = torch.rand(vocab_size, self.hidden_dim)
 
         def forward(self, input_ids, kv_caches=None, attention_mask=None):
             tokens = self.token_schedule[self.step].to(input_ids.device)

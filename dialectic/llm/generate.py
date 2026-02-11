@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
@@ -73,9 +73,14 @@ def check_and_apply_prefill(
 class BaseTokenGenerator(ABC):
     def init_state(
         self,
-        initial_input: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        initial_input: Int[torch.Tensor, "B L"],
+        attention_mask: Bool[torch.Tensor, "B L"] | None,
     ):
+        if attention_mask is not None and (initial_input.shape != attention_mask.shape):
+            raise ValueError(
+                "Expected `initial_input` and `attention_mask` to have same shape"
+                f" but got shapes {initial_input.shape} and {attention_mask.shape} respectfully."
+            )
         self.all_inputs = initial_input
         self.device = initial_input.device
         self.batch_size = initial_input.shape[0]
@@ -100,6 +105,8 @@ class BaseTokenGenerator(ABC):
     def _extra_tokens_per_step_bound(self) -> int:
         return 0
 
+    # if later we try things like BPTT we'll have to drop this
+    @torch.inference_mode()
     def generate(
         self,
         net: BaseTransformer,
@@ -258,7 +265,7 @@ class HardGenerator(BaseTokenGenerator):
 class SoftGenerator(BaseTokenGenerator):
     def __init__(
         self,
-        vocab_size: int,
+        embedding_weight: Float[torch.Tensor, "V D"],
         temperature: float = 1.0,
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
@@ -271,25 +278,32 @@ class SoftGenerator(BaseTokenGenerator):
         hard tokens. note to keep the shape the same as the soft tokens, we will one-hot encode them.
         this includes the prefilling
         """
-        self.vocab_size = vocab_size
+        self.embedding_weight = embedding_weight
+        self.vocab_size = embedding_weight.shape[0]
         self.temperature = temperature
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
         self.prefill = prefill
 
+    def _probs_to_soft_token(
+        self, probs: Float[torch.Tensor, "B L V"]
+    ) -> Float[torch.Tensor, "B L D"]:
+        return probs @ self.embedding_weight
+
     def init_state(
         self,
-        initial_input: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        initial_input: Int[torch.Tensor, "B L"],
+        attention_mask: Bool[torch.Tensor, "B L"] | None,
     ):
         super().init_state(initial_input=initial_input, attention_mask=attention_mask)
         if self.prefill is not None:
             self.prefill = self.prefill.to(self.device)
         self.shadow_seq = initial_input
-        self.all_inputs = torch.nn.functional.one_hot(
-            self.all_inputs, self.vocab_size
-        ).float()
+        self.all_inputs = self._probs_to_soft_token(
+            torch.nn.functional.one_hot(self.all_inputs, self.vocab_size).float()
+        )
+
         if self.switch_to_hard_tokens_condition is not None:
             self.switch_to_hard_tokens_condition = (
                 self.switch_to_hard_tokens_condition.to(self.device)
@@ -343,7 +357,9 @@ class SoftGenerator(BaseTokenGenerator):
             hard_token_id.squeeze(-1) == self.eos_token_id
         )
 
-        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.all_inputs = torch.cat(
+            [self.all_inputs, self._probs_to_soft_token(next_token)], 1
+        )
         self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
 
         if self.finished:
@@ -366,8 +382,10 @@ class SoftGenerator(BaseTokenGenerator):
                 new_hard_tokens = self.shadow_seq[:, -n_added:]
                 new_hard_tokens = torch.nn.functional.one_hot(
                     new_hard_tokens, self.vocab_size
+                ).float()
+                self.all_inputs = torch.cat(
+                    [self.all_inputs, self._probs_to_soft_token(new_hard_tokens)], 1
                 )
-                self.all_inputs = torch.cat([self.all_inputs, new_hard_tokens], 1)
 
             self._finished = self._finished | (
                 self.shadow_seq[:, -1] == self.eos_token_id
@@ -413,7 +431,7 @@ def generate_from_tokens(
 
     if soft_tokens:
         return SoftGenerator(
-            vocab_size=net.vocab_size,
+            embedding_weight=net.embed_tokens.weight,
             temperature=temperature,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,

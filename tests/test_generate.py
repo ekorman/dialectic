@@ -89,6 +89,7 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
     ]
 
 
+# TODO: move this...
 @torch.inference_mode()
 def test_soft_tokens_forward_pass(tiny_model: BaseTransformer):
     """Tests that the forward pass gives the same thing if we pass an integer tensor
@@ -101,8 +102,10 @@ def test_soft_tokens_forward_pass(tiny_model: BaseTransformer):
     ).float()
     assert one_hot_tokens.shape == torch.Size((b, l, tiny_model.vocab_size))
 
+    soft_tokens = one_hot_tokens @ tiny_model.embed_tokens.weight
+
     out1 = tiny_model(token_ids)
-    out2 = tiny_model(one_hot_tokens)
+    out2 = tiny_model(soft_tokens)
 
     torch.testing.assert_close(out1, out2)
 
@@ -123,7 +126,7 @@ def test_soft_tokens_generation(tiny_model: BaseTransformer):
         soft_tokens=True,
     )
 
-    assert output.shape == torch.Size((b, l + 24, tiny_model.vocab_size))
+    assert output.shape == torch.Size((b, l + 24, tiny_model.d))
 
 
 def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerateModel):
@@ -154,7 +157,7 @@ def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerate
         soft_tokens=True,
     )
 
-    assert output.shape == torch.Size((3, 2 + max_tokens_generated, vocab_size))
+    assert output.shape == torch.Size((3, 2 + max_tokens_generated, model.hidden_dim))
     generated_tokens = output[:, 2:]
 
     pad_token_one_hot = torch.nn.functional.one_hot(
@@ -165,11 +168,18 @@ def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerate
     )
 
     # last element of batch should terminated immediately and just have pad token distribution
-    assert (generated_tokens[2, 0] == eos_token_one_hot).all()
-    assert (generated_tokens[2, 1:] == pad_token_one_hot).all()
+    assert (
+        generated_tokens[2, 0] == eos_token_one_hot.float() @ model.embed_tokens.weight
+    ).all()
+    assert (
+        generated_tokens[2, 1:] == pad_token_one_hot.float() @ model.embed_tokens.weight
+    ).all()
 
     # others should always have no pad token component
-    assert (generated_tokens[:2, :, pad_token_id] == 0).all()
+    assert (
+        generated_tokens[:2, 1:]
+        != pad_token_one_hot.float() @ model.embed_tokens.weight
+    ).all()
 
 
 def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateModel):
@@ -200,11 +210,11 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
     )
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 5, vocab_size))
+    assert output.shape == torch.Size((3, 5, model.hidden_dim))
     generated_tokens = output[:, 2:]
 
     def _create_one_hot(token_id):
-        return torch.nn.functional.one_hot(torch.tensor(token_id), vocab_size)
+        return torch.nn.functional.one_hot(torch.tensor(token_id), vocab_size).float()
 
     pad_token_one_hot = _create_one_hot(pad_token_id)
     eos_token_one_hot = _create_one_hot(eos_token_id)
@@ -212,14 +222,17 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
     assert (
         generated_tokens[0]
         == torch.stack([eos_token_one_hot, pad_token_one_hot, pad_token_one_hot])
+        @ model.embed_tokens.weight
     ).all()
     assert (
         generated_tokens[1]
         == torch.stack([_create_one_hot(5), eos_token_one_hot, pad_token_one_hot])
+        @ model.embed_tokens.weight
     ).all()
     assert (
         generated_tokens[2]
         == torch.stack([_create_one_hot(6), _create_one_hot(8), eos_token_one_hot])
+        @ model.embed_tokens.weight
     ).all()
 
 
@@ -408,12 +421,11 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
     )
 
 
-def _is_one_hot(tensor: torch.Tensor, tol: float = 1e-6) -> bool:
-    """Check if a tensor is approximately one-hot encoded."""
-    max_val = tensor.max()
-    num_ones = (tensor > 1 - tol).sum()
-    num_zeros = (tensor < tol).sum()
-    return abs(max_val - 1.0) < tol and num_ones == 1 and num_zeros == len(tensor) - 1
+def _is_single_vector(
+    tensor: torch.Tensor, embedding_weights: torch.Tensor, tol: float = 5e-5
+) -> bool:
+    """Check if a tensor exactly an embedding vector of a token (as opposed to a non-trivial linear combination)"""
+    return ((tensor - embedding_weights).abs() < tol).all(1).any()
 
 
 def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
@@ -427,28 +439,31 @@ def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out_no_switch = SoftGenerator(
-        vocab_size=vocab_size,
+    gen1 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
+        temperature=100,
         switch_to_hard_tokens_condition=None,
-    ).generate(
+    )
+    gen1.generate(
         net=model,
         token_ids=x,
         max_tokens_generated=10,
         use_kv_cache=True,
     )
 
-    generated_no_switch = out_no_switch[0, x.shape[1] :]
-    shadow_tokens = generated_no_switch.argmax(-1)
-    switch_condition = shadow_tokens[:3]
+    # make switch condition the first three generated tokens
+    switch_condition = gen1.shadow_seq[0, x.shape[1] : x.shape[1] + 3]
 
-    out_with_switch = SoftGenerator(
-        vocab_size=vocab_size,
+    gen2 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
+        temperature=100,
         switch_to_hard_tokens_condition=switch_condition,
-    ).generate(
+    )
+    out_with_switch = gen2.generate(
         net=model,
         token_ids=x,
         max_tokens_generated=10,
@@ -458,14 +473,15 @@ def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
     generated_with_switch = out_with_switch[0, x.shape[1] :]
 
     for i in range(3):
-        token_dist = generated_with_switch[i]
-        assert not _is_one_hot(token_dist), (
+        soft_token = generated_with_switch[i]
+
+        assert not _is_single_vector(soft_token, model.embed_tokens.weight), (
             f"Token {i} should be soft (before switch condition met)"
         )
 
     for i in range(3, 10):
-        token_dist = generated_with_switch[i]
-        assert _is_one_hot(token_dist), (
+        soft_token = generated_with_switch[i]
+        assert _is_single_vector(soft_token, model.embed_tokens.weight), (
             f"Token {i} should be one-hot (after switch condition met)"
         )
 
@@ -482,29 +498,31 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
     x1 = torch.randint(1, vocab_size, size=(1, 4))
     x2 = torch.randint(1, vocab_size, size=(1, 4))
 
-    out1 = SoftGenerator(
-        vocab_size=vocab_size,
+    gen1 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
-    ).generate(
+    )
+    gen1.generate(
         net=model,
         token_ids=x1,
         max_tokens_generated=10,
         use_kv_cache=True,
     )
-    shadow1 = out1[0, x1.shape[1] :].argmax(-1)
+    shadow1 = gen1.shadow_seq[0]
 
-    out2 = SoftGenerator(
-        vocab_size=vocab_size,
+    gen2 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
-    ).generate(
+    )
+    gen2.generate(
         net=model,
         token_ids=x2,
         max_tokens_generated=10,
         use_kv_cache=True,
     )
-    shadow2 = out2[0, x2.shape[1] :].argmax(-1)
+    shadow2 = gen2.shadow_seq[0]
 
     switch_condition = shadow1[:2]
 
@@ -518,7 +536,7 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
     x_batched = torch.cat([x1, x2], dim=0)
 
     out_batched = SoftGenerator(
-        vocab_size=vocab_size,
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
         switch_to_hard_tokens_condition=switch_condition,
@@ -532,28 +550,28 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
     generated_batched = out_batched[:, x1.shape[1] :]
 
     for i in range(switch_step_1):
-        assert not _is_one_hot(generated_batched[0, i]), (
-            f"Batch 0, token {i}: should be soft (before switch)"
-        )
+        assert not _is_single_vector(
+            generated_batched[0, i], model.embed_tokens.weight
+        ), f"Batch 0, token {i}: should be soft (before switch)"
     for i in range(switch_step_1, 10):
-        assert _is_one_hot(generated_batched[0, i]), (
+        assert _is_single_vector(generated_batched[0, i], model.embed_tokens.weight), (
             f"Batch 0, token {i}: should be hard (after switch)"
         )
 
     if switch_step_2 is not None:
         for i in range(switch_step_2):
-            assert not _is_one_hot(generated_batched[1, i]), (
-                f"Batch 1, token {i}: should be soft (before switch)"
-            )
+            assert not _is_single_vector(
+                generated_batched[1, i], model.embed_tokens.weight
+            ), f"Batch 1, token {i}: should be soft (before switch)"
         for i in range(switch_step_2, 10):
-            assert _is_one_hot(generated_batched[1, i]), (
-                f"Batch 1, token {i}: should be hard (after switch)"
-            )
+            assert _is_single_vector(
+                generated_batched[1, i], model.embed_tokens.weight
+            ), f"Batch 1, token {i}: should be hard (after switch)"
     else:
         for i in range(10):
-            assert not _is_one_hot(generated_batched[1, i]), (
-                f"Batch 1, token {i}: should be soft (never switched)"
-            )
+            assert not _is_single_vector(
+                generated_batched[1, i], model.embed_tokens.weight
+            ), f"Batch 1, token {i}: should be soft (never switched)"
 
 
 def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer):
@@ -568,9 +586,10 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
     x = torch.randint(1, vocab_size, size=(1, 4))
 
     out = SoftGenerator(
-        vocab_size=vocab_size,
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=-1,
         pad_token_id=0,
+        temperature=100,
         switch_to_hard_tokens_condition=None,
     ).generate(
         net=model,
@@ -582,8 +601,8 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
     generated = out[0, x.shape[1] :]
 
     for i in range(10):
-        token_dist = generated[i]
-        assert not _is_one_hot(token_dist), (
+        # token_dist = generated[i]
+        assert not _is_single_vector(generated[i], model.embed_tokens.weight), (
             f"Token {i} should be soft (no switch condition set)"
         )
 
@@ -600,18 +619,19 @@ def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out_natural = SoftGenerator(
-        vocab_size=vocab_size,
+    gen1 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
-    ).generate(
+    )
+    out_natural = gen1.generate(
         net=model,
         token_ids=x,
         max_tokens_generated=20,
         use_kv_cache=False,
     )
 
-    shadow_tokens = out_natural[0, x.shape[1] :].argmax(-1)
+    shadow_tokens = gen1.shadow_seq[0, x.shape[1] :]
     trigger = shadow_tokens[:3]
     natural_fill = shadow_tokens[3:5]
     fill = (natural_fill + 1) % vocab_size
@@ -620,7 +640,7 @@ def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer
     prefill = PreFill(condition=trigger, filling=fill)
 
     out_prefill = SoftGenerator(
-        vocab_size=vocab_size,
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         prefill=prefill,
@@ -638,9 +658,10 @@ def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer
     )
 
     fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
-    assert (out_prefill[0, x.shape[1] + 3 : x.shape[1] + 5] == fill_one_hot).all(), (
-        "Prefill did not fire: one-hot fill tokens not found after trigger"
-    )
+    assert (
+        out_prefill[0, x.shape[1] + 3 : x.shape[1] + 5]
+        == fill_one_hot @ model.embed_tokens.weight
+    ).all(), "Prefill did not fire: one-hot fill tokens not found after trigger"
 
 
 def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
@@ -657,18 +678,19 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     x1 = torch.randint(1, vocab_size, size=(1, 4))
     x2 = torch.randint(1, vocab_size, size=(1, 7))
 
-    out1_natural = SoftGenerator(
-        vocab_size=vocab_size,
+    gen1 = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
-    ).generate(
+    )
+    gen1.generate(
         net=model,
         token_ids=x1,
         max_tokens_generated=20,
         use_kv_cache=True,
     )
 
-    shadow_tokens = out1_natural[0, x1.shape[1] :].argmax(-1)
+    shadow_tokens = gen1.shadow_seq[0, x1.shape[1] :]
     trigger = shadow_tokens[:3]
     natural_fill = shadow_tokens[3:5]
     fill = (natural_fill + 1) % vocab_size
@@ -677,7 +699,7 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     prefill = PreFill(condition=trigger, filling=fill)
 
     out1 = SoftGenerator(
-        vocab_size=vocab_size,
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         prefill=prefill,
@@ -689,8 +711,10 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     )
 
     fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
-    assert (out1[0, x1.shape[1] + 3 : x1.shape[1] + 5] == fill_one_hot).all(), (
-        "Prefill did not fire: one-hot fill tokens not found after trigger"
+    torch.testing.assert_close(
+        out1[0, x1.shape[1] + 3 : x1.shape[1] + 5],
+        fill_one_hot @ model.embed_tokens.weight,
+        msg="Prefill did not fire: one-hot fill tokens not found after trigger",
     )
 
     x_batched = torch.full((2, 7), pad_token_id, dtype=torch.long)
@@ -701,7 +725,7 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     attention_mask[0, :3] = False
 
     out_batched = SoftGenerator(
-        vocab_size=vocab_size,
+        embedding_weight=model.embed_tokens.weight,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         prefill=prefill,
@@ -716,5 +740,7 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     torch.testing.assert_close(
         out1[0],
         out_batched[0, 3:],
+        atol=3e-5,
+        rtol=2e-5,
         msg="Batch element 0 (with prefill) doesn't match individual generation",
     )
