@@ -84,14 +84,6 @@ def _is_modal_installed():
     return importlib.util.find_spec("modal") is not None
 
 
-def _check_inside_modal_fn():
-    if _is_modal_installed():
-        import modal
-
-        return modal.current_function_call_id()
-    return False
-
-
 def get_state_to_str(
     format_messages: Callable[[list[Message], bool], str],
     reasoning_tag: str,
@@ -120,7 +112,7 @@ def get_prompt_template(enable_thinking: bool):
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
-@extty.experiment(project="grpo-countdown", server=_check_inside_modal_fn)
+@extty.experiment(project="grpo-countdown")
 def train(
     *,
     model_name: str = "qwen3-0.6b",
