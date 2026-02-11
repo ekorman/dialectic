@@ -711,7 +711,7 @@ def train_grpo(
                     optimizer_state_dict=opt.state_dict(),
                 )
 
-    if step % save_ckpt_freq != 0:
+    if step % save_ckpt_freq != 0 and extty._active_run is not None:
         extty.save_checkpoint(
             step=step,
             state_dict=net.state_dict(),
