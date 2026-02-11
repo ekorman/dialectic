@@ -271,6 +271,7 @@ class SoftGenerator(BaseTokenGenerator):
         pad_token_id: int = 151643,
         switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
         prefill: PreFill | None = None,
+        soft_token_noise_std: float | None = None,
     ):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
@@ -285,11 +286,20 @@ class SoftGenerator(BaseTokenGenerator):
         self.pad_token_id = pad_token_id
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
         self.prefill = prefill
+        d = embedding_weight.shape[1]
+        self.soft_token_noise_std = soft_token_noise_std
+        if soft_token_noise_std is not None:
+            self.normal_dist = torch.distributions.Normal(
+                torch.zeros(d), soft_token_noise_std * torch.ones(d)
+            )
 
     def _probs_to_soft_token(
         self, probs: Float[torch.Tensor, "B L V"]
     ) -> Float[torch.Tensor, "B L D"]:
-        return probs @ self.embedding_weight
+        soft_token = probs @ self.embedding_weight
+        if self.soft_token_noise_std is not None:
+            soft_token += self.normal_dist.sample([probs.shape[0]]).unsqueeze(1)
+        return soft_token
 
     def init_state(
         self,

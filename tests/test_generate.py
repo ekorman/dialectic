@@ -553,6 +553,165 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
             ), f"Batch 1, token {i}: should be soft (never switched)"
 
 
+def test_soft_generator_noise_is_stochastic():
+    """With noise enabled, repeated calls to _probs_to_soft_token should produce different outputs."""
+    torch.manual_seed(42)
+    vocab_size, d = 10, 8
+    embedding_weight = torch.randn(vocab_size, d)
+
+    gen = SoftGenerator(embedding_weight=embedding_weight, soft_token_noise_std=0.1)
+
+    probs = torch.softmax(torch.randn(1, 1, vocab_size), dim=-1)
+    out1 = gen._probs_to_soft_token(probs)
+    out2 = gen._probs_to_soft_token(probs)
+
+    assert not torch.allclose(out1, out2)
+
+
+def test_soft_generator_no_noise_is_deterministic():
+    """Without noise, repeated calls to _probs_to_soft_token should be identical."""
+    torch.manual_seed(42)
+    vocab_size, d = 10, 8
+    embedding_weight = torch.randn(vocab_size, d)
+
+    gen = SoftGenerator(embedding_weight=embedding_weight, soft_token_noise_std=None)
+
+    probs = torch.softmax(torch.randn(1, 1, vocab_size), dim=-1)
+    out1 = gen._probs_to_soft_token(probs)
+    out2 = gen._probs_to_soft_token(probs)
+
+    torch.testing.assert_close(out1, out2)
+
+
+def test_soft_generator_noise_scale_and_mean():
+    """Empirical noise statistics should match the configured distribution."""
+    torch.manual_seed(42)
+    vocab_size, d = 10, 32
+    embedding_weight = torch.randn(vocab_size, d)
+    noise_std = 0.5
+
+    gen_noisy = SoftGenerator(
+        embedding_weight=embedding_weight, soft_token_noise_std=noise_std
+    )
+    gen_clean = SoftGenerator(
+        embedding_weight=embedding_weight, soft_token_noise_std=None
+    )
+
+    probs = torch.softmax(torch.randn(1, 1, vocab_size), dim=-1)
+    clean = gen_clean._probs_to_soft_token(probs)
+
+    diffs = torch.stack(
+        [(gen_noisy._probs_to_soft_token(probs) - clean).squeeze() for _ in range(5000)]
+    )
+
+    empirical_std = diffs.std(dim=0).mean()
+    empirical_mean = diffs.mean(dim=0).abs().max()
+
+    assert abs(empirical_std - noise_std) < 0.05, (
+        f"Expected noise std ~{noise_std}, got {empirical_std:.4f}"
+    )
+    assert empirical_mean < 0.05, (
+        f"Expected noise mean ~0, got max abs mean {empirical_mean:.4f}"
+    )
+
+
+def test_soft_generator_noise_output_shape():
+    """Noisy soft tokens should preserve the (B, L, D) shape."""
+    vocab_size, d = 10, 8
+    embedding_weight = torch.randn(vocab_size, d)
+
+    gen = SoftGenerator(embedding_weight=embedding_weight, soft_token_noise_std=0.1)
+
+    probs = torch.softmax(torch.randn(1, 1, vocab_size), dim=-1)
+    assert gen._probs_to_soft_token(probs).shape == (1, 1, d)
+
+
+def test_soft_generator_noise_normal_dist_creation():
+    """normal_dist attribute should only exist when soft_token_noise_std is set."""
+    vocab_size, d = 10, 8
+    embedding_weight = torch.randn(vocab_size, d)
+
+    gen_no_noise = SoftGenerator(
+        embedding_weight=embedding_weight, soft_token_noise_std=None
+    )
+    gen_noise = SoftGenerator(
+        embedding_weight=embedding_weight, soft_token_noise_std=0.1
+    )
+
+    assert not hasattr(gen_no_noise, "normal_dist")
+    assert hasattr(gen_noise, "normal_dist")
+
+
+def test_soft_generator_noise_end_to_end(tiny_model: BaseTransformer):
+    """Full generation with noise should produce correctly shaped output
+    that differs from noiseless generation."""
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+
+    token_ids = torch.randint(0, model.vocab_size, (1, 4))
+    max_gen = 10
+
+    out_clean = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
+        eos_token_id=-1,
+        pad_token_id=0,
+        soft_token_noise_std=None,
+    ).generate(
+        net=model,
+        token_ids=token_ids,
+        max_tokens_generated=max_gen,
+        use_kv_cache=True,
+    )
+
+    out_noisy = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
+        eos_token_id=-1,
+        pad_token_id=0,
+        soft_token_noise_std=0.1,
+    ).generate(
+        net=model,
+        token_ids=token_ids,
+        max_tokens_generated=max_gen,
+        use_kv_cache=True,
+    )
+
+    assert out_clean.shape == out_noisy.shape
+    assert out_noisy.shape == (1, 4 + max_gen, model.d)
+    assert not torch.allclose(out_clean, out_noisy)
+
+
+def test_soft_generator_noise_batch_output_shape(MockGenerateModel):
+    """Noise should produce correct (B, L, D) shape in batched generation."""
+    torch.manual_seed(42)
+    vocab_size = 12
+
+    token_schedule = [
+        torch.tensor([3, 4]),
+        torch.tensor([5, 6]),
+        torch.tensor([2, 2]),
+    ]
+
+    model = MockGenerateModel(
+        token_schedule=token_schedule, vocab_size=vocab_size
+    ).eval()
+
+    token_ids = torch.tensor([[1, 7], [4, 5]])
+
+    out = SoftGenerator(
+        embedding_weight=model.embed_tokens.weight,
+        eos_token_id=2,
+        pad_token_id=8,
+        soft_token_noise_std=0.1,
+    ).generate(
+        net=model,
+        token_ids=token_ids,
+        max_tokens_generated=3,
+        use_kv_cache=False,
+    )
+
+    assert out.shape == (2, 5, model.hidden_dim)
+
+
 def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer):
     """Without a switch condition, all generated tokens should remain soft
     (not one-hot).
