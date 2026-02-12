@@ -93,7 +93,6 @@ def compute_log_probs(
     | list[Float[torch.Tensor, "B L_completion V"]],
     pad_token_id: int,
     chunk_size: int = 0,
-    switched_to_hard_tokens_step: Integer[torch.Tensor, " B"] | None = None,
 ) -> tuple[Float[torch.Tensor, "B G L_new"], Bool[torch.Tensor, "B G L_new"]]:
     """Compute log probabilities for completions.
 
@@ -107,7 +106,6 @@ def compute_log_probs(
         List of completion token tensors, one per group member.
     pad_token_id
         Token ID used for padding.
-    switched_to_hard_tokens_step
     chunk_size
         If > 0, compute log probs in chunks to reduce memory usage.
         Recommended: 64-128 for large vocab models.

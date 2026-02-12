@@ -31,13 +31,13 @@ class PreFill:
 @dataclass
 class HardTokenGeneratorOutput:
     tokens: Int[torch.Tensor, "B L"]
-    attention_mask: Bool[torch.Tensor, "B L"]
+    attention_mask: Bool[torch.Tensor, "B L"] | None
 
 
 @dataclass
 class SoftTokenGeneratorOutput:
     tokens: Float[torch.Tensor, "B L V"]  # softmax
-    attention_mask: Bool[torch.Tensor, "B L"]
+    attention_mask: Bool[torch.Tensor, "B L"] | None
     hard_tokens_mask: Bool[torch.Tensor, "B L"]
     embedding_weight: Float[torch.Tensor, "V D"]
 
@@ -357,6 +357,7 @@ class SoftGenerator(BaseTokenGenerator):
                 0.0,
                 self.soft_token_noise_std,
                 size=(input_tokens.shape[0], input_tokens.shape[1], net.d),
+                device=input_tokens.device,
             )
         else:
             noise = None
@@ -392,7 +393,6 @@ class SoftGenerator(BaseTokenGenerator):
 
             self.hard_tokens_mask = torch.cat([self.hard_tokens_mask, cond_met], 1)
 
-            # update next_token to one-hot where self.switched_to_hard_tokens_step > -1
             c = self.hard_tokens_mask[:, -1]
 
             if c.any():
@@ -445,10 +445,6 @@ class SoftGenerator(BaseTokenGenerator):
                     new_hard_tokens, self.vocab_size
                 )
                 self.all_tokens = torch.cat([self.all_tokens, new_hard_tokens], 1)
-                # i guess switch to all True (so including pad)
-                # just need to make sure theres no logic that continues hard/soft based off
-                # of previous mask value, but there should not be
-
                 self.hard_tokens_mask = torch.cat(
                     [
                         self.hard_tokens_mask,

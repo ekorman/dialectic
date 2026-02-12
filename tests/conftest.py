@@ -18,7 +18,7 @@ def MockGenerateModel():
             self.attn_head_d = 1
             self.layers = torch.nn.ModuleList([torch.nn.Identity()])
             self.dummy_param = torch.nn.Parameter(torch.zeros(1))
-            self.embed_tokens = torch.nn.Linear(vocab_size, 2, bias=False)
+            self.embed_tokens = torch.nn.Embedding(vocab_size, 2)
 
         def forward(
             self, input_ids, kv_caches=None, attention_mask=None, soft_token_noise=None
