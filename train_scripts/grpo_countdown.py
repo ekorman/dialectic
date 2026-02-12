@@ -124,9 +124,9 @@ def train(
     lr: float = 1e-5,
     beta: float = 0.04,
     binary_reward: bool = False,
-    n_larges: int = 2,
-    n_total: int = 6,
-    n_ops: int = 5,
+    n_larges: int | list[int] = 2,
+    n_total: int | list[int] = 6,
+    n_ops: int | list[int] = 5,
     seed: int,
     compile_model: bool = False,
     mu: int = 1,
@@ -273,13 +273,22 @@ def main():
         help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
     )
     parser.add_argument(
-        "--n-ops", type=int, default=5, help="Number of operands for Countdown"
+        "--n-ops",
+        type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),
+        default=5,
+        help="Number of ops for Countdown (comma-separated for multiple configs)",
     )
     parser.add_argument(
-        "--n-total", type=int, default=6, help="Number of large numbers for Countdown"
+        "--n-total",
+        type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),
+        default=6,
+        help="Total numbers for Countdown (comma-separated for multiple configs)",
     )
     parser.add_argument(
-        "--n-larges", type=int, default=2, help="Number of operands for Countdown"
+        "--n-larges",
+        type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),
+        default=2,
+        help="Number of large numbers for Countdown (comma-separated for multiple configs)",
     )
     parser.add_argument(
         "--mu", type=int, default=1, help="Optimization passes per batch"
