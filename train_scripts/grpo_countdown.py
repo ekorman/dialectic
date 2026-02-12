@@ -38,7 +38,7 @@ from dialectic.rl.reward import (
     think_tags,
     weighted_reward,
 )
-from dialectic.rl.train import train_grpo
+from dialectic.rl.train import train_grpo, train_soft_grpo
 
 load_dotenv()
 
@@ -137,6 +137,8 @@ def train(
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
+    soft_tokens: bool = False,
+    noise_std: float = 0.1,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -187,32 +189,37 @@ def train(
 
     state_to_str = get_state_to_str(format_messages, reasoning_tag)
 
+    shared = dict(
+        net=net,
+        opt=opt,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        eos_token_id=model_info.eos_token_id,
+        pad_token_id=model_info.pad_token_id,
+        extractor=extract_from_answer_tags,
+        beta=beta,
+        eps=0.2,
+        mu=mu,
+        max_tokens_generated=max_tokens,
+        max_episodes=max_episodes,
+        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+        batch_size=batch_size,
+        group_size=group_size,
+        temperature=0.7,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        logprob_chunk_size=logprob_chunk_size,
+        use_bf16=use_bf16,
+        save_ckpt_freq=save_ckpt_freq,
+    )
+
     try:
-        train_grpo(
-            net=net,
-            opt=opt,
-            env=env,
-            reward_fn=reward_fn,
-            state_to_str=state_to_str,
-            tokenizer=tokenizer,
-            eos_token_id=model_info.eos_token_id,
-            pad_token_id=model_info.pad_token_id,
-            extractor=extract_from_answer_tags,
-            beta=beta,
-            eps=0.2,
-            mu=mu,
-            max_tokens_generated=max_tokens,
-            max_episodes=max_episodes,
-            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-            batch_size=batch_size,
-            group_size=group_size,
-            temperature=0.7,
-            accumulation_steps=accumulation_steps,
-            max_grad_norm=max_grad_norm,
-            logprob_chunk_size=logprob_chunk_size,
-            use_bf16=use_bf16,
-            save_ckpt_freq=save_ckpt_freq,
-        )
+        if soft_tokens:
+            train_soft_grpo(**shared, noise_std=noise_std)  # type: ignore[arg-type]
+        else:
+            train_grpo(**shared)  # type: ignore[arg-type]
     finally:
         extty.finish()
 
@@ -348,6 +355,18 @@ def main():
     )
 
     parser.add_argument("--compile-model", action="store_true", help="compile model")
+    parser.add_argument(
+        "--soft-tokens",
+        action="store_true",
+        default=False,
+        help="Use soft token generation (train_soft_grpo)",
+    )
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=0.1,
+        help="Noise std for soft token generation (only used with --soft-tokens)",
+    )
     args = parser.parse_args()
 
     train(
@@ -372,6 +391,8 @@ def main():
         use_qwen_thinking=args.use_qwen_thinking,
         compile_model=args.compile_model,
         seed=args.seed,
+        soft_tokens=args.soft_tokens,
+        noise_std=args.noise_std,
     )
 
 

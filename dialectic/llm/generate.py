@@ -40,6 +40,7 @@ class SoftTokenGeneratorOutput:
     attention_mask: Bool[torch.Tensor, "B L"] | None
     hard_tokens_mask: Bool[torch.Tensor, "B L"]
     embedding_weight: Float[torch.Tensor, "V D"]
+    noise: Float[torch.Tensor, "B L D"] | None
 
 
 def check_and_apply_prefill(
@@ -340,6 +341,8 @@ class _SoftGenerator(_BaseTokenGenerator):
         # mask is True where we use hard tokens
         self.hard_tokens_mask = torch.ones_like(initial_input, dtype=torch.bool)
 
+        self.all_noise: list[Tensor] = []
+
         if self.switch_to_hard_tokens_condition is not None:
             self.switch_to_hard_tokens_condition = (
                 self.switch_to_hard_tokens_condition.to(self.device)
@@ -359,6 +362,7 @@ class _SoftGenerator(_BaseTokenGenerator):
                 size=(input_tokens.shape[0], input_tokens.shape[1], net.d),
                 device=input_tokens.device,
             )
+            self.all_noise.append(noise)
         else:
             noise = None
         return net(
@@ -483,11 +487,28 @@ class _SoftGenerator(_BaseTokenGenerator):
             use_bf16=use_bf16,
         )
 
+        if self.all_noise:
+            noise = torch.cat(self.all_noise, dim=1)
+            n_pad = self.all_tokens.shape[1] - noise.shape[1]
+            if n_pad > 0:
+                noise = torch.cat(
+                    [
+                        noise,
+                        torch.zeros(
+                            noise.shape[0], n_pad, noise.shape[2], device=noise.device
+                        ),
+                    ],
+                    dim=1,
+                )
+        else:
+            noise = None
+
         return SoftTokenGeneratorOutput(
             tokens=self.all_tokens,
             attention_mask=self.attention_mask,
             hard_tokens_mask=self.hard_tokens_mask,
             embedding_weight=net.embed_tokens.weight,
+            noise=noise,
         )
 
     @property

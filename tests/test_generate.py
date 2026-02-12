@@ -711,3 +711,45 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
         out_batched[0, 3:],
         msg="Batch element 0 (with prefill) doesn't match individual generation",
     )
+
+
+def test_soft_generator_noise_shape(tiny_model: BaseTransformer):
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    b, prompt_len = 2, 4
+    n_gen = 10
+
+    x = torch.randint(1, vocab_size, size=(b, prompt_len))
+    out = generate_soft_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=n_gen,
+        use_kv_cache=True,
+        soft_token_noise_std=0.1,
+    )
+
+    assert out.noise is not None
+    assert out.noise.shape == (b, prompt_len + n_gen, model.d)
+    assert out.tokens.shape == (b, prompt_len + n_gen, vocab_size)
+
+
+def test_soft_generator_no_noise_without_std(tiny_model: BaseTransformer):
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    b, prompt_len = 2, 4
+
+    x = torch.randint(1, vocab_size, size=(b, prompt_len))
+    out = generate_soft_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=5,
+        use_kv_cache=True,
+    )
+
+    assert out.noise is None
