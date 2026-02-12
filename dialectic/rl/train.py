@@ -89,7 +89,8 @@ def compute_log_probs(
     *,
     net: BaseTransformer,
     attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
+    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]]
+    | list[Float[torch.Tensor, "B L_completion V"]],
     pad_token_id: int,
     chunk_size: int = 0,
 ) -> tuple[Float[torch.Tensor, "B G L_new"], Bool[torch.Tensor, "B G L_new"]]:
@@ -294,7 +295,7 @@ def generate_rollout_batch(
         use_kv_cache=True,
         max_tokens_generated=max_tokens_generated,
         use_bf16=use_bf16,
-    )
+    ).tokens
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
         net.train()

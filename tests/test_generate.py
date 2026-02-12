@@ -32,7 +32,7 @@ def test_generate_from_tokens_preserves_eos(MockGenerateModel):
         use_kv_cache=False,
     )
 
-    assert result[0].tolist() == [1, 3, 5, 6, eos_token_id]
+    assert result.tokens[0].tolist() == [1, 3, 5, 6, eos_token_id]
 
 
 def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
@@ -60,7 +60,7 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
         use_kv_cache=False,
     )
 
-    assert result[0].tolist() == [
+    assert result.tokens[0].tolist() == [
         1,
         3,
         5,
@@ -69,7 +69,7 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
         pad_token_id,
         pad_token_id,
     ]
-    assert result[1].tolist() == [
+    assert result.tokens[1].tolist() == [
         pad_token_id,
         3,
         5,
@@ -78,7 +78,7 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
         pad_token_id,
         pad_token_id,
     ]
-    assert result[2].tolist() == [
+    assert result.tokens[2].tolist() == [
         5,
         7,
         7,
@@ -123,7 +123,7 @@ def test_soft_tokens_generation(tiny_model: BaseTransformer):
         soft_tokens=True,
     )
 
-    assert output.shape == torch.Size((b, l + 24, tiny_model.vocab_size))
+    assert output.tokens.shape == torch.Size((b, l + 24, tiny_model.vocab_size))
 
 
 def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerateModel):
@@ -154,8 +154,8 @@ def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerate
         soft_tokens=True,
     )
 
-    assert output.shape == torch.Size((3, 2 + max_tokens_generated, vocab_size))
-    generated_tokens = output[:, 2:]
+    assert output.tokens.shape == torch.Size((3, 2 + max_tokens_generated, vocab_size))
+    generated_tokens = output.tokens[:, 2:]
 
     pad_token_one_hot = torch.nn.functional.one_hot(
         torch.tensor(pad_token_id), vocab_size
@@ -199,9 +199,9 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
         soft_tokens=True,
     )
 
-    assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shape == torch.Size((3, 5, vocab_size))
-    generated_tokens = output[:, 2:]
+    assert output.tokens.shape[1] < token_ids.shape[1] + max_tokens_generated
+    assert output.tokens.shape == torch.Size((3, 5, vocab_size))
+    generated_tokens = output.tokens[:, 2:]
 
     def _create_one_hot(token_id):
         return torch.nn.functional.one_hot(torch.tensor(token_id), vocab_size)
@@ -296,15 +296,19 @@ def test_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
     x1 = torch.randint(1, vocab_size, size=(1, 4))
     x2 = torch.randint(1, vocab_size, size=(1, 7))
 
-    out1_natural = HardGenerator(
-        sampling_strategy="greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    ).generate(
-        net=model,
-        token_ids=x1,
-        max_tokens_generated=20,
-        use_kv_cache=True,
+    out1_natural = (
+        HardGenerator(
+            sampling_strategy="greedy",
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        .generate(
+            net=model,
+            token_ids=x1,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     generated1 = out1_natural[0, x1.shape[1] :]
@@ -315,16 +319,20 @@ def test_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
 
     prefill = PreFill(condition=trigger, filling=fill)
 
-    out1 = HardGenerator(
-        sampling_strategy="greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x1,
-        max_tokens_generated=20,
-        use_kv_cache=True,
+    out1 = (
+        HardGenerator(
+            sampling_strategy="greedy",
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x1,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     assert (out1[0, x1.shape[1] + 3 : x1.shape[1] + 5] == fill).all(), (
@@ -338,17 +346,21 @@ def test_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):
     attention_mask = torch.ones(2, 7, dtype=torch.bool)
     attention_mask[0, :3] = False
 
-    out_batched = HardGenerator(
-        sampling_strategy="greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x_batched,
-        max_tokens_generated=20,
-        use_kv_cache=True,
-        attention_mask=attention_mask,
+    out_batched = (
+        HardGenerator(
+            sampling_strategy="greedy",
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x_batched,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+            attention_mask=attention_mask,
+        )
+        .tokens
     )
 
     assert (out1[0] == out_batched[0, 3:]).all(), (
@@ -369,15 +381,19 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out_natural = HardGenerator(
-        sampling_strategy="greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=20,
-        use_kv_cache=False,
+    out_natural = (
+        HardGenerator(
+            sampling_strategy="greedy",
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=20,
+            use_kv_cache=False,
+        )
+        .tokens
     )
 
     generated = out_natural[0, x.shape[1] :]
@@ -388,16 +404,20 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
 
     prefill = PreFill(condition=trigger, filling=fill)
 
-    out_prefill = HardGenerator(
-        sampling_strategy="greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=20,
-        use_kv_cache=False,
+    out_prefill = (
+        HardGenerator(
+            sampling_strategy="greedy",
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=20,
+            use_kv_cache=False,
+        )
+        .tokens
     )
 
     assert (
@@ -427,32 +447,40 @@ def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out_no_switch = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-        switch_to_hard_tokens_condition=None,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out_no_switch = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+            switch_to_hard_tokens_condition=None,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     generated_no_switch = out_no_switch[0, x.shape[1] :]
     shadow_tokens = generated_no_switch.argmax(-1)
     switch_condition = shadow_tokens[:3]
 
-    out_with_switch = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-        switch_to_hard_tokens_condition=switch_condition,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out_with_switch = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+            switch_to_hard_tokens_condition=switch_condition,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     generated_with_switch = out_with_switch[0, x.shape[1] :]
@@ -482,27 +510,35 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
     x1 = torch.randint(1, vocab_size, size=(1, 4))
     x2 = torch.randint(1, vocab_size, size=(1, 4))
 
-    out1 = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-    ).generate(
-        net=model,
-        token_ids=x1,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out1 = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+        )
+        .generate(
+            net=model,
+            token_ids=x1,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
     shadow1 = out1[0, x1.shape[1] :].argmax(-1)
 
-    out2 = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-    ).generate(
-        net=model,
-        token_ids=x2,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out2 = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+        )
+        .generate(
+            net=model,
+            token_ids=x2,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
     shadow2 = out2[0, x2.shape[1] :].argmax(-1)
 
@@ -517,16 +553,20 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
 
     x_batched = torch.cat([x1, x2], dim=0)
 
-    out_batched = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-        switch_to_hard_tokens_condition=switch_condition,
-    ).generate(
-        net=model,
-        token_ids=x_batched,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out_batched = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+            switch_to_hard_tokens_condition=switch_condition,
+        )
+        .generate(
+            net=model,
+            token_ids=x_batched,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     generated_batched = out_batched[:, x1.shape[1] :]
@@ -567,16 +607,20 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=-1,
-        pad_token_id=0,
-        switch_to_hard_tokens_condition=None,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=10,
-        use_kv_cache=True,
+    out = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=-1,
+            pad_token_id=0,
+            switch_to_hard_tokens_condition=None,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=10,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     generated = out[0, x.shape[1] :]
@@ -586,6 +630,38 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
         assert not _is_one_hot(token_dist), (
             f"Token {i} should be soft (no switch condition set)"
         )
+
+
+def test_soft_generator_hard_tokens_mask_without_switch_condition(
+    tiny_model: BaseTransformer,
+):
+    """Without a switch condition, prompt tokens should be marked hard and
+    generated tokens should be marked soft in hard_tokens_mask."""
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    prompt_len = 4
+
+    x = torch.randint(1, vocab_size, size=(1, prompt_len))
+    n_gen = 10
+
+    out = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=None,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=n_gen,
+        use_kv_cache=True,
+    )
+
+    assert out.hard_tokens_mask[0, :prompt_len].all(), "Prompt positions should be hard"
+    assert not out.hard_tokens_mask[0, prompt_len:].any(), (
+        "Generated positions should be soft when no switch condition is set"
+    )
 
 
 def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
@@ -600,15 +676,19 @@ def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer
 
     x = torch.randint(1, vocab_size, size=(1, 4))
 
-    out_natural = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=20,
-        use_kv_cache=False,
+    out_natural = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=20,
+            use_kv_cache=False,
+        )
+        .tokens
     )
 
     shadow_tokens = out_natural[0, x.shape[1] :].argmax(-1)
@@ -619,16 +699,20 @@ def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer
 
     prefill = PreFill(condition=trigger, filling=fill)
 
-    out_prefill = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x,
-        max_tokens_generated=20,
-        use_kv_cache=False,
+    out_prefill = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x,
+            max_tokens_generated=20,
+            use_kv_cache=False,
+        )
+        .tokens
     )
 
     torch.testing.assert_close(
@@ -657,15 +741,19 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     x1 = torch.randint(1, vocab_size, size=(1, 4))
     x2 = torch.randint(1, vocab_size, size=(1, 7))
 
-    out1_natural = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    ).generate(
-        net=model,
-        token_ids=x1,
-        max_tokens_generated=20,
-        use_kv_cache=True,
+    out1_natural = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+        .generate(
+            net=model,
+            token_ids=x1,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     shadow_tokens = out1_natural[0, x1.shape[1] :].argmax(-1)
@@ -676,16 +764,20 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
 
     prefill = PreFill(condition=trigger, filling=fill)
 
-    out1 = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x1,
-        max_tokens_generated=20,
-        use_kv_cache=True,
+    out1 = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x1,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+        )
+        .tokens
     )
 
     fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
@@ -700,17 +792,21 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
     attention_mask = torch.ones(2, 7, dtype=torch.bool)
     attention_mask[0, :3] = False
 
-    out_batched = SoftGenerator(
-        vocab_size=vocab_size,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net=model,
-        token_ids=x_batched,
-        max_tokens_generated=20,
-        use_kv_cache=True,
-        attention_mask=attention_mask,
+    out_batched = (
+        SoftGenerator(
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            prefill=prefill,
+        )
+        .generate(
+            net=model,
+            token_ids=x_batched,
+            max_tokens_generated=20,
+            use_kv_cache=True,
+            attention_mask=attention_mask,
+        )
+        .tokens
     )
 
     torch.testing.assert_close(

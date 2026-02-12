@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
@@ -26,6 +26,20 @@ class PreFill:
         self.condition = self.condition.to(device)
         self.filling = self.filling.to(device)
         return self
+
+
+@dataclass
+class HardTokenGeneratorOutput:
+    tokens: Int[torch.Tensor, "B L"]
+    attention_mask: Bool[torch.Tensor, "B L"] | None
+
+
+@dataclass
+class SoftTokenGeneratorOutput:
+    tokens: Float[torch.Tensor, "B L V"]  # softmax
+    attention_mask: Bool[torch.Tensor, "B L"] | None
+    hard_tokens_mask: Bool[torch.Tensor, "B L"]
+    embedding_weight: Float[torch.Tensor, "V D"]
 
 
 def check_and_apply_prefill(
@@ -76,7 +90,7 @@ class BaseTokenGenerator(ABC):
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ):
-        self.all_inputs = initial_input
+        self.all_tokens = initial_input
         self.device = initial_input.device
         self.batch_size = initial_input.shape[0]
         self.attention_mask = attention_mask
@@ -93,14 +107,24 @@ class BaseTokenGenerator(ABC):
     @abstractmethod
     def finished(self) -> bool: ...
 
-    @abstractmethod
-    def get_all_tensors(self) -> torch.Tensor: ...
-
     @property
     def _extra_tokens_per_step_bound(self) -> int:
         return 0
 
-    def generate(
+    def net_forward(
+        self,
+        net: BaseTransformer,
+        input_tokens: torch.Tensor,
+        kv_caches: list[KVCache] | None,
+        attention_mask: Bool[torch.Tensor, "B L"],
+    ):
+        return net(
+            input_tokens,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+        )
+
+    def _generate(
         self,
         net: BaseTransformer,
         token_ids: Int[Tensor, "B L"],
@@ -133,13 +157,14 @@ class BaseTokenGenerator(ABC):
             with torch.autocast(
                 device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
             ):
-                logits: Float[torch.Tensor, "B 1 V"] = net(
-                    input_tokens,
+                logits: Float[torch.Tensor, "B 1 V"] = self.net_forward(
+                    net=net,
+                    input_tokens=input_tokens,
                     kv_caches=kv_caches,
                     attention_mask=self.attention_mask,
                 )
 
-            prev_len = self.all_inputs.shape[1]
+            prev_len = self.all_tokens.shape[1]
             is_done = self.get_next_inputs(logits)
 
             if is_done:
@@ -152,7 +177,7 @@ class BaseTokenGenerator(ABC):
                 # get pad tokens here which shifts their RoPE positions. This is
                 # negligible for small fill lengths since the relative distances
                 # between the element's own real tokens are preserved.
-                n_new = self.all_inputs.shape[1] - prev_len
+                n_new = self.all_tokens.shape[1] - prev_len
                 for i in range(n_new - 1):
                     mask = (
                         self.attention_mask[:, : prev_len + i + 1]
@@ -162,18 +187,19 @@ class BaseTokenGenerator(ABC):
                     with torch.autocast(
                         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
                     ):
-                        net(
-                            self.all_inputs[:, prev_len + i : prev_len + i + 1],
+                        self.net_forward(
+                            net=net,
+                            input_tokens=self.all_tokens[
+                                :, prev_len + i : prev_len + i + 1
+                            ],
                             kv_caches=kv_caches,
                             attention_mask=mask,
                         )
-                input_tokens = self.all_inputs[:, -1:]
+                input_tokens = self.all_tokens[:, -1:]
             else:
-                input_tokens = self.all_inputs
+                input_tokens = self.all_tokens
 
             self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
-
-        return self.get_all_tensors()
 
 
 class HardGenerator(BaseTokenGenerator):
@@ -214,9 +240,9 @@ class HardGenerator(BaseTokenGenerator):
             next_token,
         )
 
-        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.all_tokens = torch.cat([self.all_tokens, next_token], 1)
 
-        self._finished = self._finished | (self.all_inputs[:, -1] == self.eos_token_id)
+        self._finished = self._finished | (self.all_tokens[:, -1] == self.eos_token_id)
         if self.finished:
             return True
 
@@ -225,15 +251,15 @@ class HardGenerator(BaseTokenGenerator):
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
 
         if self.prefill:
-            self.all_inputs, self.attention_mask = check_and_apply_prefill(
-                token_ids=self.all_inputs,
+            self.all_tokens, self.attention_mask = check_and_apply_prefill(
+                token_ids=self.all_tokens,
                 prefill=self.prefill,
                 pad_token_id=self.pad_token_id,
                 attention_mask=self.attention_mask,
             )
 
             self._finished = self._finished | (
-                self.all_inputs[:, -1] == self.eos_token_id
+                self.all_tokens[:, -1] == self.eos_token_id
             )
 
             if self.finished:
@@ -241,8 +267,26 @@ class HardGenerator(BaseTokenGenerator):
 
         return False
 
-    def get_all_tensors(self) -> torch.Tensor:
-        return self.all_inputs
+    def generate(
+        self,
+        net: BaseTransformer,
+        token_ids: Int[Tensor, "B L"],
+        max_tokens_generated: int = sys.maxsize,
+        use_kv_cache: bool = True,
+        attention_mask: torch.Tensor | None = None,  # should be left-padded
+        use_bf16: bool = False,
+    ) -> HardTokenGeneratorOutput:
+        super()._generate(
+            net=net,
+            token_ids=token_ids,
+            max_tokens_generated=max_tokens_generated,
+            use_kv_cache=use_kv_cache,
+            attention_mask=attention_mask,
+            use_bf16=use_bf16,
+        )
+        return HardTokenGeneratorOutput(
+            tokens=self.all_tokens, attention_mask=self.attention_mask
+        )
 
     @property
     def _extra_tokens_per_step_bound(self) -> int:
@@ -264,6 +308,7 @@ class SoftGenerator(BaseTokenGenerator):
         pad_token_id: int = 151643,
         switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
         prefill: PreFill | None = None,
+        soft_token_noise_std: float | None = None,
     ):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
@@ -277,27 +322,51 @@ class SoftGenerator(BaseTokenGenerator):
         self.pad_token_id = pad_token_id
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
         self.prefill = prefill
+        self.soft_token_noise_std = soft_token_noise_std
 
     def init_state(
         self,
-        initial_input: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        initial_input: Int[torch.Tensor, "B L"],
+        attention_mask: Bool[torch.Tensor, "B L"] | None,
     ):
         super().init_state(initial_input=initial_input, attention_mask=attention_mask)
         if self.prefill is not None:
             self.prefill = self.prefill.to(self.device)
         self.shadow_seq = initial_input
-        self.all_inputs = torch.nn.functional.one_hot(
-            self.all_inputs, self.vocab_size
+        self.all_tokens = torch.nn.functional.one_hot(
+            self.all_tokens, self.vocab_size
         ).float()
+
+        # mask is True where we use hard tokens
+        self.hard_tokens_mask = torch.ones_like(initial_input, dtype=torch.bool)
+
         if self.switch_to_hard_tokens_condition is not None:
             self.switch_to_hard_tokens_condition = (
                 self.switch_to_hard_tokens_condition.to(self.device)
             )
-            # batch size length tensor for when we moved to hard token sampling
-            self.switched_to_hard_tokens_step = -1 * torch.ones(
-                self.batch_size, dtype=torch.int64, device=self.device
+
+    def net_forward(
+        self,
+        net: BaseTransformer,
+        input_tokens: torch.Tensor,
+        kv_caches: list[KVCache] | None,
+        attention_mask: Bool[torch.Tensor, "B L"],
+    ):
+        if self.soft_token_noise_std is not None:
+            noise = torch.normal(
+                0.0,
+                self.soft_token_noise_std,
+                size=(input_tokens.shape[0], input_tokens.shape[1], net.d),
+                device=input_tokens.device,
             )
+        else:
+            noise = None
+        return net(
+            input_tokens,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+            soft_token_noise=noise,
+        )
 
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
         scaled_logits = logits / self.temperature
@@ -317,19 +386,15 @@ class SoftGenerator(BaseTokenGenerator):
 
         if self.switch_to_hard_tokens_condition is not None:
             # update self.switched_to_hard_tokens_step
-            cond_met = (
+            cond_met: Bool[torch.Tensor, " B"] = (
                 self.shadow_seq[:, -len(self.switch_to_hard_tokens_condition) :]
                 == self.switch_to_hard_tokens_condition
-            ).all(1)
-            self.switched_to_hard_tokens_step = torch.where(
-                cond_met & (self.switched_to_hard_tokens_step == -1),
-                self.n_generated,
-                self.switched_to_hard_tokens_step,
-            )
+            ).all(1, keepdim=True)
 
-            # update next_token to one-hot where self.switched_to_hard_tokens_step > -1
-            # next_token = torch.nn.functional.one_hot(hard_token_id, logits.shape[-1])
-            c = self.switched_to_hard_tokens_step > -1
+            self.hard_tokens_mask = torch.cat([self.hard_tokens_mask, cond_met], 1)
+
+            c = self.hard_tokens_mask[:, -1]
+
             if c.any():
                 next_token = torch.where(
                     c.unsqueeze(-1).unsqueeze(-1),
@@ -338,12 +403,24 @@ class SoftGenerator(BaseTokenGenerator):
                     ),
                     next_token,
                 )
+        else:
+            self.hard_tokens_mask = torch.cat(
+                [
+                    self.hard_tokens_mask,
+                    torch.zeros(
+                        (self.batch_size, 1),
+                        dtype=torch.bool,
+                        device=self.hard_tokens_mask.device,
+                    ),
+                ],
+                1,
+            )
 
         self._finished = self._finished | (
             hard_token_id.squeeze(-1) == self.eos_token_id
         )
 
-        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.all_tokens = torch.cat([self.all_tokens, next_token], 1)
         self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
 
         if self.finished:
@@ -361,13 +438,24 @@ class SoftGenerator(BaseTokenGenerator):
                 attention_mask=self.attention_mask,
             )
 
-            n_added = self.shadow_seq.shape[1] - self.all_inputs.shape[1]
+            n_added = self.shadow_seq.shape[1] - self.all_tokens.shape[1]
             if n_added > 0:
                 new_hard_tokens = self.shadow_seq[:, -n_added:]
                 new_hard_tokens = torch.nn.functional.one_hot(
                     new_hard_tokens, self.vocab_size
                 )
-                self.all_inputs = torch.cat([self.all_inputs, new_hard_tokens], 1)
+                self.all_tokens = torch.cat([self.all_tokens, new_hard_tokens], 1)
+                self.hard_tokens_mask = torch.cat(
+                    [
+                        self.hard_tokens_mask,
+                        torch.ones(
+                            (self.batch_size, n_added),
+                            dtype=torch.bool,
+                            device=self.hard_tokens_mask.device,
+                        ),
+                    ],
+                    1,
+                )
 
             self._finished = self._finished | (
                 self.shadow_seq[:, -1] == self.eos_token_id
@@ -377,8 +465,30 @@ class SoftGenerator(BaseTokenGenerator):
 
         return False
 
-    def get_all_tensors(self) -> torch.Tensor:
-        return self.all_inputs
+    def generate(
+        self,
+        net: BaseTransformer,
+        token_ids: Int[Tensor, "B L"],
+        max_tokens_generated: int = sys.maxsize,
+        use_kv_cache: bool = True,
+        attention_mask: torch.Tensor | None = None,  # should be left-padded
+        use_bf16: bool = False,
+    ) -> SoftTokenGeneratorOutput:
+        super()._generate(
+            net=net,
+            token_ids=token_ids,
+            max_tokens_generated=max_tokens_generated,
+            use_kv_cache=use_kv_cache,
+            attention_mask=attention_mask,
+            use_bf16=use_bf16,
+        )
+
+        return SoftTokenGeneratorOutput(
+            tokens=self.all_tokens,
+            attention_mask=self.attention_mask,
+            hard_tokens_mask=self.hard_tokens_mask,
+            embedding_weight=net.embed_tokens.weight,
+        )
 
     @property
     def finished(self) -> bool:
@@ -404,7 +514,7 @@ def generate_from_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     soft_tokens: bool = False,
-) -> Int[Tensor, "B L"] | Float[Tensor, "B L V"]:
+) -> HardTokenGeneratorOutput | SoftTokenGeneratorOutput:
     if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 
@@ -466,7 +576,7 @@ def generate_from_text(
         use_kv_cache=use_kv_cache,
         attention_mask=attention_mask,
         temperature=temperature,
-    )
+    ).tokens
 
     return [tokenizer.decode(batch.tolist()) for batch in token_ids]
 

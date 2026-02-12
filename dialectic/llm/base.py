@@ -55,11 +55,14 @@ class BaseTransformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
+        soft_token_noise: Float[torch.Tensor, "B L D"] | None = None,
     ):
         if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
         else:
             x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
+            if soft_token_noise is not None:
+                x += soft_token_noise
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
