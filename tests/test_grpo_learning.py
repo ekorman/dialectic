@@ -14,6 +14,7 @@ from copy import deepcopy
 
 import torch
 
+from dialectic.llm.generate import HardTokenGeneratorOutput
 from dialectic.llm.qwen import create_qwen
 from dialectic.rl.env import Countdown, Env, EpisodeIsDoneError
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -303,7 +304,9 @@ class TestGRPOMechanics:
                 dtype=token_ids.dtype,
                 device=token_ids.device,
             )
-            return torch.cat([token_ids, extra], dim=1)
+            return HardTokenGeneratorOutput(
+                tokens=torch.cat([token_ids, extra], dim=1), attention_mask=None
+            )
 
         monkeypatch.setattr(
             "dialectic.rl.train.generate_from_tokens",
