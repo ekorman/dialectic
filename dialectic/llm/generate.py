@@ -572,7 +572,7 @@ def generate_from_text(
         use_kv_cache=use_kv_cache,
         attention_mask=attention_mask,
         temperature=temperature,
-    )
+    ).tokens
 
     return [tokenizer.decode(batch.tolist()) for batch in token_ids]
 

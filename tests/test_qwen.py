@@ -132,7 +132,7 @@ def test_qwen_generate_from_tokens():
         max_tokens_generated=24,
         use_kv_cache=False,
         sampling_strategy="greedy",
-    )
+    ).tokens
 
     out_with_cache = generate_from_tokens(
         net=model,
@@ -141,7 +141,7 @@ def test_qwen_generate_from_tokens():
         max_tokens_generated=24,
         use_kv_cache=True,
         sampling_strategy="greedy",
-    )
+    ).tokens
 
     torch.testing.assert_close(out_no_cache, out_with_cache)
     assert out_with_cache.shape == torch.Size((b, 24 + l))
@@ -154,7 +154,7 @@ def test_qwen_generate_from_tokens():
         max_tokens_generated=24,
         use_kv_cache=False,
         sampling_strategy="greedy",
-    )
+    ).tokens
     assert out_singleton.shape == torch.Size((1, 24 + l))
     torch.testing.assert_close(out_singleton, out_with_cache[:1])
 
@@ -252,7 +252,7 @@ def test_qwen_generate_from_tokens_attention_mask():
         use_kv_cache=False,
         sampling_strategy="greedy",
         attention_mask=None,
-    )
+    ).tokens
     out2 = generate_from_tokens(
         net=model,
         token_ids=x2,
@@ -261,7 +261,7 @@ def test_qwen_generate_from_tokens_attention_mask():
         use_kv_cache=False,
         sampling_strategy="greedy",
         attention_mask=None,
-    )
+    ).tokens
     out_batched = generate_from_tokens(
         net=model,
         token_ids=x_batched,
@@ -270,7 +270,7 @@ def test_qwen_generate_from_tokens_attention_mask():
         use_kv_cache=False,
         sampling_strategy="greedy",
         attention_mask=attention_mask,
-    )
+    ).tokens
 
     assert (out1 == out_batched[:1, 3:]).all()
     assert (out2 == out_batched[1:]).all()
@@ -313,7 +313,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
         use_kv_cache=True,
         sampling_strategy="greedy",
         attention_mask=None,
-    )
+    ).tokens
     out2 = generate_from_tokens(
         net=model,
         token_ids=x2,
@@ -322,7 +322,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
         use_kv_cache=True,
         sampling_strategy="greedy",
         attention_mask=None,
-    )
+    ).tokens
     out_batched = generate_from_tokens(
         net=model,
         token_ids=x_batched,
@@ -331,7 +331,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
         use_kv_cache=True,
         sampling_strategy="greedy",
         attention_mask=attention_mask,
-    )
+    ).tokens
 
     assert (out1 == out_batched[:1, 3:]).all()
     assert (out2 == out_batched[1:]).all()
@@ -362,7 +362,7 @@ def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel
         sampling_strategy="greedy",
         max_tokens_generated=max_tokens_generated,
         use_kv_cache=True,
-    )
+    ).tokens
 
     assert output.shape == torch.Size((3, 2 + max_tokens_generated))
     generated_tokens = output[:, 2:]
@@ -400,7 +400,7 @@ def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
         sampling_strategy="greedy",
         max_tokens_generated=max_tokens_generated,
         use_kv_cache=True,
-    )
+    ).tokens
 
     assert output.shape[1] < token_ids.shape[1] + max_tokens_generated
     assert output.shape == torch.Size((3, 5))
@@ -436,7 +436,7 @@ def test_qwen_generate_temperature():
         eos_token_id=-1,
         max_tokens_generated=10,
         sampling_strategy="greedy",
-    )
+    ).tokens
 
     # very low temperature should approximate greedy
     out_low_temp = generate_from_tokens(
@@ -446,7 +446,7 @@ def test_qwen_generate_temperature():
         max_tokens_generated=10,
         sampling_strategy="sample",
         temperature=0.00001,
-    )
+    ).tokens
 
     torch.testing.assert_close(out_greedy, out_low_temp)
 
