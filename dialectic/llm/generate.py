@@ -405,7 +405,15 @@ class SoftGenerator(BaseTokenGenerator):
                 )
         else:
             self.hard_tokens_mask = torch.cat(
-                [self.hard_tokens_mask, self.hard_tokens_mask[:, -1:]], 1
+                [
+                    self.hard_tokens_mask,
+                    torch.zeros(
+                        (self.batch_size, 1),
+                        dtype=torch.bool,
+                        device=self.hard_tokens_mask.device,
+                    ),
+                ],
+                1,
             )
 
         self._finished = self._finished | (

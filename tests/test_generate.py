@@ -632,6 +632,38 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
         )
 
 
+def test_soft_generator_hard_tokens_mask_without_switch_condition(
+    tiny_model: BaseTransformer,
+):
+    """Without a switch condition, prompt tokens should be marked hard and
+    generated tokens should be marked soft in hard_tokens_mask."""
+
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    prompt_len = 4
+
+    x = torch.randint(1, vocab_size, size=(1, prompt_len))
+    n_gen = 10
+
+    out = SoftGenerator(
+        vocab_size=vocab_size,
+        eos_token_id=-1,
+        pad_token_id=0,
+        switch_to_hard_tokens_condition=None,
+    ).generate(
+        net=model,
+        token_ids=x,
+        max_tokens_generated=n_gen,
+        use_kv_cache=True,
+    )
+
+    assert out.hard_tokens_mask[0, :prompt_len].all(), "Prompt positions should be hard"
+    assert not out.hard_tokens_mask[0, prompt_len:].any(), (
+        "Generated positions should be soft when no switch condition is set"
+    )
+
+
 def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
     """Soft generator prefill should insert one-hot encoded fill tokens into the
     output at the position where the shadow sequence matches the trigger.
