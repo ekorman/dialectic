@@ -89,9 +89,11 @@ def compute_log_probs(
     *,
     net: BaseTransformer,
     attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]],
+    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]]
+    | list[Float[torch.Tensor, "B L_completion V"]],
     pad_token_id: int,
     chunk_size: int = 0,
+    switched_to_hard_tokens_step: Integer[torch.Tensor, " B"] | None = None,
 ) -> tuple[Float[torch.Tensor, "B G L_new"], Bool[torch.Tensor, "B G L_new"]]:
     """Compute log probabilities for completions.
 
@@ -105,6 +107,7 @@ def compute_log_probs(
         List of completion token tensors, one per group member.
     pad_token_id
         Token ID used for padding.
+    switched_to_hard_tokens_step
     chunk_size
         If > 0, compute log probs in chunks to reduce memory usage.
         Recommended: 64-128 for large vocab models.
@@ -294,7 +297,7 @@ def generate_rollout_batch(
         use_kv_cache=True,
         max_tokens_generated=max_tokens_generated,
         use_bf16=use_bf16,
-    )
+    ).tokens
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
         net.train()
