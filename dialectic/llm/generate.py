@@ -28,6 +28,20 @@ class PreFill:
         return self
 
 
+@dataclass
+class HardTokenGeneratorOutput:
+    tokens: Int[torch.Tensor, "B L"]
+    attention_mask: Bool[torch.Tensor, "B L"]
+
+
+@dataclass
+class SoftTokenGeneratorOutput:
+    tokens: Float[torch.Tensor, "B L V"]  # softmax
+    attention_mask: Bool[torch.Tensor, "B L"]
+    hard_tokens_mask: Bool[torch.Tensor, "B L"]
+    embedding_weight: Float[torch.Tensor, "V D"]
+
+
 def check_and_apply_prefill(
     token_ids: Int[torch.Tensor, "B L"],
     prefill: PreFill,
@@ -76,7 +90,7 @@ class BaseTokenGenerator(ABC):
         initial_input: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ):
-        self.all_inputs = initial_input
+        self.all_tokens = initial_input
         self.device = initial_input.device
         self.batch_size = initial_input.shape[0]
         self.attention_mask = attention_mask
@@ -150,7 +164,7 @@ class BaseTokenGenerator(ABC):
                     attention_mask=self.attention_mask,
                 )
 
-            prev_len = self.all_inputs.shape[1]
+            prev_len = self.all_tokens.shape[1]
             is_done = self.get_next_inputs(logits)
 
             if is_done:
@@ -163,7 +177,7 @@ class BaseTokenGenerator(ABC):
                 # get pad tokens here which shifts their RoPE positions. This is
                 # negligible for small fill lengths since the relative distances
                 # between the element's own real tokens are preserved.
-                n_new = self.all_inputs.shape[1] - prev_len
+                n_new = self.all_tokens.shape[1] - prev_len
                 for i in range(n_new - 1):
                     mask = (
                         self.attention_mask[:, : prev_len + i + 1]
@@ -175,15 +189,15 @@ class BaseTokenGenerator(ABC):
                     ):
                         self.net_forward(
                             net=net,
-                            input_tokens=self.all_inputs[
+                            input_tokens=self.all_tokens[
                                 :, prev_len + i : prev_len + i + 1
                             ],
                             kv_caches=kv_caches,
                             attention_mask=mask,
                         )
-                input_tokens = self.all_inputs[:, -1:]
+                input_tokens = self.all_tokens[:, -1:]
             else:
-                input_tokens = self.all_inputs
+                input_tokens = self.all_tokens
 
             self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
 
@@ -226,9 +240,9 @@ class HardGenerator(BaseTokenGenerator):
             next_token,
         )
 
-        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.all_tokens = torch.cat([self.all_tokens, next_token], 1)
 
-        self._finished = self._finished | (self.all_inputs[:, -1] == self.eos_token_id)
+        self._finished = self._finished | (self.all_tokens[:, -1] == self.eos_token_id)
         if self.finished:
             return True
 
@@ -237,15 +251,15 @@ class HardGenerator(BaseTokenGenerator):
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
 
         if self.prefill:
-            self.all_inputs, self.attention_mask = check_and_apply_prefill(
-                token_ids=self.all_inputs,
+            self.all_tokens, self.attention_mask = check_and_apply_prefill(
+                token_ids=self.all_tokens,
                 prefill=self.prefill,
                 pad_token_id=self.pad_token_id,
                 attention_mask=self.attention_mask,
             )
 
             self._finished = self._finished | (
-                self.all_inputs[:, -1] == self.eos_token_id
+                self.all_tokens[:, -1] == self.eos_token_id
             )
 
             if self.finished:
@@ -261,7 +275,7 @@ class HardGenerator(BaseTokenGenerator):
         use_kv_cache: bool = True,
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
-    ) -> Int[torch.Tensor, "B L_completion"]:
+    ) -> HardTokenGeneratorOutput:
         super()._generate(
             net=net,
             token_ids=token_ids,
@@ -270,7 +284,9 @@ class HardGenerator(BaseTokenGenerator):
             attention_mask=attention_mask,
             use_bf16=use_bf16,
         )
-        return self.all_inputs
+        return HardTokenGeneratorOutput(
+            tokens=self.all_tokens, attention_mask=self.attention_mask
+        )
 
     @property
     def _extra_tokens_per_step_bound(self) -> int:
@@ -317,8 +333,8 @@ class SoftGenerator(BaseTokenGenerator):
         if self.prefill is not None:
             self.prefill = self.prefill.to(self.device)
         self.shadow_seq = initial_input
-        self.all_inputs = torch.nn.functional.one_hot(
-            self.all_inputs, self.vocab_size
+        self.all_tokens = torch.nn.functional.one_hot(
+            self.all_tokens, self.vocab_size
         ).float()
 
         # mask is True where we use hard tokens
@@ -396,7 +412,7 @@ class SoftGenerator(BaseTokenGenerator):
             hard_token_id.squeeze(-1) == self.eos_token_id
         )
 
-        self.all_inputs = torch.cat([self.all_inputs, next_token], 1)
+        self.all_tokens = torch.cat([self.all_tokens, next_token], 1)
         self.shadow_seq = torch.cat([self.shadow_seq, hard_token_id], 1)
 
         if self.finished:
@@ -414,13 +430,13 @@ class SoftGenerator(BaseTokenGenerator):
                 attention_mask=self.attention_mask,
             )
 
-            n_added = self.shadow_seq.shape[1] - self.all_inputs.shape[1]
+            n_added = self.shadow_seq.shape[1] - self.all_tokens.shape[1]
             if n_added > 0:
                 new_hard_tokens = self.shadow_seq[:, -n_added:]
                 new_hard_tokens = torch.nn.functional.one_hot(
                     new_hard_tokens, self.vocab_size
                 )
-                self.all_inputs = torch.cat([self.all_inputs, new_hard_tokens], 1)
+                self.all_tokens = torch.cat([self.all_tokens, new_hard_tokens], 1)
                 # i guess switch to all True (so including pad)
                 # just need to make sure theres no logic that continues hard/soft based off
                 # of previous mask value, but there should not be
@@ -453,7 +469,7 @@ class SoftGenerator(BaseTokenGenerator):
         use_kv_cache: bool = True,
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
-    ) -> tuple[Float[torch.Tensor, "B L_completion V"]]:
+    ) -> SoftTokenGeneratorOutput:
         super()._generate(
             net=net,
             token_ids=token_ids,
@@ -463,9 +479,12 @@ class SoftGenerator(BaseTokenGenerator):
             use_bf16=use_bf16,
         )
 
-        assert self.all_inputs.shape[:2] == self.hard_tokens_mask.shape
-
-        return self.all_inputs
+        return SoftTokenGeneratorOutput(
+            tokens=self.all_tokens,
+            attention_mask=self.attention_mask,
+            hard_tokens_mask=self.hard_tokens_mask,
+            embedding_weight=net.embed_tokens.weight,
+        )
 
     @property
     def finished(self) -> bool:
@@ -491,7 +510,7 @@ def generate_from_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     soft_tokens: bool = False,
-) -> Int[Tensor, "B L"] | Float[Tensor, "B L V"]:
+) -> HardTokenGeneratorOutput | SoftTokenGeneratorOutput:
     if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 
