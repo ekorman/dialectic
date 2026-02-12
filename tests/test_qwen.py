@@ -13,7 +13,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 from dialectic.llm.generate import (
     generate_from_text,
-    generate_from_tokens,
+    generate_hard_tokens,
     qwen_generate_from_chat,
 )
 from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen_06b
@@ -105,7 +105,7 @@ def test_qwen():
     torch.testing.assert_close(out1, out2.logits[:, -1:])
 
 
-def test_qwen_generate_from_tokens():
+def test_qwen_generate_hard_tokens():
     l, b, d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 4, 6, 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -125,7 +125,7 @@ def test_qwen_generate_from_tokens():
     ).eval()
 
     # check we get the same thing if we cache or not
-    out_no_cache = generate_from_tokens(
+    out_no_cache = generate_hard_tokens(
         net=model,
         token_ids=x,
         eos_token_id=-1,
@@ -134,7 +134,7 @@ def test_qwen_generate_from_tokens():
         sampling_strategy="greedy",
     ).tokens
 
-    out_with_cache = generate_from_tokens(
+    out_with_cache = generate_hard_tokens(
         net=model,
         token_ids=x,
         eos_token_id=-1,
@@ -147,7 +147,7 @@ def test_qwen_generate_from_tokens():
     assert out_with_cache.shape == torch.Size((b, 24 + l))
 
     # test we get the same thing for a batch or not
-    out_singleton = generate_from_tokens(
+    out_singleton = generate_hard_tokens(
         net=model,
         token_ids=x[:1],
         eos_token_id=-1,
@@ -215,7 +215,7 @@ def test_qwen_generate_from_text_batch():
     assert out_singleton == out_with_cache[:1]
 
 
-def test_qwen_generate_from_tokens_attention_mask():
+def test_qwen_generate_hard_tokens_attention_mask():
     d, head_d, num_heads, num_kv_heads, mlp_hidden_d = 20, 16, 8, 2, 32
     vocab_size = 500
     n_decoder_layers = 3
@@ -244,7 +244,7 @@ def test_qwen_generate_from_tokens_attention_mask():
     attention_mask = torch.ones((2, 7), dtype=torch.bool)
     attention_mask[0, :3] = False
 
-    out1 = generate_from_tokens(
+    out1 = generate_hard_tokens(
         net=model,
         token_ids=x1,
         eos_token_id=-1,
@@ -253,7 +253,7 @@ def test_qwen_generate_from_tokens_attention_mask():
         sampling_strategy="greedy",
         attention_mask=None,
     ).tokens
-    out2 = generate_from_tokens(
+    out2 = generate_hard_tokens(
         net=model,
         token_ids=x2,
         eos_token_id=-1,
@@ -262,7 +262,7 @@ def test_qwen_generate_from_tokens_attention_mask():
         sampling_strategy="greedy",
         attention_mask=None,
     ).tokens
-    out_batched = generate_from_tokens(
+    out_batched = generate_hard_tokens(
         net=model,
         token_ids=x_batched,
         eos_token_id=-1,
@@ -305,7 +305,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     attention_mask = torch.ones((2, 7), dtype=torch.bool)
     attention_mask[0, :3] = False
 
-    out1 = generate_from_tokens(
+    out1 = generate_hard_tokens(
         net=model,
         token_ids=x1,
         eos_token_id=-1,
@@ -314,7 +314,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
         sampling_strategy="greedy",
         attention_mask=None,
     ).tokens
-    out2 = generate_from_tokens(
+    out2 = generate_hard_tokens(
         net=model,
         token_ids=x2,
         eos_token_id=-1,
@@ -323,7 +323,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
         sampling_strategy="greedy",
         attention_mask=None,
     ).tokens
-    out_batched = generate_from_tokens(
+    out_batched = generate_hard_tokens(
         net=model,
         token_ids=x_batched,
         eos_token_id=-1,
@@ -337,7 +337,7 @@ def test_qwen_generate_attention_mask_with_kv_cache():
     assert (out2 == out_batched[1:]).all()
 
 
-def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel):
+def test_generate_hard_tokens_stopping_condition_partial_batch(MockGenerateModel):
     pad_token_id = 0
     eos_token_id = 2
     vocab_size = 12
@@ -354,7 +354,7 @@ def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel
     ).eval()
 
     max_tokens_generated = 4
-    output = generate_from_tokens(
+    output = generate_hard_tokens(
         net=model,
         token_ids=token_ids,
         eos_token_id=eos_token_id,
@@ -376,7 +376,7 @@ def test_generate_from_tokens_stopping_condition_partial_batch(MockGenerateModel
     assert (generated_tokens[:2] != eos_token_id).all()
 
 
-def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
+def test_generate_hard_tokens_stopping_condition_full_batch(MockGenerateModel):
     pad_token_id = 0
     eos_token_id = 2
     vocab_size = 12
@@ -392,7 +392,7 @@ def test_generate_from_tokens_stopping_condition_full_batch(MockGenerateModel):
     ).eval()
 
     max_tokens_generated = 5
-    output = generate_from_tokens(
+    output = generate_hard_tokens(
         net=model,
         token_ids=token_ids,
         eos_token_id=eos_token_id,
@@ -430,7 +430,7 @@ def test_qwen_generate_temperature():
 
     x = torch.randint(0, vocab_size, size=(2, 4))
 
-    out_greedy = generate_from_tokens(
+    out_greedy = generate_hard_tokens(
         net=model,
         token_ids=x,
         eos_token_id=-1,
@@ -439,7 +439,7 @@ def test_qwen_generate_temperature():
     ).tokens
 
     # very low temperature should approximate greedy
-    out_low_temp = generate_from_tokens(
+    out_low_temp = generate_hard_tokens(
         net=model,
         token_ids=x,
         eos_token_id=-1,

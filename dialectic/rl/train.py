@@ -12,7 +12,7 @@ from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import generate_from_tokens
+from dialectic.llm.generate import generate_hard_tokens
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
@@ -284,16 +284,16 @@ def generate_rollout_batch(
     net.eval()
     t_gen_start = time.perf_counter()
 
-    all_completions = generate_from_tokens(
+    all_completions = generate_hard_tokens(
         net=net,
         token_ids=expanded_token_ids,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
         sampling_strategy="sample" if temperature > 0 else "greedy",
-        temperature=temperature if temperature > 0 else 1.0,
-        attention_mask=expanded_attention_mask,
-        use_kv_cache=True,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
         max_tokens_generated=max_tokens_generated,
+        use_kv_cache=True,
+        attention_mask=expanded_attention_mask,
+        temperature=temperature if temperature > 0 else 1.0,
         use_bf16=use_bf16,
     ).tokens
     t_generation = time.perf_counter() - t_gen_start

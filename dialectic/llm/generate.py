@@ -84,7 +84,7 @@ def check_and_apply_prefill(
     return torch.cat([token_ids, new_tensors], -1), attention_mask
 
 
-class BaseTokenGenerator(ABC):
+class _BaseTokenGenerator(ABC):
     def init_state(
         self,
         initial_input: torch.Tensor,
@@ -202,7 +202,7 @@ class BaseTokenGenerator(ABC):
             self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
 
 
-class HardGenerator(BaseTokenGenerator):
+class _HardGenerator(_BaseTokenGenerator):
     def __init__(
         self,
         sampling_strategy: Literal["greedy", "sample"] | None = "sample",
@@ -299,7 +299,7 @@ class HardGenerator(BaseTokenGenerator):
         return bool(self._finished.all())
 
 
-class SoftGenerator(BaseTokenGenerator):
+class _SoftGenerator(_BaseTokenGenerator):
     def __init__(
         self,
         vocab_size: int,
@@ -502,43 +502,65 @@ class SoftGenerator(BaseTokenGenerator):
 
 
 @torch.inference_mode()
-def generate_from_tokens(
+def generate_hard_tokens(
     net: BaseTransformer,
     token_ids: Int[Tensor, "B L"],
+    sampling_strategy: Literal["greedy", "sample"] = "sample",
     eos_token_id: int = 151645,
     pad_token_id: int = 151643,
-    sampling_strategy: Literal["greedy", "sample"] | None = "sample",
     max_tokens_generated: int = sys.maxsize,
     use_kv_cache: bool = True,
-    attention_mask: torch.Tensor | None = None,  # should be left-padded
+    attention_mask: torch.Tensor | None = None,
     temperature: float = 1.0,
     use_bf16: bool = False,
-    soft_tokens: bool = False,
-) -> HardTokenGeneratorOutput | SoftTokenGeneratorOutput:
-    if not soft_tokens and sampling_strategy not in ["greedy", "sample"]:
+    prefill: PreFill | None = None,
+) -> HardTokenGeneratorOutput:
+    if sampling_strategy not in ["greedy", "sample"]:
         raise ValueError("`sampling_strategy` must be one of 'greedy' or 'sample'.")
 
     if pad_token_id is None:
         pad_token_id = eos_token_id
 
-    if soft_tokens:
-        return SoftGenerator(
-            vocab_size=net.vocab_size,
-            temperature=temperature,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-        ).generate(
-            net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
-        )
-    else:
-        return HardGenerator(
-            sampling_strategy=sampling_strategy,
-            temperature=temperature,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-        ).generate(
-            net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
-        )
+    return _HardGenerator(
+        sampling_strategy=sampling_strategy,
+        temperature=temperature,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prefill=prefill,
+    ).generate(
+        net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
+    )
+
+
+@torch.inference_mode()
+def generate_soft_tokens(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    eos_token_id: int = 151645,
+    pad_token_id: int = 151643,
+    max_tokens_generated: int = sys.maxsize,
+    use_kv_cache: bool = True,
+    attention_mask: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    use_bf16: bool = False,
+    switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
+    prefill: PreFill | None = None,
+    soft_token_noise_std: float | None = None,
+) -> SoftTokenGeneratorOutput:
+    if pad_token_id is None:
+        pad_token_id = eos_token_id
+
+    return _SoftGenerator(
+        vocab_size=net.vocab_size,
+        temperature=temperature,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+        prefill=prefill,
+        soft_token_noise_std=soft_token_noise_std,
+    ).generate(
+        net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
+    )
 
 
 def generate_from_text(
@@ -566,12 +588,12 @@ def generate_from_text(
 
     eos_token_id = tokenizer.token_to_id(eos_token)
 
-    token_ids = generate_from_tokens(
+    token_ids = generate_hard_tokens(
         net=net,
         token_ids=token_ids,
+        sampling_strategy=sampling_strategy,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
-        sampling_strategy=sampling_strategy,
         max_tokens_generated=max_tokens_generated,
         use_kv_cache=use_kv_cache,
         attention_mask=attention_mask,

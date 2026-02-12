@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import generate_from_tokens
+from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.qwen import create_qwen
 
 
@@ -160,7 +160,7 @@ def benchmark_generation(
     for _ in range(n_warmup):
         sync_device(device)
         start = time.perf_counter()
-        _ = generate_from_tokens(
+        _ = generate_hard_tokens(
             net=model,
             token_ids=x,
             eos_token_id=-1,
@@ -176,7 +176,7 @@ def benchmark_generation(
     for _ in range(n_iterations):
         sync_device(device)
         start = time.perf_counter()
-        _ = generate_from_tokens(
+        _ = generate_hard_tokens(
             net=model,
             token_ids=x,
             eos_token_id=-1,
