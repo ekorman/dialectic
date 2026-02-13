@@ -189,6 +189,9 @@ def train(
 
     state_to_str = get_state_to_str(format_messages, reasoning_tag)
 
+    answer_tag_ids = tokenizer.encode("<answer>", add_special_tokens=False).ids
+    switch_condition = torch.tensor(answer_tag_ids)
+
     try:
         if soft_tokens:
             train_soft_grpo(
@@ -211,6 +214,7 @@ def train(
                 group_size=group_size,
                 temperature=0.7,
                 noise_std=noise_std,
+                switch_to_hard_tokens_condition=switch_condition,
                 accumulation_steps=accumulation_steps,
                 max_grad_norm=max_grad_norm,
                 logprob_chunk_size=logprob_chunk_size,
