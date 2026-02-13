@@ -405,52 +405,66 @@ def _is_one_hot(tensor: torch.Tensor, tol: float = 1e-6) -> bool:
     return abs(max_val - 1.0) < tol and num_ones == 1 and num_zeros == len(tensor) - 1
 
 
-def test_soft_generator_switch_to_hard_tokens(tiny_model: BaseTransformer):
-    """After the switch condition is met, generated tokens should be one-hot
-    (hard) instead of soft probability distributions.
+def test_soft_generator_switch_to_hard_tokens(MockGenerateModel):
+    """Once the switch condition fires, ALL subsequent tokens must be hard (one-hot)
+    even when the shadow sequence no longer ends with the condition (latching).
+
+    Uses a mock with distinct scheduled tokens so the condition provably cannot
+    re-trigger by coincidence — any post-switch hard token proves latching works.
     """
+    vocab_size = 20
+    schedule = [
+        torch.tensor([5]),
+        torch.tensor([3]),
+        torch.tensor([7]),
+        torch.tensor([12]),
+        torch.tensor([9]),
+        torch.tensor([1]),
+        torch.tensor([15]),
+        torch.tensor([4]),
+        torch.tensor([8]),
+        torch.tensor([6]),
+    ]
 
-    torch.manual_seed(42)
-    model = tiny_model.eval()
-    vocab_size = model.vocab_size
+    net = MockGenerateModel(token_schedule=list(schedule), vocab_size=vocab_size).eval()
+    x = torch.tensor([[10, 11, 13, 14]])
+    switch_condition = torch.tensor([5, 3, 7])
 
-    x = torch.randint(1, vocab_size, size=(1, 4))
-
-    out_no_switch = generate_soft_tokens(
-        net=model,
-        token_ids=x,
-        eos_token_id=-1,
-        pad_token_id=0,
-        max_tokens_generated=10,
-        use_kv_cache=True,
-    ).tokens
-
-    generated_no_switch = out_no_switch[0, x.shape[1] :]
-    shadow_tokens = generated_no_switch.argmax(-1)
-    switch_condition = shadow_tokens[:3]
-
-    out_with_switch = generate_soft_tokens(
-        net=model,
+    out = generate_soft_tokens(
+        net=net,
         token_ids=x,
         eos_token_id=-1,
         pad_token_id=0,
         max_tokens_generated=10,
         use_kv_cache=True,
         switch_to_hard_tokens_condition=switch_condition,
-    ).tokens
+    )
 
-    generated_with_switch = out_with_switch[0, x.shape[1] :]
+    generated = out.tokens[0, x.shape[1] :]
+    shadow = generated.argmax(-1)
 
-    for i in range(3):
-        token_dist = generated_with_switch[i]
-        assert not _is_one_hot(token_dist), (
-            f"Token {i} should be soft (before switch condition met)"
+    # condition [5,3,7] appears in the shadow sequence at positions 0-2;
+    # verify it does NOT re-appear anywhere later
+    for i in range(1, len(shadow) - len(switch_condition) + 1):
+        assert not (shadow[i : i + len(switch_condition)] == switch_condition).all(), (
+            f"Condition re-triggers at position {i} — test cannot verify latching"
         )
 
+    # shadow_seq checked BEFORE appending each token, so condition fires at step 3
+    # (when shadow_seq ends with [..., 5, 3, 7]). Tokens 0-2 are soft, 3+ are hard.
+    prompt_len = x.shape[1]
+    mask = out.hard_tokens_mask[0]
+    assert mask[:prompt_len].all(), "Prompt tokens should be hard"
+    assert not mask[prompt_len : prompt_len + 3].any(), (
+        "First 3 generated tokens should be soft (before condition met)"
+    )
+    assert mask[prompt_len + 3 :].all(), (
+        "All tokens after switch should be hard (latching)"
+    )
+
     for i in range(3, 10):
-        token_dist = generated_with_switch[i]
-        assert _is_one_hot(token_dist), (
-            f"Token {i} should be one-hot (after switch condition met)"
+        assert _is_one_hot(generated[i]), (
+            f"Token {i} should be one-hot encoded (hard from latching)"
         )
 
 
@@ -561,6 +575,50 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
         assert not _is_one_hot(token_dist), (
             f"Token {i} should be soft (no switch condition set)"
         )
+
+
+def test_soft_token_argmax_matches_hard_greedy(tiny_model: BaseTransformer):
+    """The argmax of soft tokens should equal greedy hard token generation.
+
+    Both process identical logits on the first step (same prompt embeddings).
+    From step 2 onward, soft feeds back a mixture embedding while hard feeds
+    back an exact embedding, so they may diverge — but the first generated
+    token must always match.
+    """
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    V = model.vocab_size
+
+    x = torch.randint(1, V, size=(1, 4))
+
+    hard_out = generate_hard_tokens(
+        net=model,
+        token_ids=x.clone(),
+        sampling_strategy="greedy",
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=5,
+        use_kv_cache=True,
+        temperature=1.0,
+    )
+
+    soft_out = generate_soft_tokens(
+        net=model,
+        token_ids=x.clone(),
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=5,
+        use_kv_cache=True,
+        temperature=1.0,
+    )
+
+    hard_generated = hard_out.tokens[0, x.shape[1] :]
+    soft_argmax = soft_out.tokens[0, x.shape[1] :].argmax(-1)
+
+    assert hard_generated[0] == soft_argmax[0], (
+        f"First generated token should match: hard={hard_generated[0].item()}, "
+        f"soft argmax={soft_argmax[0].item()}"
+    )
 
 
 def test_soft_generator_hard_tokens_mask_without_switch_condition(

@@ -340,6 +340,9 @@ class _SoftGenerator(_BaseTokenGenerator):
 
         # mask is True where we use hard tokens
         self.hard_tokens_mask = torch.ones_like(initial_input, dtype=torch.bool)
+        self._switched_to_hard = torch.zeros(
+            initial_input.shape[0], dtype=torch.bool, device=self.device
+        )
 
         self.all_noise: list[Tensor] = []
 
@@ -389,19 +392,19 @@ class _SoftGenerator(_BaseTokenGenerator):
         hard_token_id = next_token.argmax(-1)
 
         if self.switch_to_hard_tokens_condition is not None:
-            # update self.switched_to_hard_tokens_step
-            cond_met: Bool[torch.Tensor, " B"] = (
+            cond_met = (
                 self.shadow_seq[:, -len(self.switch_to_hard_tokens_condition) :]
                 == self.switch_to_hard_tokens_condition
-            ).all(1, keepdim=True)
+            ).all(1)
+            self._switched_to_hard = self._switched_to_hard | cond_met
 
-            self.hard_tokens_mask = torch.cat([self.hard_tokens_mask, cond_met], 1)
+            self.hard_tokens_mask = torch.cat(
+                [self.hard_tokens_mask, self._switched_to_hard.unsqueeze(1)], 1
+            )
 
-            c = self.hard_tokens_mask[:, -1]
-
-            if c.any():
+            if self._switched_to_hard.any():
                 next_token = torch.where(
-                    c.unsqueeze(-1).unsqueeze(-1),
+                    self._switched_to_hard.unsqueeze(-1).unsqueeze(-1),
                     torch.nn.functional.one_hot(
                         hard_token_id, num_classes=next_token.shape[-1]
                     ),
