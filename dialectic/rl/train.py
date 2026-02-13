@@ -42,7 +42,6 @@ class SoftRolloutBatch(Generic[T]):
     ]  # len G, full seq (prompt+gen)
     completion_noise: list[Float[torch.Tensor, "B L D"]]  # len G
     hard_tokens_mask: list[Bool[torch.Tensor, "B L"]]  # len G
-    embedding_weight: Float[torch.Tensor, "V D"]
     noise_std: float
     temperature: float
     attention_mask: Bool[torch.Tensor, "B L_prompt"]
@@ -784,12 +783,13 @@ def stack_and_pad_soft(
 
     pad_one_hot = torch.nn.functional.one_hot(
         torch.tensor(pad_token_id, device=device), V
-    ).float()
+    ).to(dtype=tokens[0].dtype)
 
     stacked_tokens = pad_one_hot.expand(batch_size, group_size, max_len, V).clone()
     stacked_noise = torch.zeros(
         batch_size, group_size, max_len, D, device=device, dtype=noise[0].dtype
     )
+    # Padded positions default to hard=True; harmless since non_pad_mask excludes them from the loss.
     stacked_masks = torch.ones(
         batch_size, group_size, max_len, device=device, dtype=torch.bool
     )
@@ -1062,7 +1062,8 @@ def generate_soft_rollout_batch(
     )
 
     noise = gen_output.noise
-    assert noise is not None
+    if noise is None:
+        raise RuntimeError("soft token generation did not produce noise")
     all_noise = noise.view(batch_size, group_size, *noise.shape[1:])
     all_noise = all_noise.permute(1, 0, 2, 3)
     completion_noise: list[Float[torch.Tensor, "B L D"]] = list(all_noise.unbind(0))
@@ -1107,9 +1108,8 @@ def generate_soft_rollout_batch(
         completion_tokens=completion_tokens,
         completion_noise=completion_noise,
         hard_tokens_mask=hard_tokens_mask_list,
-        embedding_weight=gen_output.embedding_weight,
         noise_std=noise_std,
-        temperature=temperature,
+        temperature=temperature if temperature > 0 else 1.0,
         attention_mask=attention_mask,
         t_generation=t_generation,
     )

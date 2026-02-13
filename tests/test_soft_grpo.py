@@ -199,6 +199,33 @@ class TestComputeSoftLogProbs:
 
         assert lp.shape == (B, G, completion_len)
 
+        with torch.no_grad():
+            W = tiny_model.embed_tokens.weight
+            stacked = full_tokens.unsqueeze(1)  # [B, 1, L, V]
+            flat = stacked.view(B, total_len, V)
+            noise_flat = full_noise.unsqueeze(1).view(B, total_len, D)
+            full_attn_mask = torch.ones(B, total_len, dtype=torch.bool)
+            full_attn_mask[:, :prompt_len] = attention_mask
+            logits = tiny_model(
+                flat,
+                return_all_logits=True,
+                attention_mask=full_attn_mask,
+                soft_token_noise=noise_flat,
+            )
+            logits_comp = logits[:, prompt_len - 1 : -1]
+            comp_tokens = flat[:, prompt_len:]
+            comp_noise = noise_flat[:, prompt_len:]
+            e_action = comp_tokens @ W + comp_noise
+            mu_new = torch.softmax(logits_comp / 1.0, dim=-1) @ W
+            expected = (
+                -0.5 * D * torch.log(torch.tensor(2 * torch.pi))
+                - D * torch.log(torch.tensor(noise_std))
+                - 0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
+            )
+            expected = expected.view(B, G, completion_len)
+
+        torch.testing.assert_close(lp, expected)
+
     def test_gradient_flows_through_soft_log_probs(self, tiny_model):
         tiny_model.train()
 

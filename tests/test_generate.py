@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from dialectic.llm.base import BaseTransformer
@@ -591,55 +592,20 @@ def test_soft_generator_hard_tokens_mask_without_switch_condition(
     )
 
 
-def test_soft_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
-    """Soft generator prefill should insert one-hot encoded fill tokens into the
-    output at the position where the shadow sequence matches the trigger.
-    """
-    torch.manual_seed(42)
+def test_soft_generate_without_kv_cache_raises(tiny_model: BaseTransformer):
+    """Soft generation without KV cache is unsupported due to noise accumulation."""
     model = tiny_model.eval()
-    vocab_size = model.vocab_size
-    pad_token_id = 0
-    eos_token_id = -1
+    x = torch.randint(1, model.vocab_size, size=(1, 4))
 
-    x = torch.randint(1, vocab_size, size=(1, 4))
-
-    out_natural = generate_soft_tokens(
-        net=model,
-        token_ids=x,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=20,
-        use_kv_cache=False,
-    ).tokens
-
-    shadow_tokens = out_natural[0, x.shape[1] :].argmax(-1)
-    trigger = shadow_tokens[:3]
-    natural_fill = shadow_tokens[3:5]
-    fill = (natural_fill + 1) % vocab_size
-    fill = torch.where(fill == pad_token_id, (fill + 1) % vocab_size, fill)
-
-    prefill = PreFill(condition=trigger, filling=fill)
-
-    out_prefill = generate_soft_tokens(
-        net=model,
-        token_ids=x,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=20,
-        use_kv_cache=False,
-        prefill=prefill,
-    ).tokens
-
-    torch.testing.assert_close(
-        out_prefill[0, : x.shape[1] + 3],
-        out_natural[0, : x.shape[1] + 3],
-        msg="Output before trigger should match natural generation",
-    )
-
-    fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
-    assert (out_prefill[0, x.shape[1] + 3 : x.shape[1] + 5] == fill_one_hot).all(), (
-        "Prefill did not fire: one-hot fill tokens not found after trigger"
-    )
+    with pytest.raises(ValueError, match="use_kv_cache=True"):
+        generate_soft_tokens(
+            net=model,
+            token_ids=x,
+            eos_token_id=-1,
+            pad_token_id=0,
+            max_tokens_generated=5,
+            use_kv_cache=False,
+        )
 
 
 def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransformer):

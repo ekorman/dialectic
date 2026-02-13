@@ -478,6 +478,8 @@ class _SoftGenerator(_BaseTokenGenerator):
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
     ) -> SoftTokenGeneratorOutput:
+        if not use_kv_cache:
+            raise ValueError("soft token generation requires use_kv_cache=True")
         super()._generate(
             net=net,
             token_ids=token_ids,

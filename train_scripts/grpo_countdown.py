@@ -189,37 +189,60 @@ def train(
 
     state_to_str = get_state_to_str(format_messages, reasoning_tag)
 
-    shared = dict(
-        net=net,
-        opt=opt,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=model_info.eos_token_id,
-        pad_token_id=model_info.pad_token_id,
-        extractor=extract_from_answer_tags,
-        beta=beta,
-        eps=0.2,
-        mu=mu,
-        max_tokens_generated=max_tokens,
-        max_episodes=max_episodes,
-        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-        batch_size=batch_size,
-        group_size=group_size,
-        temperature=0.7,
-        accumulation_steps=accumulation_steps,
-        max_grad_norm=max_grad_norm,
-        logprob_chunk_size=logprob_chunk_size,
-        use_bf16=use_bf16,
-        save_ckpt_freq=save_ckpt_freq,
-    )
-
     try:
         if soft_tokens:
-            train_soft_grpo(**shared, noise_std=noise_std)  # type: ignore[arg-type]
+            train_soft_grpo(
+                net=net,
+                opt=opt,
+                env=env,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                extractor=extract_from_answer_tags,
+                beta=beta,
+                eps=0.2,
+                mu=mu,
+                max_tokens_generated=max_tokens,
+                max_episodes=max_episodes,
+                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+                batch_size=batch_size,
+                group_size=group_size,
+                temperature=0.7,
+                noise_std=noise_std,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                logprob_chunk_size=logprob_chunk_size,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+            )
         else:
-            train_grpo(**shared)  # type: ignore[arg-type]
+            train_grpo(
+                net=net,
+                opt=opt,
+                env=env,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                extractor=extract_from_answer_tags,
+                beta=beta,
+                eps=0.2,
+                mu=mu,
+                max_tokens_generated=max_tokens,
+                max_episodes=max_episodes,
+                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+                batch_size=batch_size,
+                group_size=group_size,
+                temperature=0.7,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                logprob_chunk_size=logprob_chunk_size,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+            )
     finally:
         extty.finish()
 
