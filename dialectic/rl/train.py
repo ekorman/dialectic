@@ -18,6 +18,11 @@ from dialectic.rl.reward import RewardFn
 from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
 
 
+def _embedding_rms_norm(net: BaseTransformer) -> float:
+    W = net.embed_tokens.weight
+    return W.pow(2).mean().sqrt().item()
+
+
 @dataclass
 class RolloutBatch(Generic[T]):
     env_responses: list[EnvResponse[T]]
@@ -1017,6 +1022,8 @@ def generate_soft_rollout_batch(
     prefill: PreFill | None = None,
     use_bf16: bool = False,
 ) -> SoftRolloutBatch[T]:
+    actual_noise_std = noise_std * _embedding_rms_norm(net)
+
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
     device = next(net.parameters()).device
@@ -1047,7 +1054,7 @@ def generate_soft_rollout_batch(
         use_bf16=use_bf16,
         switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
         prefill=prefill,
-        soft_token_noise_std=noise_std,
+        soft_token_noise_std=actual_noise_std,
     )
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
@@ -1108,7 +1115,7 @@ def generate_soft_rollout_batch(
         completion_tokens=completion_tokens,
         completion_noise=completion_noise,
         hard_tokens_mask=hard_tokens_mask_list,
-        noise_std=noise_std,
+        noise_std=actual_noise_std,
         temperature=temperature if temperature > 0 else 1.0,
         attention_mask=attention_mask,
         t_generation=t_generation,

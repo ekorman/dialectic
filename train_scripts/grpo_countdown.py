@@ -99,6 +99,9 @@ def get_state_to_str(
     return _state_to_str
 
 
+# update prompt. especially for soft tokens using <reasoning> tags don't make sense
+
+
 def get_prompt_template(enable_thinking: bool):
     reasoning_tag = "think" if enable_thinking else "reasoning"
     return (
@@ -138,7 +141,7 @@ def train(
     use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
     soft_tokens: bool = False,
-    noise_std: float = 0.1,
+    noise_std: float = 0.33,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -400,8 +403,8 @@ def main():
     parser.add_argument(
         "--noise-std",
         type=float,
-        default=0.1,
-        help="Noise std for soft token generation (only used with --soft-tokens)",
+        default=0.33,
+        help="Noise scale as a multiplier of the embedding RMS norm (only used with --soft-tokens)",
     )
     args = parser.parse_args()
 
