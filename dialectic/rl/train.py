@@ -912,9 +912,13 @@ def _compute_soft_log_probs_full(
         reduction="none",
     ).reshape(BG, completion_len)
 
+    D = W.shape[1]
     e_action = comp_tokens @ W + comp_noise
     mu_new = torch.softmax(logits / temperature, dim=-1) @ W
-    soft_lp = -0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
+    log_norm = -0.5 * D * torch.log(torch.tensor(2 * torch.pi)) - D * torch.log(
+        torch.tensor(noise_std)
+    )
+    soft_lp = log_norm - 0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
 
     log_probs = torch.where(comp_masks, hard_lp, soft_lp)
     return log_probs.view(batch_size, group_size, completion_len)
@@ -953,6 +957,10 @@ def _compute_soft_log_probs_chunked(
     comp_noise = flat_noise[:, l_prompt:]
     comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
     W = net.embed_tokens.weight
+    D = W.shape[1]
+    log_norm = -0.5 * D * torch.log(torch.tensor(2 * torch.pi)) - D * torch.log(
+        torch.tensor(noise_std)
+    )
 
     log_probs_list = []
     for chunk_start in range(0, completion_len, chunk_size):
@@ -975,7 +983,7 @@ def _compute_soft_log_probs_chunked(
 
         e_action = chunk_comp_tokens @ W + chunk_comp_noise
         mu_new = torch.softmax(chunk_logits / temperature, dim=-1) @ W
-        soft_lp = -0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
+        soft_lp = log_norm - 0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
 
         chunk_log_probs = torch.where(chunk_masks, hard_lp, soft_lp)
         log_probs_list.append(chunk_log_probs)
