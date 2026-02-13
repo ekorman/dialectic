@@ -165,12 +165,14 @@ class CountdownEnv(Env[Countdown, None]):
 
     Parameters
     ----------
-    num_operands : int
-        Number of operands to use. Default is 4.
-    min_number : int
-        Minimum value for operands. Default is 1.
-    max_number : int
-        Maximum value for operands. Default is 25.
+    n_larges : int or list[int]
+        Number of large numbers to include. If a list, must be same length as
+        n_total and n_ops; a configuration is sampled uniformly per problem.
+    n_total : int or list[int]
+        Total numbers to include. Same list constraint as n_larges.
+    n_ops : int or list[int]
+        Number of random operations used to generate the target. Same list
+        constraint as n_larges.
     """
 
     SMALLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] * 2
@@ -199,13 +201,18 @@ class CountdownEnv(Env[Countdown, None]):
         return ops
 
     def _generate_problem(self):
-        numbers = self.rng.sample(self.LARGES, self.n_larges) + self.rng.sample(
-            self.SMALLS, self.n_total - self.n_larges
+        idx = self.rng.randrange(len(self._n_larges))
+        n_larges = self._n_larges[idx]
+        n_total = self._n_total[idx]
+        n_ops = self._n_ops[idx]
+
+        numbers = self.rng.sample(self.LARGES, n_larges) + self.rng.sample(
+            self.SMALLS, n_total - n_larges
         )
         self.rng.shuffle(numbers)
         pool = numbers[:]
 
-        for _ in range(self.n_ops):
+        for _ in range(n_ops):
             if len(pool) < 2:
                 break
             i, j = self.rng.sample(range(len(pool)), 2)
@@ -223,14 +230,22 @@ class CountdownEnv(Env[Countdown, None]):
         self,
         *,
         prompt_template: str | None = None,
-        n_larges: int = 2,
-        n_total: int = 6,
-        n_ops: int = 5,
+        n_larges: int | list[int] = 2,
+        n_total: int | list[int] = 6,
+        n_ops: int | list[int] = 5,
         seed: int | None = None,
     ):
-        self.n_larges = n_larges
-        self.n_total = n_total
-        self.n_ops = n_ops
+        self._n_larges = [n_larges] if isinstance(n_larges, int) else n_larges
+        self._n_total = [n_total] if isinstance(n_total, int) else n_total
+        self._n_ops = [n_ops] if isinstance(n_ops, int) else n_ops
+
+        lengths = {len(self._n_larges), len(self._n_total), len(self._n_ops)}
+        if len(lengths) != 1:
+            raise ValueError(
+                f"n_larges, n_total, and n_ops must have the same length, "
+                f"got {len(self._n_larges)}, {len(self._n_total)}, {len(self._n_ops)}"
+            )
+
         self.prompt_template = prompt_template or (
             "Using the numbers {numbers}, create an equation that equals {target}. "
             "You can use +, -, *, / and each number at most once. "

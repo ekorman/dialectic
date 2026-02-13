@@ -151,3 +151,32 @@ class TestCountdownEnv:
 
         assert resp.data.prompt.startswith("Numbers:")
         assert str(resp.data.target) in resp.data.prompt
+
+    def test_list_configs_selects_from_options(self):
+        env = CountdownEnv(
+            n_larges=[2, 1],
+            n_total=[6, 3],
+            n_ops=[5, 2],
+            seed=0,
+        )
+        seen_lengths: set[int] = set()
+        for i in range(50):
+            resp = env.reset()
+            seen_lengths.add(len(resp.data.numbers))
+
+        assert seen_lengths == {6, 3}
+
+    def test_list_configs_mismatched_lengths_raises(self):
+        with pytest.raises(ValueError, match="same length"):
+            CountdownEnv(n_larges=[2, 1], n_total=[6], n_ops=[5, 2])
+
+    def test_list_configs_seed_reproducibility(self):
+        kwargs = dict(n_larges=[2, 1], n_total=[6, 3], n_ops=[5, 2], seed=42)
+        env1 = CountdownEnv(**kwargs)
+        env2 = CountdownEnv(**kwargs)
+
+        for _ in range(10):
+            r1 = env1.reset()
+            r2 = env2.reset()
+            assert r1.data.numbers == r2.data.numbers
+            assert r1.data.target == r2.data.target
