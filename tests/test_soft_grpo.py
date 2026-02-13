@@ -26,7 +26,7 @@ class TestStackAndPadSoft:
         m1 = torch.ones(B, 5, dtype=torch.bool)
         m2 = torch.zeros(B, 3, dtype=torch.bool)
 
-        st, sn, sm = stack_and_pad_soft(
+        st, sn, sm, npm = stack_and_pad_soft(
             tokens=[t1, t2],
             noise=[n1, n2],
             hard_masks=[m1, m2],
@@ -36,6 +36,7 @@ class TestStackAndPadSoft:
         assert st.shape == (B, 2, 5, V)
         assert sn.shape == (B, 2, 5, D)
         assert sm.shape == (B, 2, 5)
+        assert npm.shape == (B, 2, 5)
 
         torch.testing.assert_close(st[:, 0, :5], t1)
         torch.testing.assert_close(st[:, 1, :3], t2)
@@ -48,6 +49,10 @@ class TestStackAndPadSoft:
         assert sm[:, 0, :5].all()
         assert not sm[:, 1, :3].any()
         assert sm[:, 1, 3:].all()
+
+        assert npm[:, 0, :5].all()
+        assert npm[:, 1, :3].all()
+        assert not npm[:, 1, 3:].any()
 
 
 class TestComputeSoftLogProbs:

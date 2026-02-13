@@ -773,6 +773,7 @@ def stack_and_pad_soft(
     Float[torch.Tensor, "B G L V"],
     Float[torch.Tensor, "B G L D"],
     Bool[torch.Tensor, "B G L"],
+    Bool[torch.Tensor, "B G L"],
 ]:
     max_len = max(t.shape[1] for t in tokens)
     batch_size = tokens[0].shape[0]
@@ -792,14 +793,18 @@ def stack_and_pad_soft(
     stacked_masks = torch.ones(
         batch_size, group_size, max_len, device=device, dtype=torch.bool
     )
+    non_pad_mask = torch.zeros(
+        batch_size, group_size, max_len, device=device, dtype=torch.bool
+    )
 
     for g, (t, n, m) in enumerate(zip(tokens, noise, hard_masks)):
         L = t.shape[1]
         stacked_tokens[:, g, :L] = t
         stacked_noise[:, g, :L] = n
         stacked_masks[:, g, :L] = m
+        non_pad_mask[:, g, :L] = True
 
-    return stacked_tokens, stacked_noise, stacked_masks
+    return stacked_tokens, stacked_noise, stacked_masks, non_pad_mask
 
 
 def compute_soft_log_probs(
@@ -815,7 +820,7 @@ def compute_soft_log_probs(
     chunk_size: int = 0,
 ) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
     l_prompt = attention_mask.shape[1]
-    stacked_tokens, stacked_noise, stacked_masks = stack_and_pad_soft(
+    stacked_tokens, stacked_noise, stacked_masks, non_pad_mask = stack_and_pad_soft(
         tokens=completion_tokens,
         noise=completion_noise,
         hard_masks=hard_tokens_mask,
@@ -846,8 +851,7 @@ def compute_soft_log_probs(
             temperature=temperature,
         )
 
-    shadow_ids = stacked_tokens[:, :, l_prompt:].argmax(-1)
-    completion_mask = shadow_ids != pad_token_id
+    completion_mask = non_pad_mask[:, :, l_prompt:]
     return log_probs, completion_mask
 
 
