@@ -102,6 +102,7 @@ def get_state_to_str(
 # update prompt. especially for soft tokens using <reasoning> tags don't make sense
 
 
+# TODO: need to version these prompts better
 def get_prompt_template(enable_thinking: bool):
     reasoning_tag = "think" if enable_thinking else "reasoning"
     return (
@@ -121,6 +122,7 @@ def train(
     model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
+    eps: float = 0.2,
     batch_size: int = 2,
     group_size: int = 8,
     max_tokens: int = 700,
@@ -142,6 +144,10 @@ def train(
     save_ckpt_freq: int = sys.maxsize,
     soft_tokens: bool = False,
     noise_std: float = 0.33,
+    temperature: float = 0.7,
+    min_soft_steps: int = 0,
+    answer_tags_weight: float = 0.1,
+    think_tags_weight: float = 0.05,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -174,8 +180,12 @@ def train(
         reward_fn = weighted_reward(
             [
                 ("correct", 1.0, countdown_correct),
-                ("answer_tags", 0.1, answer_tags),
-                ("think_tags", 0.05, think_tags(reasoning_tag, prefilled_open=True)),
+                ("answer_tags", answer_tags_weight, answer_tags),
+                (
+                    "think_tags",
+                    think_tags_weight,
+                    think_tags(reasoning_tag, prefilled_open=True),
+                ),
             ]
         )
 
@@ -208,16 +218,17 @@ def train(
                 pad_token_id=model_info.pad_token_id,
                 extractor=extract_from_answer_tags,
                 beta=beta,
-                eps=0.2,
+                eps=eps,
                 mu=mu,
                 max_tokens_generated=max_tokens,
                 max_episodes=max_episodes,
                 update_ref_net_batch_cadence=update_ref_net_batch_cadence,
                 batch_size=batch_size,
                 group_size=group_size,
-                temperature=0.7,
+                temperature=temperature,
                 noise_std=noise_std,
                 switch_to_hard_tokens_condition=switch_condition,
+                min_soft_steps=min_soft_steps,
                 accumulation_steps=accumulation_steps,
                 max_grad_norm=max_grad_norm,
                 logprob_chunk_size=logprob_chunk_size,
@@ -236,14 +247,14 @@ def train(
                 pad_token_id=model_info.pad_token_id,
                 extractor=extract_from_answer_tags,
                 beta=beta,
-                eps=0.2,
+                eps=eps,
                 mu=mu,
                 max_tokens_generated=max_tokens,
                 max_episodes=max_episodes,
                 update_ref_net_batch_cadence=update_ref_net_batch_cadence,
                 batch_size=batch_size,
                 group_size=group_size,
-                temperature=0.7,
+                temperature=temperature,
                 accumulation_steps=accumulation_steps,
                 max_grad_norm=max_grad_norm,
                 logprob_chunk_size=logprob_chunk_size,
@@ -304,6 +315,7 @@ def main():
     parser.add_argument(
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
+    parser.add_argument("--eps", type=float, default=0.2, help="clip coefficient")
     parser.add_argument(
         "--binary-reward",
         action="store_true",
@@ -406,6 +418,31 @@ def main():
         default=0.33,
         help="Noise scale as a multiplier of the embedding RMS norm (only used with --soft-tokens)",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for generation",
+    )
+    parser.add_argument(
+        "--min-soft-steps",
+        type=int,
+        default=0,
+        help="Minimum number of soft-token steps before switching to hard tokens",
+    )
+    parser.add_argument(
+        "--answer-tags-weight",
+        type=float,
+        default=0.1,
+        help="Reward weight for answer tag formatting",
+    )
+    parser.add_argument(
+        "--think-tags-weight",
+        type=float,
+        default=0.05,
+        help="Reward weight for thinking tags formatting",
+    )
+
     args = parser.parse_args()
 
     train(
@@ -432,6 +469,10 @@ def main():
         seed=args.seed,
         soft_tokens=args.soft_tokens,
         noise_std=args.noise_std,
+        temperature=args.temperature,
+        min_soft_steps=args.min_soft_steps,
+        answer_tags_weight=args.answer_tags_weight,
+        eps=args.eps,
     )
 
 
