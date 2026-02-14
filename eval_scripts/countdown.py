@@ -44,8 +44,8 @@ def get_prompt_template(enable_thinking: bool):
     if enable_thinking:
         return (
             "Using the numbers {numbers}, create an equation that equals {target}. "
-            "You can use +, -, *, / and each number at most once. "
-            "Show your reasoning in <think></think> tags. Please be concise and give just one solution."
+            "You can use +, -, *, / and each number must be used exactly once. "
+            "First show your complete reasoning process step by step."
             "Put your final equation in <answer></answer> tags. "
             "For example, if the equation is 3+5*2, respond with <answer>3+5*2</answer>."
         )

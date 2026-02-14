@@ -310,6 +310,7 @@ class _SoftGenerator(_BaseTokenGenerator):
         switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
         prefill: PreFill | None = None,
         soft_token_noise_std: float | None = None,
+        min_soft_steps: int = 0,
     ):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
@@ -324,6 +325,7 @@ class _SoftGenerator(_BaseTokenGenerator):
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
         self.prefill = prefill
         self.soft_token_noise_std = soft_token_noise_std
+        self.min_soft_steps = max(0, min_soft_steps)
 
     def init_state(
         self,
@@ -392,10 +394,17 @@ class _SoftGenerator(_BaseTokenGenerator):
         hard_token_id = next_token.argmax(-1)
 
         if self.switch_to_hard_tokens_condition is not None:
-            cond_met = (
-                self.shadow_seq[:, -len(self.switch_to_hard_tokens_condition) :]
-                == self.switch_to_hard_tokens_condition
-            ).all(1)
+            if self.n_generated < self.min_soft_steps:
+                cond_met = torch.zeros(
+                    self.shadow_seq.shape[0],
+                    dtype=torch.bool,
+                    device=self.shadow_seq.device,
+                )
+            else:
+                cond_met = (
+                    self.shadow_seq[:, -len(self.switch_to_hard_tokens_condition) :]
+                    == self.switch_to_hard_tokens_condition
+                ).all(1)
             self._switched_to_hard = self._switched_to_hard | cond_met
 
             self.hard_tokens_mask = torch.cat(
@@ -572,6 +581,7 @@ def generate_soft_tokens(
     switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
     prefill: PreFill | None = None,
     soft_token_noise_std: float | None = None,
+    min_soft_steps: int = 0,
 ) -> SoftTokenGeneratorOutput:
     if pad_token_id is None:
         pad_token_id = eos_token_id
@@ -584,6 +594,7 @@ def generate_soft_tokens(
         switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
         prefill=prefill,
         soft_token_noise_std=soft_token_noise_std,
+        min_soft_steps=min_soft_steps,
     ).generate(
         net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
     )

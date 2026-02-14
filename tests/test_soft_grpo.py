@@ -217,11 +217,7 @@ class TestComputeSoftLogProbs:
             comp_noise = noise_flat[:, prompt_len:]
             e_action = comp_tokens @ W + comp_noise
             mu_new = torch.softmax(logits_comp / 1.0, dim=-1) @ W
-            expected = (
-                -0.5 * D * torch.log(torch.tensor(2 * torch.pi))
-                - D * torch.log(torch.tensor(noise_std))
-                - 0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
-            )
+            expected = -0.5 * ((e_action - mu_new) ** 2).sum(-1) / (noise_std**2)
             expected = expected.view(B, G, completion_len)
 
         torch.testing.assert_close(lp, expected)
