@@ -223,6 +223,8 @@ def stack_and_pad(
     return ret
 
 
+# TODO: update this to support RLOO advantages? think this is just
+# this with normalize False
 def compute_advantages(
     rewards: Float[torch.Tensor, "G B"],
     normalize: bool = True,
@@ -232,6 +234,7 @@ def compute_advantages(
     if normalize:
         if rewards.shape[0] <= 1:
             return rewards - mean
+        # TODO: think there's some clipping option for std
         return (rewards - mean) / (rewards.std(0, keepdim=True) + eps)
     return rewards - mean
 
@@ -407,49 +410,6 @@ def compute_grpo_loss(
 
     loss = ppo_loss_scalar + beta * kl_loss_scalar
     return loss, ppo_loss_scalar.item(), kl_loss_scalar.item()
-
-
-def grpo_step(
-    *,
-    opt: torch.optim.Optimizer,
-    log_probs: Float[torch.Tensor, "B G L_new"],
-    old_log_probs: Float[torch.Tensor, "B G L_new"] | None,
-    ref_log_probs: Float[torch.Tensor, "B G L_new"],
-    completion_mask: Bool[torch.Tensor, "B G L_new"],
-    beta: float,
-    eps: float,
-    rewards: Float[torch.Tensor, "G B"],
-    normalize_advantages: bool = True,
-    clip_ratio_c: float = 3.0,
-    max_grad_norm: float = 1.0,
-) -> tuple[float, float, float]:
-    batch_size, g = log_probs.shape[:2]
-    if old_log_probs is None:
-        old_log_probs = log_probs.detach()
-
-    advs: Float[torch.Tensor, "B G 1"] = compute_advantages(
-        rewards, normalize=normalize_advantages
-    ).T.view(batch_size, g, 1)
-
-    loss, ppo_loss, kl_loss = compute_grpo_loss(
-        log_probs=log_probs,
-        old_log_probs=old_log_probs,
-        ref_log_probs=ref_log_probs,
-        completion_mask=completion_mask,
-        advs=advs,
-        beta=beta,
-        eps=eps,
-        clip_ratio_c=clip_ratio_c,
-    )
-
-    opt.zero_grad()
-    loss.backward()
-    if max_grad_norm > 0:
-        params = [p for group in opt.param_groups for p in group["params"]]
-        torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
-    opt.step()
-
-    return loss.item(), ppo_loss, kl_loss
 
 
 @torch.no_grad()
@@ -1202,6 +1162,8 @@ def generate_soft_rollout_batch(
     max_tokens_generated: int,
     noise_std: float,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
+    max_tokens_prefill: torch.Tensor | None = None,
+    max_tokens_prefill_steps_before_end: int = 0,
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
     use_bf16: bool = False,
@@ -1237,6 +1199,8 @@ def generate_soft_rollout_batch(
         temperature=temperature if temperature > 0 else 1.0,
         use_bf16=use_bf16,
         switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+        max_tokens_prefill=max_tokens_prefill,
+        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
         prefill=prefill,
         soft_token_noise_std=actual_noise_std,
         min_soft_steps=min_soft_steps,
@@ -1333,6 +1297,8 @@ def collect_soft_micro_batch(
     max_tokens_generated: int,
     noise_std: float,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
+    max_tokens_prefill: torch.Tensor | None = None,
+    max_tokens_prefill_steps_before_end: int = 0,
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
     logprob_chunk_size: int = 0,
@@ -1353,6 +1319,8 @@ def collect_soft_micro_batch(
         max_tokens_generated=max_tokens_generated,
         noise_std=noise_std,
         switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+        max_tokens_prefill=max_tokens_prefill,
+        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
         min_soft_steps=min_soft_steps,
         prefill=prefill,
         use_bf16=use_bf16,
@@ -1486,8 +1454,10 @@ def train_soft_grpo(
     temperature: float,
     noise_std: float,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
+    max_tokens_prefill: torch.Tensor | None = None,
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
+    max_tokens_prefill_steps_before_end: int = 0,
     normalize_advantages: bool = True,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
@@ -1515,6 +1485,8 @@ def train_soft_grpo(
             max_tokens_generated=max_tokens_generated,
             noise_std=noise_std,
             switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+            max_tokens_prefill=max_tokens_prefill,
+            max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
             min_soft_steps=min_soft_steps,
             prefill=prefill,
             logprob_chunk_size=logprob_chunk_size,
