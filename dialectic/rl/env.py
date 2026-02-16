@@ -229,7 +229,7 @@ class CountdownEnv(Env[Countdown, None]):
     def __init__(
         self,
         *,
-        prompt_template: str | None = None,
+        prompt_template: str = "Using the numbers {numbers}, create an equation that equals {target}. ",
         n_larges: int | list[int] = 2,
         n_total: int | list[int] = 6,
         n_ops: int | list[int] = 5,
@@ -246,13 +246,7 @@ class CountdownEnv(Env[Countdown, None]):
                 f"got {len(self._n_larges)}, {len(self._n_total)}, {len(self._n_ops)}"
             )
 
-        self.prompt_template = prompt_template or (
-            "Using the numbers {numbers}, create an equation that equals {target}. "
-            "You can use +, -, *, / and each number at most once. "
-            "Show your reasoning in <reasoning></reasoning> tags. Please be concise and give just one solution."
-            "Put your final equation in <answer></answer> tags. "
-            "For example, if the equation is 3+5*2, respond with <reasoning>[detailed reasoning explanations]</reasoning><answer>3+5*2</answer>."
-        )
+        self.prompt_template = prompt_template
         self.rng = random.Random(seed)
 
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
