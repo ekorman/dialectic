@@ -96,7 +96,11 @@ def test_system_and_user_message():
         enable_thinking=True,
     )
 
-    assert result == expected
+    assert (
+        result
+        == expected
+        == "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+    )
 
 
 def test_multi_turn_conversation():
@@ -122,7 +126,11 @@ def test_multi_turn_conversation():
         enable_thinking=True,
     )
 
-    assert result == expected
+    assert (
+        result
+        == expected
+        == "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n2+2 equals 4.<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n"
+    )
 
 
 def test_enable_thinking_false():
@@ -705,7 +713,11 @@ def test_llama_system_and_user_message():
         add_system_date_prompt=True,
     )
 
-    assert result == expected
+    assert (
+        result
+        == expected
+        == "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
 
 
 @pytest.mark.skipif(
