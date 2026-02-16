@@ -151,6 +151,7 @@ class _BaseTokenGenerator(ABC):
 
         device = token_ids.device
         self.init_state(token_ids, attention_mask)
+        self.max_tokens_generated = max_tokens_generated
 
         input_tokens = token_ids
 
@@ -201,6 +202,13 @@ class _BaseTokenGenerator(ABC):
                 input_tokens = self.all_tokens
 
             self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
+
+        # If we hit the generation limit before finishing, allow generators to
+        # append forced tokens (e.g., to trigger a hard-token switch).
+        if self.n_generated >= max_tokens_generated and not self.finished:
+            on_max_tokens_reached = getattr(self, "on_max_tokens_reached", None)
+            if callable(on_max_tokens_reached):
+                on_max_tokens_reached()
 
 
 class _HardGenerator(_BaseTokenGenerator):
@@ -308,6 +316,8 @@ class _SoftGenerator(_BaseTokenGenerator):
         eos_token_id: int = 151645,
         pad_token_id: int = 151643,
         switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
+        max_tokens_prefill: Int[torch.Tensor, " N"] | None = None,
+        max_tokens_prefill_steps_before_end: int = 0,
         prefill: PreFill | None = None,
         soft_token_noise_std: float | None = None,
         min_soft_steps: int = 0,
@@ -323,6 +333,10 @@ class _SoftGenerator(_BaseTokenGenerator):
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.switch_to_hard_tokens_condition = switch_to_hard_tokens_condition
+        self.max_tokens_prefill = max_tokens_prefill
+        self.max_tokens_prefill_steps_before_end = max(
+            0, max_tokens_prefill_steps_before_end
+        )
         self.prefill = prefill
         self.soft_token_noise_std = soft_token_noise_std
         self.min_soft_steps = max(0, min_soft_steps)
@@ -352,6 +366,57 @@ class _SoftGenerator(_BaseTokenGenerator):
             self.switch_to_hard_tokens_condition = (
                 self.switch_to_hard_tokens_condition.to(self.device)
             )
+        if self.max_tokens_prefill is not None:
+            self.max_tokens_prefill = self.max_tokens_prefill.to(self.device)
+        self._max_tokens_prefilled = False
+
+    def on_max_tokens_reached(self) -> None:
+        prefill_ids = (
+            self.max_tokens_prefill
+            if self.max_tokens_prefill is not None
+            else self.switch_to_hard_tokens_condition
+        )
+        if prefill_ids is None:
+            return
+        if self._switched_to_hard.all():
+            return
+
+        need_prefill = (~self._switched_to_hard) & (~self._finished)
+        if not need_prefill.any():
+            return
+
+        fill_ids = prefill_ids
+        fill_len = fill_ids.numel()
+        pad_ids = torch.full_like(fill_ids, self.pad_token_id)
+
+        new_shadow = torch.where(
+            need_prefill.unsqueeze(-1),
+            fill_ids.unsqueeze(0),
+            pad_ids.unsqueeze(0),
+        )
+
+        self.shadow_seq = torch.cat([self.shadow_seq, new_shadow], 1)
+        new_soft = torch.nn.functional.one_hot(new_shadow, self.vocab_size).float()
+        self.all_tokens = torch.cat([self.all_tokens, new_soft], 1)
+
+        new_hard_mask = need_prefill.unsqueeze(-1).expand(-1, fill_len)
+        self.hard_tokens_mask = torch.cat([self.hard_tokens_mask, new_hard_mask], 1)
+
+        if self.attention_mask is not None:
+            new_attn = new_hard_mask
+            self.attention_mask = torch.cat([self.attention_mask, new_attn], 1)
+            if self.attention_mask.shape[1] < self.all_tokens.shape[1]:
+                pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
+                pad = torch.zeros(
+                    self.attention_mask.shape[0],
+                    pad_len,
+                    dtype=self.attention_mask.dtype,
+                    device=self.attention_mask.device,
+                )
+                self.attention_mask = torch.cat([self.attention_mask, pad], 1)
+
+        self._switched_to_hard = self._switched_to_hard | need_prefill
+        self._max_tokens_prefilled = True
 
     def net_forward(
         self,
@@ -378,6 +443,16 @@ class _SoftGenerator(_BaseTokenGenerator):
         )
 
     def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
+        if (
+            self.max_tokens_prefill_steps_before_end > 0
+            and not self._max_tokens_prefilled
+            and self.switch_to_hard_tokens_condition is not None
+        ):
+            prefill_at = max(
+                0, self.max_tokens_generated - self.max_tokens_prefill_steps_before_end
+            )
+            if self.n_generated >= prefill_at:
+                self.on_max_tokens_reached()
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
         next_token = probs
@@ -445,6 +520,18 @@ class _SoftGenerator(_BaseTokenGenerator):
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
+
+        if self.attention_mask is not None and (
+            self.attention_mask.shape[1] < self.all_tokens.shape[1]
+        ):
+            pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
+            pad = torch.zeros(
+                self.attention_mask.shape[0],
+                pad_len,
+                dtype=self.attention_mask.dtype,
+                device=self.attention_mask.device,
+            )
+            self.attention_mask = torch.cat([self.attention_mask, pad], 1)
 
         if self.prefill:
             self.shadow_seq, self.attention_mask = check_and_apply_prefill(
@@ -579,6 +666,8 @@ def generate_soft_tokens(
     temperature: float = 1.0,
     use_bf16: bool = False,
     switch_to_hard_tokens_condition: Int[torch.Tensor, " M"] | None = None,
+    max_tokens_prefill: Int[torch.Tensor, " N"] | None = None,
+    max_tokens_prefill_steps_before_end: int = 0,
     prefill: PreFill | None = None,
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
@@ -592,6 +681,8 @@ def generate_soft_tokens(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+        max_tokens_prefill=max_tokens_prefill,
+        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
         prefill=prefill,
         soft_token_noise_std=soft_token_noise_std,
         min_soft_steps=min_soft_steps,
