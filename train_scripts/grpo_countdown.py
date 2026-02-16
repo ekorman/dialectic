@@ -42,6 +42,8 @@ from dialectic.rl.train import train_grpo, train_soft_grpo
 
 load_dotenv()
 
+REASONING_TAG = "reasoning"
+
 
 @dataclass
 class ModelInfo:
@@ -79,38 +81,88 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
     ),
 }
 
+# system prompt from Soft Tokens Hard Truths paper (but using answer tags instead of boxed)
+STHT_SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves"
+    " it. The assistant first shows the complete reasoning process step by step, then provides the final"
+    " answer in <answer></answer> tags. The assistant must always follow the format: 'User: [question] Assistant:"
+    " [detailed reasoning] The final answer is: <answer>[answer]</answer>.'"
+)
+ENV_PROMPT_WITH_REASONING_TAGS = (
+    "Using the numbers {numbers}, create an equation that equals {target}. "
+    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. "
+    f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags."
+    "Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
+)
+ENV_PROMPT_WITHOUT_REASONING_TAGS = (
+    "Using the numbers {numbers}, create an equation that equals {target}. "
+    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. "
+)
+
+
+@dataclass
+class PromptCollection:
+    system_prompt: str | None
+    env_prompt: str
+    assistant_prefill: str | None
+
+
+PROMPT_COLLECTIONS: list[PromptCollection] = [
+    PromptCollection(
+        system_prompt=None,
+        env_prompt=ENV_PROMPT_WITH_REASONING_TAGS,
+        assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+    ),
+    PromptCollection(
+        system_prompt=STHT_SYSTEM_PROMPT,
+        env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+        assistant_prefill=None,
+    ),
+]
+
 
 def _is_modal_installed():
     return importlib.util.find_spec("modal") is not None
 
 
 def get_state_to_str(
+    *,
     format_messages: Callable[[list[Message], bool], str],
-    reasoning_tag: str,
+    system_prompt: str | None = None,
+    assistant_prefill: str | None = None,
 ):
     def _state_to_str(data: Countdown) -> str:
-        ret = format_messages(
-            [Message(role="user", content=data.prompt)],
-            True,
-        )
-        ret += f"Let me solve this step by step\n<{reasoning_tag}>"
+        # TODO: add system prompt here
+        msgs = []
+        if system_prompt:
+            msgs.append(Message(role="system", content=system_prompt))
+        msgs.append(Message(role="user", content=data.prompt))
+        ret = format_messages(msgs, True)
+        if assistant_prefill:
+            ret += assistant_prefill
         return ret
 
     return _state_to_str
 
 
-# update prompt. especially for soft tokens using <reasoning> tags don't make sense
+def get_reward_fn(answer_tags_weight: float, think_tags_weight: float):
+    components = [
+        ("correct", 1.0, countdown_correct),
+        ("answer_tags", answer_tags_weight, answer_tags),
+    ]
+    if think_tags_weight > 0:
+        components.append(
+            (
+                "think_tags",
+                think_tags_weight,
+                think_tags(REASONING_TAG, prefilled_open=True),
+            )
+        )
+    reward_fn = weighted_reward(components)
+    return reward_fn
 
 
-# TODO: need to version these prompts better
-def get_prompt_template(enable_thinking: bool):
-    reasoning_tag = "think" if enable_thinking else "reasoning"
-    return (
-        "Using the numbers {numbers}, create an equation that equals {target}. "
-        "You can use basic arithmetic operations (+, -, *, /) and each number at most once. "
-        f"Show your reasoning in <{reasoning_tag}></{reasoning_tag}> tags."
-        "Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
-    )
+# update prompt? especially for soft tokens using <reasoning> tags don't make sense
 
 
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
@@ -128,7 +180,6 @@ def train(
     max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
-    binary_reward: bool = False,
     n_larges: int | list[int] = 2,
     n_total: int | list[int] = 6,
     n_ops: int | list[int] = 5,
@@ -148,6 +199,10 @@ def train(
     min_soft_steps: int = 0,
     answer_tags_weight: float = 0.1,
     think_tags_weight: float = 0.05,
+    env_prompt_template: str,
+    system_prompt: str | None,
+    assistant_prefill: str | None,
+    normalize_advantages: bool = True,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -166,44 +221,36 @@ def train(
     opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
     if use_qwen_thinking:
-        reasoning_tag = "think"
 
         def format_messages(msgs: list[Message], gen: bool) -> str:
             return get_qwen_input_text_from_messages(msgs, gen, enable_thinking=True)
     else:
-        reasoning_tag = "reasoning"
         format_messages = model_info.format_messages
 
-    if binary_reward:
-        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
-    else:
-        reward_fn = weighted_reward(
-            [
-                ("correct", 1.0, countdown_correct),
-                ("answer_tags", answer_tags_weight, answer_tags),
-                (
-                    "think_tags",
-                    think_tags_weight,
-                    think_tags(reasoning_tag, prefilled_open=True),
-                ),
-            ]
-        )
+    reward_fn = get_reward_fn(
+        answer_tags_weight=answer_tags_weight, think_tags_weight=think_tags_weight
+    )
 
     env = CountdownEnv(
         seed=seed,
         n_larges=n_larges,
         n_total=n_total,
         n_ops=n_ops,
-        prompt_template=get_prompt_template(enable_thinking=use_qwen_thinking),
+        prompt_template=env_prompt_template,
     )
     device = device or get_default_device()
     print(f"device: {device}")
     net = net.to(device)
 
-    state_to_str = get_state_to_str(format_messages, reasoning_tag)
+    state_to_str = get_state_to_str(
+        format_messages=format_messages,
+        system_prompt=system_prompt,
+        assistant_prefill=assistant_prefill,
+    )
 
     answer_tag_ids = tokenizer.encode("<answer>", add_special_tokens=False).ids
     switch_condition = torch.tensor(answer_tag_ids)
+    max_tokens_prefill = torch.tensor(answer_tag_ids)
 
     try:
         if soft_tokens:
@@ -228,12 +275,15 @@ def train(
                 temperature=temperature,
                 noise_std=noise_std,
                 switch_to_hard_tokens_condition=switch_condition,
+                max_tokens_prefill=max_tokens_prefill,
+                max_tokens_prefill_steps_before_end=20,
                 min_soft_steps=min_soft_steps,
                 accumulation_steps=accumulation_steps,
                 max_grad_norm=max_grad_norm,
                 logprob_chunk_size=logprob_chunk_size,
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
+                normalize_advantages=normalize_advantages,
             )
         else:
             train_grpo(
@@ -260,6 +310,7 @@ def train(
                 logprob_chunk_size=logprob_chunk_size,
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
+                normalize_advantages=normalize_advantages,
             )
     finally:
         extty.finish()
@@ -316,11 +367,6 @@ def main():
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
     parser.add_argument("--eps", type=float, default=0.2, help="clip coefficient")
-    parser.add_argument(
-        "--binary-reward",
-        action="store_true",
-        help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
-    )
     parser.add_argument(
         "--n-ops",
         type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),
@@ -443,7 +489,23 @@ def main():
         help="Reward weight for thinking tags formatting",
     )
 
+    parser.add_argument(
+        "--normalize-advantages",
+        action="store_true",
+        default=True,
+        help="Use Qwen's out-of-the-box thinking mode",
+    )
+    parser.add_argument(
+        "--no-normalize-advantages",
+        dest="normalize_advantages",
+        action="store_false",
+        help="Do not use Qwen's out-of-the-box thinking mode",
+    )
+    parser.add_argument("--prompt-collections-id", type=int, required=True)
+
     args = parser.parse_args()
+
+    prompt_collection: PromptCollection = PROMPT_COLLECTIONS[args.prompt_collections_id]
 
     train(
         model_name=args.model,
@@ -454,7 +516,6 @@ def main():
         max_tokens=args.max_tokens,
         lr=args.lr,
         beta=args.beta,
-        binary_reward=args.binary_reward,
         n_larges=args.n_larges,
         n_ops=args.n_ops,
         n_total=args.n_total,
@@ -473,6 +534,10 @@ def main():
         min_soft_steps=args.min_soft_steps,
         answer_tags_weight=args.answer_tags_weight,
         eps=args.eps,
+        normalize_advantages=args.normalize_advantages,
+        system_prompt=prompt_collection.system_prompt,
+        env_prompt_template=prompt_collection.env_prompt,
+        assistant_prefill=prompt_collection.assistant_prefill,
     )
 
 
