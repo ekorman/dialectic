@@ -302,7 +302,11 @@ class TestTrainSoftGrpo:
         def length_reward_fn(
             *, env_response, raw_model_output=None, extracted_model_output
         ) -> RewardResult:
-            value = len(raw_model_output) / 100.0 if raw_model_output else 0.0
+            if not raw_model_output:
+                value = 0.0
+            else:
+                # Use a reward that's unlikely to tie across group samples.
+                value = sum(ord(c) for c in raw_model_output) / 10000.0
             return RewardResult(total=value, components={"length": value})
 
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-2)
@@ -318,7 +322,7 @@ class TestTrainSoftGrpo:
             reward_fn=length_reward_fn,
             state_to_str=countdown_state_to_str,
             tokenizer=tokenizer,
-            eos_token_id=151643,
+            eos_token_id=999999,
             pad_token_id=151643,
             extractor=extract_from_answer_tags,
             beta=0.01,
