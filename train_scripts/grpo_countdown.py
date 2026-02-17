@@ -97,7 +97,7 @@ ENV_PROMPT_WITH_REASONING_TAGS = (
     "Using the numbers {numbers}, create an equation that equals {target}. "
     "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. "
     f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags."
-    "Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
+    " Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
 )
 ENV_PROMPT_WITHOUT_REASONING_TAGS = (
     "Using the numbers {numbers}, create an equation that equals {target}. "

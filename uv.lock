@@ -318,7 +318,7 @@ modal = [
 
 [package.metadata]
 requires-dist = [
-    { name = "extty", specifier = ">=0.9.0" },
+    { name = "extty", specifier = ">=0.10.0" },
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "requests", specifier = ">=2.31.0" },
@@ -347,15 +347,16 @@ wheels = [
 
 [[package]]
 name = "extty"
-version = "0.9.0"
+version = "0.10.0"
 source = { registry = "https://pypi.pols.ai/" }
 dependencies = [
     { name = "boto3" },
+    { name = "nvidia-ml-py" },
     { name = "psutil" },
 ]
-sdist = { url = "https://pypi.pols.ai/packages/extty-0.9.0.tar.gz", hash = "sha256:80d8f579c3791bc5b4bcdbf3805e8987c8cb18cf20b2c5dd139ac083ce4a88e9" }
+sdist = { url = "https://pypi.pols.ai/packages/extty-0.10.0.tar.gz", hash = "sha256:0dc903a8b8da0fb1892a225e1c1c9887551416778974469843fd0bce871a4d82" }
 wheels = [
-    { url = "https://pypi.pols.ai/packages/extty-0.9.0-py3-none-any.whl", hash = "sha256:c5de43587e006d038d503a82c5b41f8dd591e42bf1ba9c3893fe364c4f74cb63" },
+    { url = "https://pypi.pols.ai/packages/extty-0.10.0-py3-none-any.whl", hash = "sha256:b2cea10c49433cca11c3438f404ff8606027b1534e02b62297475cecd47a3fe3" },
 ]
 
 [[package]]
@@ -1015,6 +1016,15 @@ version = "0.7.1"
 source = { registry = "https://pypi.pols.ai/" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/56/79/12978b96bd44274fe38b5dde5cfb660b1d114f70a65ef962bcbbed99b549/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_x86_64.whl", hash = "sha256:f1bb701d6b930d5a7cea44c19ceb973311500847f81b634d802b7b539dc55623", size = 287193691, upload-time = "2025-02-26T00:15:44.104Z" },
+]
+
+[[package]]
+name = "nvidia-ml-py"
+version = "13.590.48"
+source = { registry = "https://pypi.pols.ai/" }
+sdist = { url = "https://files.pythonhosted.org/packages/af/a0/f4fc18cf72f06821a9a665085435b901449986855519d5b3843532db35e9/nvidia_ml_py-13.590.48.tar.gz", hash = "sha256:8184d1be52914ac7f0991cd1c0d946c65dc88a840c754cd12c274b77b88760dd", size = 49732, upload-time = "2026-01-22T01:14:56.456Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/72/fb2af0d259a651affdce65fd6a495f0e07a685a0136baf585c5065204ee7/nvidia_ml_py-13.590.48-py3-none-any.whl", hash = "sha256:fd43d30ee9cd0b7940f5f9f9220b68d42722975e3992b6c21d14144c48760e43", size = 50680, upload-time = "2026-01-22T01:14:55.281Z" },
 ]
 
 [[package]]

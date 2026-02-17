@@ -21,6 +21,7 @@ class BaseTransformer(nn.Module):
         rope_base_value: float,
         decoder_layer_factory: Callable,
         tie_weights: bool = False,
+        upcast_attention: bool = False,
     ):
         super().__init__()
         self.d = d
@@ -39,6 +40,7 @@ class BaseTransformer(nn.Module):
                     mlp_hidden_d=mlp_hidden_d,
                     rope_base_value=rope_base_value,
                     rms_norm_eps=rms_norm_eps,
+                    upcast_attention=upcast_attention,
                 )
                 for _ in range(n_decoder_layers)
             ]

@@ -18,6 +18,7 @@ def attention(
     v: Float[Tensor, "B NKVH L DHead"],
     causal: bool = False,
     attention_mask: Bool[Tensor, "B L"] | None = None,
+    upcast_attention: bool = False,
 ) -> Float[Tensor, "B NH L DHead"]:
     sdpa_mask = None
     if attention_mask is not None:
@@ -40,7 +41,15 @@ def attention(
                 sdpa_mask = sdpa_mask & causal_mask
             else:
                 use_sdpa_causal = True
-    return nn.functional.scaled_dot_product_attention(
+    input_dtype = q.dtype
+    if upcast_attention:
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        if sdpa_mask is not None and sdpa_mask.dtype != torch.bool:
+            sdpa_mask = sdpa_mask.float()
+
+    out = nn.functional.scaled_dot_product_attention(
         q,
         k,
         v,
@@ -49,6 +58,8 @@ def attention(
         is_causal=use_sdpa_causal,
         enable_gqa=True,
     )
+
+    return out.to(input_dtype) if upcast_attention else out
 
 
 class MHSA(nn.Module):
@@ -63,6 +74,7 @@ class MHSA(nn.Module):
         rope_base_value: float | None = None,
         apply_rms_norm: bool = False,
         rms_norm_eps: float | None = None,
+        upcast_attention: bool = False,
         max_position_embeddings: int = 8192,
         rope_scaling: RopeScaling | None = None,
     ):
@@ -81,6 +93,7 @@ class MHSA(nn.Module):
         self.causal = causal  # ty: ignore[unresolved-attribute]
         self.use_rope = rope_base_value is not None  # ty: ignore[unresolved-attribute]
         self.apply_rms_norm = apply_rms_norm  # ty: ignore[unresolved-attribute]
+        self.upcast_attention = upcast_attention  # ty: ignore[unresolved-attribute]
 
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d, rms_norm_eps)
@@ -133,7 +146,14 @@ class MHSA(nn.Module):
             k = kv_cache.update_and_get_keys(k)
             v = kv_cache.update_and_get_values(v)
 
-        ret = attention(q, k, v, causal=self.causal, attention_mask=attention_mask)
+        ret = attention(
+            q,
+            k,
+            v,
+            causal=self.causal,
+            attention_mask=attention_mask,
+            upcast_attention=self.upcast_attention,
+        )
 
         # move sequence length back to second position and join the heads
         ret = ret.transpose(1, 2).contiguous()

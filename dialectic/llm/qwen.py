@@ -26,6 +26,7 @@ def create_qwen_decoder_layer(
     rope_base_value: float | None = None,
     rms_norm_eps: float = 1e-6,
     rope_max_position_embeddings: int = 32768,
+    upcast_attention: bool = False,
 ):
     return DecoderLayer(
         d=d,

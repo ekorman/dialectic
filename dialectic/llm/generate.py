@@ -240,7 +240,7 @@ class _HardGenerator(_BaseTokenGenerator):
             next_token = logits.argmax(-1)
         else:
             scaled_logits = logits / self.temperature
-            probs = torch.softmax(scaled_logits.squeeze(1), dim=-1)
+            probs = torch.softmax(scaled_logits.squeeze(1).float(), dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
 
         next_token = torch.where(

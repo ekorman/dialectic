@@ -30,6 +30,7 @@ def create_llama_decoder_layer(
     rope_scaling: RopeScaling = RopeScaling(
         factor=32, high_freq_factor=4, low_freq_factor=1
     ),
+    upcast_attention: bool = False,
 ):
     return DecoderLayer(
         d=d,
@@ -43,6 +44,7 @@ def create_llama_decoder_layer(
         rms_norm_eps=rms_norm_eps,
         rope_max_position_embeddings=rope_max_position_embeddings,
         rope_scaling=rope_scaling,
+        upcast_attention=upcast_attention,
     )
 
 
@@ -56,6 +58,7 @@ def create_llama(
     mlp_hidden_d: int,
     tie_weights: bool,
     rope_base_value: int = 500000,
+    upcast_attention: bool = False,
 ):
     return BaseTransformer(
         d=d,
@@ -69,6 +72,7 @@ def create_llama(
         rope_base_value=rope_base_value,
         tie_weights=tie_weights,
         decoder_layer_factory=create_llama_decoder_layer,
+        upcast_attention=upcast_attention,
     )
 
 
@@ -94,6 +98,7 @@ def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
         mlp_hidden_d=8192,
         rope_base_value=500000,
         tie_weights=True,
+        upcast_attention=True,
     )
 
     if pretrained_weights:
