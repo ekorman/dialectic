@@ -16,7 +16,12 @@ from dialectic.llm.generate import (
     generate_hard_tokens,
     qwen_generate_from_chat,
 )
-from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen3_06b
+from dialectic.llm.qwen import (
+    create_qwen,
+    create_qwen_decoder_layer,
+    load_qwen3_06b,
+    load_qwen3_17b,
+)
 from dialectic.llm.templates import Message
 
 torch.manual_seed(18)
@@ -568,3 +573,36 @@ def test_compiled_model_generation_against_qwen_06b():
     model = load_qwen3_06b(True).eval()
     model = torch.compile(model)
     _test_model_generation_against_qwen_06b(hf_model, model)
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_qwen17b_model_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_qwen17b_model_generation():
+    model = load_qwen3_17b(True).eval()
+    tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+    messages = [Message(role="user", content="Name two cities in Japan")]
+
+    resp = qwen_generate_from_chat(
+        model,
+        tokenizer,
+        [messages],
+        sampling_strategy="greedy",
+        enable_thinking=True,
+    )
+
+    assert (
+        resp[0]
+        == """user
+Name two cities in Japan
+assistant
+<think>
+Okay, the user is asking for two cities in Japan. Let me think. Japan has a lot of cities, but I need to pick two that are well-known. Tokyo is definitely the most famous, so that's a good choice. Then, Osaka is another major city. They're both in the main island of Honshu. I should check if there are any other popular ones, but maybe Tokyo and Osaka are the safest bet. Let me confirm the names to make sure I'm not mixing up any. Yeah, Tokyo is the capital, and Osaka is a major metropolitan area. I think that's right. No need to mention other cities unless the user asks for more. Just stick to two.
+</think>
+
+Two cities in Japan are **Tokyo** and **Osaka**.
+
+- **Tokyo** is the capital and the most populous city in Japan, known for its advanced technology, culture, and iconic landmarks like the Tokyo Tower and Shibuya.
+- **Osaka** is a major metropolitan area in the Kansai region, famous for its vibrant food scene, historic sites like Osaka Castle, and bustling urban life."""
+    )
