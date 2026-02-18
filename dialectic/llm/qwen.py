@@ -73,7 +73,7 @@ QWEN3_06B_WEIGHTS = Artifact(
 )
 
 
-def load_qwen_06b(pretrained_weights: bool = False) -> BaseTransformer:
+def load_qwen3_06b(pretrained_weights: bool = False) -> BaseTransformer:
     net = create_qwen(
         d=1024,
         vocab_size=151936,

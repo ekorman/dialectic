@@ -23,7 +23,7 @@ from tokenizers import Tokenizer
 
 from dialectic.artifacts import Artifact, get_artifact
 from dialectic.llm.llama import LLAMA_32_TOKENIZER, load_llama_32_1b_instruct
-from dialectic.llm.qwen import load_qwen_06b
+from dialectic.llm.qwen import load_qwen3_06b
 from dialectic.llm.templates import (
     Message,
     get_llama_input_text_from_messages,
@@ -62,7 +62,7 @@ class ModelInfo:
 
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
-        net_factory=lambda: load_qwen_06b(True),
+        net_factory=lambda: load_qwen3_06b(True),
         tokenizer="Qwen/Qwen3-0.6B",
         eos_token_id=151645,
         pad_token_id=151643,

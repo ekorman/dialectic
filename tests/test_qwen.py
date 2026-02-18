@@ -16,7 +16,7 @@ from dialectic.llm.generate import (
     generate_hard_tokens,
     qwen_generate_from_chat,
 )
-from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen_06b
+from dialectic.llm.qwen import create_qwen, create_qwen_decoder_layer, load_qwen3_06b
 from dialectic.llm.templates import Message
 
 torch.manual_seed(18)
@@ -553,7 +553,7 @@ def test_model_generation_against_qwen_06b():
     hf_model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen3-0.6B", dtype=torch.float32
     ).eval()
-    model = load_qwen_06b(True).eval()
+    model = load_qwen3_06b(True).eval()
     _test_model_generation_against_qwen_06b(hf_model, model)
 
 
@@ -565,6 +565,6 @@ def test_compiled_model_generation_against_qwen_06b():
     hf_model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen3-0.6B", dtype=torch.float32
     ).eval()
-    model = load_qwen_06b(True).eval()
+    model = load_qwen3_06b(True).eval()
     model = torch.compile(model)
     _test_model_generation_against_qwen_06b(hf_model, model)
