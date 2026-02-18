@@ -9,9 +9,7 @@
 - 'VC': vocab size
 """
 
-from safetensors.torch import load_file
-
-from dialectic.artifacts import Artifact, get_artifact, map_hf_key_to_dialectic
+from dialectic.artifacts import Artifact, load_state_dict_from_artifact
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import DecoderLayer
 from dialectic.llm.components.rope import RopeScaling
@@ -77,17 +75,32 @@ def create_llama(
 
 
 LLAMA_32_1B_INSTRUCT_WEIGHTS = Artifact(
-    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/model.safetensors",
-    filename="llama-3.2-1b-instruct/model.safetensors",
+    urls=[
+        "https://public-storage.pols.ai/model-weights/llama-3.2/llama-3.2-1b-instruct/model.safetensors"
+    ],
+    filenames=["llama-3.2/llama-3.2-1b-instruct/model.safetensors"],
 )
 
-LLAMA_32_1B_TOKENIZER = Artifact(
-    url="https://public-storage.pols.ai/model-weights/llama-3.2-1b-instruct/llama3.2-tokenizer.json",
-    filename="llama-3.2-1b-instruct/llama3.2-tokenizer.json",
+LLAMA_32_3B_INSTRUCT_WEIGHTS = Artifact(
+    urls=[
+        f"https://public-storage.pols.ai/model-weights/llama-3.2/llama-3.2-3b-instruct/model-0000{i}-of-00002.safetensors"
+        for i in [1, 2]
+    ],
+    filenames=[
+        f"llama-3.2/llama-3.2-3b-instruct/model-0000{i}-of-00002.safetensors"
+        for i in [1, 2]
+    ],
+)
+
+LLAMA_32_TOKENIZER = Artifact(
+    urls=[
+        "https://public-storage.pols.ai/model-weights/llama-3.2/llama3.2-tokenizer.json"
+    ],
+    filenames=["llama-3.2/llama3.2-tokenizer.json"],
 )
 
 
-def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
+def load_llama_32_1b_instruct(pretrained_weights: bool = False) -> BaseTransformer:
     net = create_llama(
         d=2048,
         vocab_size=128256,
@@ -102,15 +115,32 @@ def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
     )
 
     if pretrained_weights:
-        sd = load_file(get_artifact(artifact=LLAMA_32_1B_INSTRUCT_WEIGHTS))
-        sd = {map_hf_key_to_dialectic(k): v for k, v in sd.items()}
+        sd = load_state_dict_from_artifact(
+            LLAMA_32_1B_INSTRUCT_WEIGHTS, convert_keys=True, tied_weights=True
+        )
 
-        if "lm_head.weight" not in sd:
-            sd["lm_head.weight"] = sd["embed_tokens.weight"]
-        elif not (sd["lm_head.weight"] == sd["embed_tokens.weight"]).all():
-            raise ValueError(
-                "Expected `lm_head.weight` and `embed_tokens.weight` to be identical."
-            )
+        net.load_state_dict(sd)
+
+    return net
+
+
+def load_llama_32_3b_instruct(pretrained_weights: bool = False) -> BaseTransformer:
+    net = create_llama(
+        d=3072,
+        vocab_size=128256,
+        n_decoder_layers=28,
+        attn_head_d=128,
+        attn_num_heads=24,
+        attn_num_kv_heads=8,
+        mlp_hidden_d=8192,
+        rope_base_value=500000,
+        tie_weights=True,
+    )
+
+    if pretrained_weights:
+        sd = load_state_dict_from_artifact(
+            LLAMA_32_3B_INSTRUCT_WEIGHTS, convert_keys=True, tied_weights=True
+        )
 
         net.load_state_dict(sd)
 
