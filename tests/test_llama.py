@@ -6,7 +6,7 @@ from tokenizers import Tokenizer
 from transformers import AutoModelForCausalLM
 
 from dialectic.llm.generate import llama_generate_from_chat
-from dialectic.llm.llama import load_llama_1b
+from dialectic.llm.llama import load_llama_32_1b_instruct, load_llama_32_3b_instruct
 from dialectic.llm.templates import Message
 
 """
@@ -37,7 +37,7 @@ Hello! I'm an artificial intelligence model known as Llama. Llama stands for "La
 )
 @torch.no_grad()
 def test_llama_against_hf_softmax():
-    model = load_llama_1b()
+    model = load_llama_32_1b_instruct()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-3.2-1B-Instruct", dtype=torch.float32
@@ -89,10 +89,10 @@ token.
     reason="skipping `test_llama_against_hf_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
 @torch.no_grad()
-def test_llama_against_hf_generation():
+def test_llama_32_1b_instruct_against_hf_generation():
     tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
-    model = load_llama_1b(True).eval()
+    model = load_llama_32_1b_instruct(True).eval()
 
     messages = [[Message(role="user", content="Hello who are you?")]]
 
@@ -113,4 +113,44 @@ def test_llama_against_hf_generation():
 Hello who are you?assistant
 
 I'm an artificial intelligence model known as Llama. Llama stands for "Large Language Model Meta AI.\""""
+    )
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_llama_32_3b_instruct_against_hf_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+@torch.no_grad()
+def test_llama_32_3b_instruct_against_hf_generation():
+    tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+
+    model = load_llama_32_3b_instruct(True).eval()
+
+    messages = [[Message(role="user", content="Write a haiku")]]
+
+    chat_output = llama_generate_from_chat(
+        model,
+        tokenizer=tokenizer,
+        batch_messages=messages,
+        sampling_strategy="greedy",
+        max_tokens_generated=100,
+    )
+
+    assert len(chat_output) == 1
+
+    """ huggingface gives
+    Softly falls the snow
+    Dance of white and silent night
+    Winter's peaceful hush
+    """
+
+    assert (
+        chat_output[0]
+        == """user
+
+Write a haikuassistant
+
+Snowflakes gently fall
+Blanketing the winter scene
+Peaceful silence reigns"""
     )
