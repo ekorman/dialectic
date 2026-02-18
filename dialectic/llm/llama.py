@@ -83,7 +83,7 @@ LLAMA_32_1B_TOKENIZER = Artifact(
 )
 
 
-def load_llama_1b(pretrained_weights: bool = False) -> BaseTransformer:
+def load_llama_32_1b(pretrained_weights: bool = False) -> BaseTransformer:
     net = create_llama(
         d=2048,
         vocab_size=128256,
