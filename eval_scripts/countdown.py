@@ -15,7 +15,7 @@ import extty
 import torch
 from tokenizers import Tokenizer
 
-from dialectic.llm.qwen import load_qwen_06b
+from dialectic.llm.qwen import load_qwen3_06b
 from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
@@ -79,7 +79,7 @@ def eval(
     max_episodes: int,
     n_examples: int,
 ):
-    net = load_qwen_06b()
+    net = load_qwen3_06b()
     net.load_state_dict(
         torch.load(weights_path, map_location=device, weights_only=True)
     )
