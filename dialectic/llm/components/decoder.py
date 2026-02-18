@@ -27,7 +27,6 @@ class DecoderLayer(nn.Module):
         rope_max_position_embeddings: int,
         rope_base_value: float | None = None,
         rope_scaling: RopeScaling | None = None,
-        upcast_attention: bool = False,
     ):
         super().__init__()
         self.input_layernorm = RMSNorm(d, rms_norm_eps)
@@ -42,7 +41,6 @@ class DecoderLayer(nn.Module):
             rms_norm_eps=rms_norm_eps,
             max_position_embeddings=rope_max_position_embeddings,
             rope_scaling=rope_scaling,
-            upcast_attention=upcast_attention,
         )
         self.post_attention_layernorm = RMSNorm(d, rms_norm_eps)
         self.mlp = GatedMLP(d=d, hidden_d=mlp_hidden_d)
