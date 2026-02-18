@@ -57,7 +57,7 @@ class ModelInfo:
     def load_tokenizer(self) -> Tokenizer:
         if isinstance(self.tokenizer, str):
             return Tokenizer.from_pretrained(self.tokenizer)
-        return Tokenizer.from_file(str(get_artifact(self.tokenizer)))
+        return Tokenizer.from_file(str(get_artifact(self.tokenizer)[0]))
 
 
 MODEL_REGISTRY: dict[str, ModelInfo] = {

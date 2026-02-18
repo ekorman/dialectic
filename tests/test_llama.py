@@ -118,7 +118,7 @@ I'm an artificial intelligence model known as Llama. Llama stands for "Large Lan
 
 @pytest.mark.skipif(
     os.getenv("TEST_LLM_AGAINST_HF") is None,
-    reason="skipping `test_llama_against_hf_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
+    reason="skipping `test_llama_32_3b_instruct_against_hf_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
 )
 @torch.no_grad()
 def test_llama_32_3b_instruct_against_hf_generation():

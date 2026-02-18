@@ -19,7 +19,7 @@ class Artifact:
 
 def get_artifact(artifact: Artifact) -> list[Path]:
     local_paths = []
-    for url, filename in zip(artifact.urls, artifact.filenames):
+    for url, filename in zip(artifact.urls, artifact.filenames, strict=True):
         local_path = WEIGHTS_CACHE / filename
         if not local_path.exists():
             print(
