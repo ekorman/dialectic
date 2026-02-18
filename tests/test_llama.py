@@ -6,7 +6,7 @@ from tokenizers import Tokenizer
 from transformers import AutoModelForCausalLM
 
 from dialectic.llm.generate import llama_generate_from_chat
-from dialectic.llm.llama import load_llama_32_1b
+from dialectic.llm.llama import load_llama_32_1b_instruct
 from dialectic.llm.templates import Message
 
 """
@@ -37,7 +37,7 @@ Hello! I'm an artificial intelligence model known as Llama. Llama stands for "La
 )
 @torch.no_grad()
 def test_llama_against_hf_softmax():
-    model = load_llama_32_1b()
+    model = load_llama_32_1b_instruct()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         "meta-llama/Llama-3.2-1B-Instruct", dtype=torch.float32
@@ -92,7 +92,7 @@ token.
 def test_llama_against_hf_generation():
     tokenizer = Tokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 
-    model = load_llama_32_1b(True).eval()
+    model = load_llama_32_1b_instruct(True).eval()
 
     messages = [[Message(role="user", content="Hello who are you?")]]
 
