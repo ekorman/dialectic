@@ -68,8 +68,10 @@ def create_qwen(
 
 
 QWEN3_06B_WEIGHTS = Artifact(
-    url="https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/model.safetensors?download=true",
-    filename="qwen3-0.6b/model.safetensors",
+    urls=[
+        "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/model.safetensors?download=true"
+    ],
+    filenames=["qwen3-0.6b/model.safetensors"],
 )
 
 
