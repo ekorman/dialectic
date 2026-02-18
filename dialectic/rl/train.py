@@ -149,7 +149,7 @@ def compute_log_probs(
         only_completion = stacked[:, :, l_prompt:]
         B, G, L, V = logits.shape
         log_probs = -torch.nn.functional.cross_entropy(
-            logits.reshape(B * G * L, V).float(),
+            logits.reshape(B * G * L, V),
             only_completion.reshape(B * G * L),
             reduction="none",
         ).reshape(B, G, L)
@@ -194,7 +194,7 @@ def _compute_log_probs_chunked(
 
         BG, L_chunk, V = chunk_logits.shape
         chunk_log_probs = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG * L_chunk, V).float(),
+            chunk_logits.reshape(BG * L_chunk, V),
             chunk_targets.reshape(BG * L_chunk),
             reduction="none",
         ).reshape(BG, L_chunk)
@@ -485,7 +485,7 @@ def collect_micro_batch(
         )
         l_prompt = rollout.attention_mask.shape[1]
         logits = logits[:, :, l_prompt - 1 : -1]
-        logp = torch.log_softmax(logits.float(), dim=-1)
+        logp = torch.log_softmax(logits, dim=-1)
         entropy = -(logp.exp() * logp).sum(-1)
         if torch.any(completion_mask):
             ent_vals = entropy[completion_mask]
@@ -1021,7 +1021,7 @@ def _compute_soft_log_probs_full(
 
     shadow_ids = comp_tokens.argmax(-1)
     hard_lp = -torch.nn.functional.cross_entropy(
-        logits.reshape(BG * completion_len, V).float(),
+        logits.reshape(BG * completion_len, V),
         shadow_ids.reshape(BG * completion_len),
         reduction="none",
     ).reshape(BG, completion_len)
@@ -1108,7 +1108,7 @@ def _compute_soft_log_probs_chunked(
 
         chunk_shadow_ids = chunk_comp_tokens.argmax(-1)
         hard_lp = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG_c * L_chunk, V).float(),
+            chunk_logits.reshape(BG_c * L_chunk, V),
             chunk_shadow_ids.reshape(BG_c * L_chunk),
             reduction="none",
         ).reshape(BG_c, L_chunk)
