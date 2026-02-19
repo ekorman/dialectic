@@ -34,7 +34,6 @@ def aggregate_reward_components(
 @dataclass
 class ValidationConfig:
     envs: list[Env]
-    env_seeds: list[int]
     reward_fn: RewardFn
     state_to_str: Callable
     extractor: Callable[[str], Any]
@@ -59,9 +58,7 @@ def run_validation(
     was_training = net.training
     net.eval()
 
-    for env, seed in zip(val_config.envs, val_config.env_seeds):
-        env.reset(seed=seed)
-
+    for env in val_config.envs:
         label = str(env)
         result, examples = evaluate(
             net=net,

@@ -299,22 +299,18 @@ def train(
         n_total_list = [n_total] if isinstance(n_total, int) else n_total
         n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
         val_envs = []
-        val_seeds = []
         for i in range(len(n_ops_list)):
-            val_seed = 2026 + i
             val_envs.append(
                 CountdownEnv(
-                    seed=val_seed,
+                    seed=2026 + i,
                     n_larges=n_larges_list[i],
                     n_total=n_total_list[i],
                     n_ops=n_ops_list[i],
                     prompt_template=env_prompt_template,
                 )
             )
-            val_seeds.append(val_seed)
         val_config = ValidationConfig(
             envs=val_envs,
-            env_seeds=val_seeds,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
             extractor=extract_from_answer_tags,
