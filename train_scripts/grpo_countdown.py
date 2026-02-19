@@ -533,13 +533,13 @@ def main():
         "--normalize-advantages",
         action="store_true",
         default=True,
-        help="Use Qwen's out-of-the-box thinking mode",
+        help="Normalize advantages by standard deviation",
     )
     parser.add_argument(
         "--no-normalize-advantages",
         dest="normalize_advantages",
         action="store_false",
-        help="Do not use Qwen's out-of-the-box thinking mode",
+        help="Do not normalize advantages by standard deviation",
     )
     parser.add_argument("--prompt-collections-id", type=int, required=True)
     parser.add_argument(

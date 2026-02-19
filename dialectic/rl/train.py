@@ -735,6 +735,7 @@ def _grpo_train_loop(
                             / len(micro_batches),
                         }
                         if "hard_ent_mean" in micro_batches[0]
+                        and "hard_lp_mean" not in micro_batches[0]
                         else {}
                     ),
                 },
