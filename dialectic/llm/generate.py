@@ -410,15 +410,17 @@ class _SoftGenerator(_BaseTokenGenerator):
         if self.attention_mask is not None:
             new_attn = new_hard_mask
             self.attention_mask = torch.cat([self.attention_mask, new_attn], 1)
-            if self.attention_mask.shape[1] < self.all_tokens.shape[1]:
-                pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
-                pad = torch.zeros(
-                    self.attention_mask.shape[0],
-                    pad_len,
-                    dtype=self.attention_mask.dtype,
-                    device=self.attention_mask.device,
-                )
-                self.attention_mask = torch.cat([self.attention_mask, pad], 1)
+            # TODO: think this is dead code that should never be reached, commenting out
+            # for now to test live
+            # if self.attention_mask.shape[1] < self.all_tokens.shape[1]:
+            #     pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
+            #     pad = torch.zeros(
+            #         self.attention_mask.shape[0],
+            #         pad_len,
+            #         dtype=self.attention_mask.dtype,
+            #         device=self.attention_mask.device,
+            #     )
+            #     self.attention_mask = torch.cat([self.attention_mask, pad], 1)
 
         self._switched_to_hard = self._switched_to_hard | need_prefill
         self._max_tokens_prefilled = True
@@ -526,17 +528,19 @@ class _SoftGenerator(_BaseTokenGenerator):
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
 
-        if self.attention_mask is not None and (
-            self.attention_mask.shape[1] < self.all_tokens.shape[1]
-        ):
-            pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
-            pad = torch.zeros(
-                self.attention_mask.shape[0],
-                pad_len,
-                dtype=self.attention_mask.dtype,
-                device=self.attention_mask.device,
-            )
-            self.attention_mask = torch.cat([self.attention_mask, pad], 1)
+        # TODO: think this is dead code that should never be reached, commenting out
+        # for now to test live
+        # if self.attention_mask is not None and (
+        #     self.attention_mask.shape[1] < self.all_tokens.shape[1]
+        # ):
+        #     pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
+        #     pad = torch.zeros(
+        #         self.attention_mask.shape[0],
+        #         pad_len,
+        #         dtype=self.attention_mask.dtype,
+        #         device=self.attention_mask.device,
+        #     )
+        #     self.attention_mask = torch.cat([self.attention_mask, pad], 1)
 
         if self.prefill:
             self.shadow_seq, self.attention_mask = check_and_apply_prefill(

@@ -880,7 +880,10 @@ def compute_soft_log_probs(
     pad_token_id: int,
     chunk_size: int = 0,
     return_entropy: bool = False,
-) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
+) -> (
+    tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]
+    | tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"], torch.Tensor]
+):
     l_prompt = attention_mask.shape[1]
     stacked_tokens, stacked_noise, stacked_masks, non_pad_mask = stack_and_pad_soft(
         tokens=completion_tokens,
