@@ -5,6 +5,7 @@ from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import countdown_correct, weighted_reward
 from dialectic.rl.train import (
     compute_soft_log_probs,
+    grpo_advantage,
     stack_and_pad_soft,
     train_soft_grpo,
 )
@@ -294,6 +295,8 @@ class TestTrainSoftGrpo:
             temperature=1.0,
             noise_std=0.1,
             use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer):
@@ -336,6 +339,8 @@ class TestTrainSoftGrpo:
             temperature=1.0,
             noise_std=0.1,
             use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
         params_changed = False
