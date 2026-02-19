@@ -325,7 +325,7 @@ class TestGRPOMechanics:
             )
 
         monkeypatch.setattr(
-            "dialectic.rl.train.generate_hard_tokens",
+            "dialectic.rl.rollout.generate_hard_tokens",
             deterministic_generate_from_tokens,
         )
 

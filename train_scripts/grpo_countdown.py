@@ -44,6 +44,7 @@ from dialectic.rl.reward import (
     weighted_reward,
 )
 from dialectic.rl.train import (
+    ValidationConfig,
     grpo_advantage,
     rloo_advantage,
     train_grpo,
@@ -233,6 +234,9 @@ def train(
     assistant_prefill: str | None,
     normalize_advantages: bool = True,
     normalize_by_sequence_length: bool,
+    val_freq: int = 0,
+    val_episodes: int = 50,
+    val_batch_size: int = 4,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -289,6 +293,36 @@ def train(
     else:
         raise ValueError(f"Got unknown advantage function type {advantage_fn_type}")
 
+    val_config: ValidationConfig | None = None
+    if val_freq > 0:
+        n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
+        n_total_list = [n_total] if isinstance(n_total, int) else n_total
+        n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
+        val_envs = []
+        for i in range(len(n_ops_list)):
+            val_envs.append(
+                CountdownEnv(
+                    seed=2026 + i,
+                    n_larges=n_larges_list[i],
+                    n_total=n_total_list[i],
+                    n_ops=n_ops_list[i],
+                    prompt_template=env_prompt_template,
+                )
+            )
+        val_config = ValidationConfig(
+            envs=val_envs,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            extractor=extract_from_answer_tags,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            max_tokens_generated=max_tokens,
+            use_bf16=use_bf16,
+        )
+
     try:
         if soft_tokens:
             train_soft_grpo(
@@ -322,6 +356,8 @@ def train(
                 save_ckpt_freq=save_ckpt_freq,
                 advantage_fn=advantage_fn,
                 normalize_by_sequence_length=normalize_by_sequence_length,
+                val_config=val_config,
+                val_freq=val_freq,
             )
         else:
             train_grpo(
@@ -350,6 +386,8 @@ def train(
                 save_ckpt_freq=save_ckpt_freq,
                 advantage_fn=advantage_fn,
                 normalize_by_sequence_length=normalize_by_sequence_length,
+                val_config=val_config,
+                val_freq=val_freq,
             )
     finally:
         extty.finish()
@@ -555,6 +593,25 @@ def main():
         help="Do not normalize per-token loss by sequence length",
     )
 
+    parser.add_argument(
+        "--val-freq",
+        type=int,
+        default=50,
+        help="Validate every N steps (0 = disabled)",
+    )
+    parser.add_argument(
+        "--val-episodes",
+        type=int,
+        default=100,
+        help="Episodes per validation env",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for validation",
+    )
+
     args = parser.parse_args()
 
     prompt_collection: PromptCollection = PROMPT_COLLECTIONS[args.prompt_collections_id]
@@ -593,6 +650,9 @@ def main():
         env_prompt_template=prompt_collection.env_prompt,
         assistant_prefill=prompt_collection.assistant_prefill,
         think_tags_weight=args.think_tags_weight,
+        val_freq=args.val_freq,
+        val_episodes=args.val_episodes,
+        val_batch_size=args.val_batch_size,
     )
 
 

@@ -6,7 +6,7 @@ from dialectic.rl.env import Countdown
 from dialectic.rl.evaluate import EvaluationResult, evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import countdown_correct, weighted_reward
-from dialectic.rl.train import RolloutBatch, generate_rollout_batch
+from dialectic.rl.rollout import RolloutBatch, generate_rollout_batch
 
 
 def countdown_state_to_str(data: Countdown) -> str:

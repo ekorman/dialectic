@@ -1,9 +1,8 @@
 import sys
 import time
-import warnings
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Generic
+from typing import Any, Callable
 
 import extty
 import torch
@@ -12,48 +11,12 @@ from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import PreFill, generate_hard_tokens, generate_soft_tokens
+from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
+from dialectic.rl.evaluate import evaluate
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
-
-
-def _embedding_rms_norm(net: BaseTransformer) -> float:
-    W = net.embed_tokens.weight
-    return W.pow(2).mean().sqrt().item()
-
-
-@dataclass
-class RolloutBatch(Generic[T]):
-    env_responses: list[EnvResponse[T]]
-    prompts: list[str]
-    output_strs: list[list[str]]  # [G][B]
-    reward_results: list[list[RewardResult]]  # [G][B]
-    rewards: Float[torch.Tensor, "G B"]
-    completion_token_ids: list[Integer[torch.Tensor, "B L"]]  # len G
-    attention_mask: Bool[torch.Tensor, "B L_prompt"]
-    t_generation: float
-
-
-@dataclass
-class SoftRolloutBatch(Generic[T]):
-    env_responses: list[EnvResponse[T]]
-    prompts: list[str]
-    output_strs: list[list[str]]  # [G][B]
-    reward_results: list[list[RewardResult]]  # [G][B]
-    rewards: Float[torch.Tensor, "G B"]
-    completion_tokens: list[
-        Float[torch.Tensor, "B L V"]
-    ]  # len G, full seq (prompt+gen)
-    completion_action_embeddings: list[
-        Float[torch.Tensor, "B L D"]
-    ]  # len G, full seq (prompt+gen), from behavior net
-    completion_noise: list[Float[torch.Tensor, "B L D"]]  # len G
-    hard_tokens_mask: list[Bool[torch.Tensor, "B L"]]  # len G
-    noise_std: float
-    temperature: float
-    attention_mask: Bool[torch.Tensor, "B L_prompt"]
-    t_generation: float
+from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
+from dialectic.rl.types import A, E, RewardResult, T
 
 
 def aggregate_reward_components(
@@ -66,6 +29,73 @@ def aggregate_reward_components(
             for name, value in r.components.items():
                 all_components.setdefault(name, []).append(value)
     return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
+
+
+@dataclass
+class ValidationConfig:
+    envs: list[Env]
+    reward_fn: RewardFn
+    state_to_str: Callable
+    extractor: Callable[[str], Any]
+    tokenizer: Tokenizer
+    eos_token_id: int
+    pad_token_id: int
+    max_episodes: int
+    batch_size: int
+    max_tokens_generated: int
+    use_bf16: bool
+
+
+@torch.no_grad()
+def run_validation(
+    *,
+    net: BaseTransformer,
+    val_config: ValidationConfig,
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    reward_means: list[float] = []
+
+    was_training = net.training
+    net.eval()
+
+    for env in val_config.envs:
+        label = str(env)
+        result, examples = evaluate(
+            net=net,
+            env=env,
+            reward_fn=val_config.reward_fn,
+            state_to_str=val_config.state_to_str,
+            tokenizer=val_config.tokenizer,
+            eos_token_id=val_config.eos_token_id,
+            pad_token_id=val_config.pad_token_id,
+            extractor=val_config.extractor,
+            max_tokens_generated=val_config.max_tokens_generated,
+            max_episodes=val_config.max_episodes,
+            batch_size=val_config.batch_size,
+            group_size=1,
+            temperature=0.0,
+            use_bf16=val_config.use_bf16,
+        )
+
+        metrics[f"val/{label}/reward_mean"] = result.reward_mean
+        metrics[f"val/{label}/reward_std"] = result.reward_std
+        for comp_name, comp_val in result.component_means.items():
+            metrics[f"val/{label}/reward/{comp_name}"] = comp_val
+        if examples:
+            metrics[f"val/{label}/example"] = extty.BatchExample(
+                prompts=[e.prompt for e in examples],
+                responses=[e.responses for e in examples],
+                rewards=None,
+            )
+        reward_means.append(result.reward_mean)
+
+    if reward_means:
+        metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
+
+    if was_training:
+        net.train()
+
+    return metrics
 
 
 def rewards_to_go(
@@ -244,111 +274,6 @@ def rloo_advantage(rewards: Float[torch.Tensor, "G B"]) -> Float[torch.Tensor, "
     return G / (G - 1) * rewards - 1 / (G - 1) * rewards.sum(0, keepdim=True)
 
 
-def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
-    env_responses = []
-    for _ in range(batch_size):
-        env_response = env.reset()
-        if env_response is not None:
-            env_responses.append(env_response)
-            if not env_response.is_done:
-                raise RuntimeError("Only single step environments supported for now")
-        else:
-            warnings.warn("Got None response from `env.reset`")
-    return env_responses
-
-
-@torch.no_grad()
-def generate_rollout_batch(
-    *,
-    net: BaseTransformer,
-    env: Env[T, A],
-    reward_fn: RewardFn[T, E],
-    state_to_str: Callable[[T], str],
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
-    extractor: Callable[[str], E],
-    batch_size: int,
-    group_size: int,
-    temperature: float,
-    max_tokens_generated: int,
-    use_bf16: bool = False,
-) -> RolloutBatch[T]:
-    """Generate completions and compute rewards for a batch from the environment."""
-    env_responses = get_batch(env, batch_size)
-    prompts = [state_to_str(resp.data) for resp in env_responses]
-    device = next(net.parameters()).device
-
-    tokenizer.enable_padding(direction="left")
-    tokens = tokenizer.encode_batch(prompts)
-    attention_mask = torch.tensor(
-        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
-    )
-    token_ids = torch.tensor([t.ids for t in tokens], device=device)
-
-    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
-
-    was_training = net.training
-    net.eval()
-    t_gen_start = time.perf_counter()
-
-    all_completions = generate_hard_tokens(
-        net=net,
-        token_ids=expanded_token_ids,
-        sampling_strategy="sample" if temperature > 0 else "greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-        attention_mask=expanded_attention_mask,
-        temperature=temperature if temperature > 0 else 1.0,
-        use_bf16=use_bf16,
-    ).tokens
-    t_generation = time.perf_counter() - t_gen_start
-    if was_training:
-        net.train()
-
-    all_completions = all_completions.view(batch_size, group_size, -1)
-    all_completions = all_completions.permute(1, 0, 2)
-    completion_token_ids: list[Integer[torch.Tensor, "B L"]] = list(
-        all_completions.unbind(0)
-    )
-
-    prompt_len = token_ids.shape[1]
-
-    output_strs: list[list[str]] = [
-        tokenizer.decode_batch(c[:, prompt_len:].tolist()) for c in completion_token_ids
-    ]
-    reward_results: list[list[RewardResult]] = [
-        [
-            reward_fn(
-                env_response=env_response,
-                raw_model_output=s,
-                extracted_model_output=extractor(s),
-            )
-            for s, env_response in zip(group_batch, env_responses)
-        ]
-        for group_batch in output_strs
-    ]
-
-    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
-        [[r.total for r in row] for row in reward_results],
-        device=device,
-    )
-
-    return RolloutBatch(
-        env_responses=env_responses,
-        prompts=prompts,
-        output_strs=output_strs,
-        reward_results=reward_results,
-        rewards=rewards,
-        completion_token_ids=completion_token_ids,
-        attention_mask=attention_mask,
-        t_generation=t_generation,
-    )
-
-
 def compute_grpo_loss(
     *,
     log_probs: Float[torch.Tensor, "B G L_new"],
@@ -518,6 +443,8 @@ def _grpo_train_loop(
     use_bf16: bool,
     save_ckpt_freq: int,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
+    val_config: ValidationConfig | None = None,
+    val_freq: int = 0,
 ) -> None:
     device = next(net.parameters()).device
     n_episodes = 0
@@ -710,6 +637,10 @@ def _grpo_train_loop(
                     optimizer_state_dict=opt.state_dict(),
                 )
 
+        if val_config is not None and val_freq > 0 and step % val_freq == 0:
+            val_metrics = run_validation(net=net, val_config=val_config)
+            extty.log(val_metrics, step=step)
+
     if step % save_ckpt_freq != 0 and extty._active_run is not None:
         extty.save_checkpoint(
             step=step,
@@ -745,6 +676,8 @@ def train_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
+    val_config: ValidationConfig | None = None,
+    val_freq: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -797,6 +730,8 @@ def train_grpo(
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
         normalize_by_sequence_length=normalize_by_sequence_length,
+        val_config=val_config,
+        val_freq=val_freq,
     )
 
 
@@ -1123,140 +1058,6 @@ def _compute_soft_log_probs_chunked(
 
 
 @torch.no_grad()
-def generate_soft_rollout_batch(
-    *,
-    net: BaseTransformer,
-    env: Env[T, A],
-    reward_fn: RewardFn[T, E],
-    state_to_str: Callable[[T], str],
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
-    extractor: Callable[[str], E],
-    batch_size: int,
-    group_size: int,
-    temperature: float,
-    max_tokens_generated: int,
-    noise_std: float,
-    switch_to_hard_tokens_condition: torch.Tensor | None = None,
-    max_tokens_prefill: torch.Tensor | None = None,
-    max_tokens_prefill_steps_before_end: int = 0,
-    min_soft_steps: int = 0,
-    prefill: PreFill | None = None,
-    use_bf16: bool = False,
-) -> SoftRolloutBatch[T]:
-    actual_noise_std = noise_std * _embedding_rms_norm(net)
-
-    env_responses = get_batch(env, batch_size)
-    prompts = [state_to_str(resp.data) for resp in env_responses]
-    device = next(net.parameters()).device
-
-    tokenizer.enable_padding(direction="left")
-    tokens = tokenizer.encode_batch(prompts)
-    attention_mask = torch.tensor(
-        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
-    )
-    token_ids = torch.tensor([t.ids for t in tokens], device=device)
-
-    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
-
-    was_training = net.training
-    net.eval()
-    t_gen_start = time.perf_counter()
-
-    gen_output = generate_soft_tokens(
-        net=net,
-        token_ids=expanded_token_ids,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-        attention_mask=expanded_attention_mask,
-        temperature=temperature if temperature > 0 else 1.0,
-        use_bf16=use_bf16,
-        switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
-        max_tokens_prefill=max_tokens_prefill,
-        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
-        prefill=prefill,
-        soft_token_noise_std=actual_noise_std,
-        min_soft_steps=min_soft_steps,
-    )
-    t_generation = time.perf_counter() - t_gen_start
-    if was_training:
-        net.train()
-
-    all_soft_tokens = gen_output.tokens.view(
-        batch_size, group_size, *gen_output.tokens.shape[1:]
-    )
-    all_soft_tokens = all_soft_tokens.permute(1, 0, 2, 3)
-    completion_tokens: list[Float[torch.Tensor, "B L V"]] = list(
-        all_soft_tokens.unbind(0)
-    )
-
-    noise = gen_output.noise
-    if noise is None:
-        raise RuntimeError("soft token generation did not produce noise")
-    all_noise = noise.view(batch_size, group_size, *noise.shape[1:])
-    all_noise = all_noise.permute(1, 0, 2, 3)
-    completion_noise: list[Float[torch.Tensor, "B L D"]] = list(all_noise.unbind(0))
-
-    # Action embeddings computed with behavior policy's embedding matrix.
-    behavior_W = net.embed_tokens.weight
-    completion_action_embeddings: list[Float[torch.Tensor, "B L D"]] = [
-        (c.float() @ behavior_W.float()) + n.float()
-        for c, n in zip(completion_tokens, completion_noise)
-    ]
-
-    all_hard_masks = gen_output.hard_tokens_mask.view(
-        batch_size, group_size, gen_output.hard_tokens_mask.shape[1]
-    )
-    all_hard_masks = all_hard_masks.permute(1, 0, 2)
-    hard_tokens_mask_list: list[Bool[torch.Tensor, "B L"]] = list(
-        all_hard_masks.unbind(0)
-    )
-
-    prompt_len = token_ids.shape[1]
-    output_strs: list[list[str]] = [
-        tokenizer.decode_batch(c[:, prompt_len:].argmax(-1).tolist())
-        for c in completion_tokens
-    ]
-
-    reward_results: list[list[RewardResult]] = [
-        [
-            reward_fn(
-                env_response=env_response,
-                raw_model_output=s,
-                extracted_model_output=extractor(s),
-            )
-            for s, env_response in zip(group_batch, env_responses)
-        ]
-        for group_batch in output_strs
-    ]
-
-    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
-        [[r.total for r in row] for row in reward_results],
-        device=device,
-    )
-
-    return SoftRolloutBatch(
-        env_responses=env_responses,
-        prompts=prompts,
-        output_strs=output_strs,
-        reward_results=reward_results,
-        rewards=rewards,
-        completion_tokens=completion_tokens,
-        completion_action_embeddings=completion_action_embeddings,
-        completion_noise=completion_noise,
-        hard_tokens_mask=hard_tokens_mask_list,
-        noise_std=actual_noise_std,
-        temperature=temperature if temperature > 0 else 1.0,
-        attention_mask=attention_mask,
-        t_generation=t_generation,
-    )
-
-
-@torch.no_grad()
 def collect_soft_micro_batch(
     *,
     net: BaseTransformer,
@@ -1442,6 +1243,8 @@ def train_soft_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
+    val_config: ValidationConfig | None = None,
+    val_freq: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -1505,4 +1308,6 @@ def train_soft_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
+        val_config=val_config,
+        val_freq=val_freq,
     )
