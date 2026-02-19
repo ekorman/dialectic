@@ -112,6 +112,10 @@ class _BaseTokenGenerator(ABC):
     def _extra_tokens_per_step_bound(self) -> int:
         return 0
 
+    @property
+    def _extra_kv_reserve(self) -> int:
+        return 0
+
     def net_forward(
         self,
         net: BaseTransformer,
@@ -139,6 +143,7 @@ class _BaseTokenGenerator(ABC):
                 KVCache(
                     max_seq_len=max_tokens_generated
                     * (1 + self._extra_tokens_per_step_bound)
+                    + self._extra_kv_reserve
                     + token_ids.shape[1],
                     num_heads=net.attn_num_kv_heads,
                     head_dim=net.attn_head_d,
@@ -620,6 +625,17 @@ class _SoftGenerator(_BaseTokenGenerator):
     def _extra_tokens_per_step_bound(self) -> int:
         if self.prefill:
             return len(self.prefill.filling)
+        return 0
+
+    @property
+    def _extra_kv_reserve(self) -> int:
+        prefill_ids = (
+            self.max_tokens_prefill
+            if self.max_tokens_prefill is not None
+            else self.switch_to_hard_tokens_condition
+        )
+        if prefill_ids is not None:
+            return prefill_ids.numel()
         return 0
 
 
