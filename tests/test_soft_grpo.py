@@ -300,7 +300,10 @@ class TestTrainSoftGrpo:
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer):
-        env = CountdownEnv()
+        torch.manual_seed(123)
+        env = CountdownEnv(seed=123)
+
+        rng = torch.Generator().manual_seed(123)
 
         def length_reward_fn(
             *, env_response, raw_model_output=None, extracted_model_output
@@ -310,6 +313,8 @@ class TestTrainSoftGrpo:
             else:
                 # Use a reward that's unlikely to tie across group samples.
                 value = sum(ord(c) for c in raw_model_output) / 10000.0
+            # Deterministic jitter to prevent identical rewards within a group.
+            value += torch.rand((), generator=rng).item() * 1e-3
             return RewardResult(total=value, components={"length": value})
 
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-2)
