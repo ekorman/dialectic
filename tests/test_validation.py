@@ -1,5 +1,7 @@
 """Tests for validation evaluation during training."""
 
+import extty
+
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import countdown_correct, weighted_reward
@@ -123,3 +125,19 @@ class TestRunValidation:
 
         for param in tiny_model.parameters():
             assert param.grad is None
+
+    def test_examples_have_rewards(self, tiny_model, tokenizer):
+        env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
+        val_config = self._make_val_config(tokenizer, [env])
+
+        metrics = run_validation(net=tiny_model, val_config=val_config)
+
+        label = str(env)
+        example = metrics[f"val/{label}/example"]
+        assert isinstance(example, extty.BatchExample)
+        assert len(example.prompts) > 0
+        assert len(example.rewards) == len(example.prompts)
+        for reward in example.rewards:
+            assert isinstance(reward, list)
+            assert all(isinstance(r, dict) for r in reward)
+            assert all("correct" in r for r in reward)
