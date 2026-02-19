@@ -459,6 +459,8 @@ class _SoftGenerator(_BaseTokenGenerator):
                 0, self.max_tokens_generated - self.max_tokens_prefill_steps_before_end
             )
             if self.n_generated >= prefill_at:
+                # TODO: is there an issue that not replaying prefill through KV cache?
+                # probably negligible if any
                 self.on_max_tokens_reached()
         scaled_logits = logits / self.temperature
         probs = torch.softmax(scaled_logits, dim=-1)
