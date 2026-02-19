@@ -481,30 +481,6 @@ def collect_micro_batch(
         )
     t_logprobs = time.perf_counter() - t_logprobs_start
 
-    # Hard-token entropy stats for comparison with soft runs.
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-    ):
-        stacked = stack_and_pad(
-            tensors=rollout.completion_token_ids, pad_token_id=pad_token_id
-        )
-        logits = compute_logits_of_group(
-            net=net,
-            input_ids=stacked,
-            attention_mask=rollout.attention_mask,
-        )
-        l_prompt = rollout.attention_mask.shape[1]
-        logits = logits[:, :, l_prompt - 1 : -1]
-        logp = torch.log_softmax(logits, dim=-1)
-        entropy = -(logp.exp() * logp).sum(-1)
-        if torch.any(completion_mask):
-            ent_vals = entropy[completion_mask]
-            hard_ent_mean = ent_vals.mean().item()
-            hard_ent_std = ent_vals.std().item()
-        else:
-            hard_ent_mean = float("nan")
-            hard_ent_std = float("nan")
-
     return {
         "prompts": rollout.prompts,
         "env_responses": rollout.env_responses,
@@ -516,8 +492,6 @@ def collect_micro_batch(
         "ref_log_probs": ref_log_probs,
         "old_log_probs": old_log_probs,
         "completion_mask": completion_mask,
-        "hard_ent_mean": hard_ent_mean,
-        "hard_ent_std": hard_ent_std,
         "t_gen": rollout.t_generation,
         "t_logprobs": t_logprobs,
     }
@@ -725,21 +699,6 @@ def _grpo_train_loop(
                         f"train/reward/{name}": mean
                         for name, mean in component_means.items()
                     },
-                    **(
-                        {
-                            "train/entropy_mean": sum(
-                                mb["hard_ent_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/entropy_std": sum(
-                                mb["hard_ent_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                        }
-                        if "hard_ent_mean" in micro_batches[0]
-                        and "hard_lp_mean" not in micro_batches[0]
-                        else {}
-                    ),
                 },
                 step=step,
             )
