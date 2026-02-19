@@ -596,13 +596,13 @@ def main():
     parser.add_argument(
         "--val-freq",
         type=int,
-        default=0,
+        default=50,
         help="Validate every N steps (0 = disabled)",
     )
     parser.add_argument(
         "--val-episodes",
         type=int,
-        default=50,
+        default=100,
         help="Episodes per validation env",
     )
     parser.add_argument(
