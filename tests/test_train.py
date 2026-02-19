@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 
-from dialectic.rl.train import compute_log_probs, compute_logits_of_group, stack_and_pad
+from dialectic.rl.train import (
+    compute_advantages,
+    compute_log_probs,
+    compute_logits_of_group,
+    stack_and_pad,
+)
 
 
 def test_stack_and_pad():
@@ -151,3 +156,22 @@ def test_compute_logits_of_group_attention_mask_extended():
     assert net.received_mask_shape == expected_mask_shape, (
         f"Expected mask shape {expected_mask_shape}, got {net.received_mask_shape}"
     )
+
+
+def test_compute_advantages():
+    g, b = 2, 4
+    rewards = torch.rand((g, b))
+
+    advs = compute_advantages(rewards, normalize=True)
+    assert advs.shape == torch.Size((g, b))
+    for i in range(b):
+        r_mean_at_batch = rewards[:, i].mean()
+        r_std_at_batch = rewards[:, i].std()
+        for j in range(g):
+            assert (
+                abs(
+                    advs[j, i].item()
+                    - ((rewards[j, i] - r_mean_at_batch) / r_std_at_batch).item()
+                )
+                < 1e-6
+            )
