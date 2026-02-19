@@ -760,6 +760,50 @@ def test_soft_generator_noise_shape(tiny_model: BaseTransformer):
     assert out.tokens.shape == (b, prompt_len + n_gen, vocab_size)
 
 
+def test_soft_generate_with_switch_condition_and_attention_mask(
+    tiny_model: BaseTransformer,
+):
+    torch.manual_seed(20)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    pad_token_id = 0
+    eos_token_id = vocab_size - 1
+
+    x1 = torch.randint(1, vocab_size, size=(1, 4))
+    x2 = torch.randint(1, vocab_size, size=(1, 7))
+
+    x_batched = torch.full((2, 7), pad_token_id, dtype=torch.long)
+    x_batched[0, 3:] = x1
+    x_batched[1] = x2
+
+    attention_mask = torch.ones(2, 7, dtype=torch.bool)
+    attention_mask[0, :3] = False
+
+    switch_condition = torch.tensor([3, 5, 7])
+    max_tokens_prefill = torch.tensor([3, 5, 7])
+
+    out = generate_soft_tokens(
+        net=model,
+        token_ids=x_batched,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        max_tokens_generated=50,
+        use_kv_cache=True,
+        attention_mask=attention_mask,
+        temperature=0.5,
+        use_bf16=False,
+        switch_to_hard_tokens_condition=switch_condition,
+        max_tokens_prefill=max_tokens_prefill,
+        max_tokens_prefill_steps_before_end=10,
+        soft_token_noise_std=0.1,
+        min_soft_steps=0,
+    )
+
+    assert out.tokens.ndim == 3
+    assert out.tokens.shape[0] == 2
+    assert out.tokens.shape[2] == vocab_size
+
+
 def test_soft_generator_no_noise_without_std(tiny_model: BaseTransformer):
     torch.manual_seed(42)
     model = tiny_model.eval()
