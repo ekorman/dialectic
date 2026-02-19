@@ -223,9 +223,7 @@ def stack_and_pad(
     return ret
 
 
-# TODO: update this to support RLOO advantages? think this is just
-# this with normalize False
-def compute_advantages(
+def grpo_advantage(
     rewards: Float[torch.Tensor, "G B"],
     normalize: bool = True,
     eps: float = 1e-8,
@@ -237,6 +235,11 @@ def compute_advantages(
         # TODO: think there's some clipping option for std
         return (rewards - mean) / (rewards.std(0, keepdim=True) + eps)
     return rewards - mean
+
+
+def rloo_advantage(rewards: Float[torch.Tensor, "G B"]) -> Float[torch.Tensor, "G B"]:
+    G = rewards.shape[0]
+    return G / (G - 1) * rewards - 1 / (G - 1) * rewards.sum(0, keepdim=True)
 
 
 def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
@@ -533,12 +536,12 @@ def _grpo_train_loop(
     update_ref_net_batch_cadence: int,
     batch_size: int,
     group_size: int,
-    normalize_advantages: bool,
     normalize_by_sequence_length: bool,
     accumulation_steps: int,
     max_grad_norm: float,
     use_bf16: bool,
     save_ckpt_freq: int,
+    advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
 ) -> None:
     device = next(net.parameters()).device
     n_episodes = 0
@@ -561,9 +564,7 @@ def _grpo_train_loop(
         all_rewards = torch.cat(
             [mb["rewards"] for mb in micro_batches], dim=1
         )  # [G, B*accum]
-        global_advs: Float[torch.Tensor, "G B*accum"] = compute_advantages(
-            all_rewards, normalize=normalize_advantages
-        )
+        global_advs: Float[torch.Tensor, "G B*accum"] = advantage_fn(all_rewards)
 
         t_opt_start = time.perf_counter()
         total_loss = 0.0
@@ -775,8 +776,8 @@ def train_grpo(
     batch_size: int,
     group_size: int,
     temperature: float,
+    advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     normalize_by_sequence_length: bool,
-    normalize_advantages: bool = True,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
@@ -828,7 +829,7 @@ def train_grpo(
         update_ref_net_batch_cadence=update_ref_net_batch_cadence,
         batch_size=batch_size,
         group_size=group_size,
-        normalize_advantages=normalize_advantages,
+        advantage_fn=advantage_fn,
         accumulation_steps=accumulation_steps,
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
@@ -1465,12 +1466,12 @@ def train_soft_grpo(
     temperature: float,
     noise_std: float,
     normalize_by_sequence_length: bool,
+    advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
     max_tokens_prefill: torch.Tensor | None = None,
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
     max_tokens_prefill_steps_before_end: int = 0,
-    normalize_advantages: bool = True,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
@@ -1526,6 +1527,7 @@ def train_soft_grpo(
         opt=opt,
         collect_fn=collect_fn,
         recompute_log_probs_fn=recompute_fn,
+        advantage_fn=advantage_fn,
         beta=beta,
         eps=eps,
         mu=mu,
@@ -1533,7 +1535,6 @@ def train_soft_grpo(
         update_ref_net_batch_cadence=update_ref_net_batch_cadence,
         batch_size=batch_size,
         group_size=group_size,
-        normalize_advantages=normalize_advantages,
         normalize_by_sequence_length=normalize_by_sequence_length,
         accumulation_steps=accumulation_steps,
         max_grad_norm=max_grad_norm,

@@ -14,7 +14,8 @@ import os
 import random
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from functools import partial
+from typing import Callable, Literal
 
 import extty
 import torch
@@ -42,7 +43,12 @@ from dialectic.rl.reward import (
     think_tags,
     weighted_reward,
 )
-from dialectic.rl.train import train_grpo, train_soft_grpo
+from dialectic.rl.train import (
+    grpo_advantage,
+    rloo_advantage,
+    train_grpo,
+    train_soft_grpo,
+)
 
 load_dotenv()
 
@@ -206,6 +212,7 @@ def train(
     n_total: int | list[int] = 6,
     n_ops: int | list[int] = 5,
     seed: int,
+    advantage_fn_type: Literal["grpo", "rloo"],
     compile_model: bool = False,
     mu: int = 1,
     accumulation_steps: int = 16,
@@ -275,6 +282,13 @@ def train(
     switch_condition = torch.tensor(answer_tag_ids)
     max_tokens_prefill = torch.tensor(answer_tag_ids)
 
+    if advantage_fn_type == "grpo":
+        advantage_fn = partial(grpo_advantage, normalize=normalize_advantages)
+    elif advantage_fn_type == "rloo":
+        advantage_fn = rloo_advantage
+    else:
+        raise ValueError(f"Got unknown advantage function type {advantage_fn_type}")
+
     try:
         if soft_tokens:
             train_soft_grpo(
@@ -306,7 +320,7 @@ def train(
                 logprob_chunk_size=logprob_chunk_size,
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
-                normalize_advantages=normalize_advantages,
+                advantage_fn=advantage_fn,
                 normalize_by_sequence_length=normalize_by_sequence_length,
             )
         else:
@@ -334,7 +348,7 @@ def train(
                 logprob_chunk_size=logprob_chunk_size,
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
-                normalize_advantages=normalize_advantages,
+                advantage_fn=advantage_fn,
                 normalize_by_sequence_length=normalize_by_sequence_length,
             )
     finally:
@@ -384,6 +398,7 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
     parser.add_argument("--group-size", type=int, default=8, help="Group size for GRPO")
+    parser.add_argument("--advantage-fn-type", type=str, default="grpo")
     parser.add_argument(
         "--max-tokens", type=int, default=1024, help="Max tokens to generate"
     )
@@ -565,6 +580,7 @@ def main():
         use_qwen_thinking=args.use_qwen_thinking,
         compile_model=args.compile_model,
         seed=args.seed,
+        advantage_fn_type=args.advantage_fn_type,
         soft_tokens=args.soft_tokens,
         noise_std=args.noise_std,
         temperature=args.temperature,
