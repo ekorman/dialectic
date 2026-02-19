@@ -24,7 +24,12 @@ from dialectic.rl.reward import (
     think_tags,
     weighted_reward,
 )
-from dialectic.rl.train import compute_grpo_loss, compute_log_probs, train_grpo
+from dialectic.rl.train import (
+    compute_grpo_loss,
+    compute_log_probs,
+    grpo_advantage,
+    train_grpo,
+)
 from dialectic.rl.types import EnvResponse, RewardResult
 
 
@@ -71,6 +76,7 @@ class TestComputeGRPOLoss:
             advs=advs,
             beta=0.0,  # Disable KL penalty for clarity
             eps=0.2,
+            normalize_by_sequence_length=True,
         )
 
         # Now test with uniform lengths (all 5 tokens)
@@ -85,6 +91,7 @@ class TestComputeGRPOLoss:
             advs=advs,
             beta=0.0,
             eps=0.2,
+            normalize_by_sequence_length=True,
         )
 
         # With proper per-sequence normalization, both losses should be equal
@@ -123,6 +130,7 @@ class TestComputeGRPOLoss:
             advs=advs,
             beta=0.0,
             eps=0.2,
+            normalize_by_sequence_length=True,
         )
 
         # With proper normalization, the two sequences should cancel out
@@ -161,6 +169,8 @@ class TestGRPOMechanics:
             group_size=2,
             temperature=1.0,
             use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
     def test_loss_is_finite(self, tiny_model, tokenizer, env):
@@ -187,6 +197,8 @@ class TestGRPOMechanics:
             group_size=2,
             temperature=1.0,
             use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer, env):
@@ -231,6 +243,8 @@ class TestGRPOMechanics:
             group_size=2,
             temperature=1.0,
             use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
         params_changed = False
@@ -265,6 +279,8 @@ class TestGRPOMechanics:
             group_size=2,
             temperature=1.0,
             use_bf16=True,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
         )
 
         for param in tiny_model.parameters():
@@ -295,7 +311,7 @@ class TestGRPOMechanics:
             *,
             token_ids: torch.Tensor,
             **kwargs,
-        ) -> torch.Tensor:
+        ) -> HardTokenGeneratorOutput:
             pad_token_id = kwargs.get("pad_token_id")
             completion_token_id = 1 if pad_token_id != 1 else 2
             extra = torch.full(
@@ -354,11 +370,12 @@ class TestGRPOMechanics:
                 batch_size=batch_size,
                 group_size=2,
                 temperature=1.0,
-                normalize_advantages=True,
                 accumulation_steps=accumulation_steps,
                 max_grad_norm=0.0,
                 logprob_chunk_size=0,
                 use_bf16=False,
+                advantage_fn=grpo_advantage,
+                normalize_by_sequence_length=True,
             )
             return model
 
