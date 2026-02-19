@@ -9,7 +9,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.base import BaseTransformer
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.train import generate_rollout_batch
+from dialectic.rl.rollout import generate_rollout_batch
 from dialectic.rl.types import A, E, T
 
 

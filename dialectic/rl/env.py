@@ -249,6 +249,9 @@ class CountdownEnv(Env[Countdown, None]):
         self.prompt_template = prompt_template
         self.rng = random.Random(seed)
 
+    def __str__(self) -> str:
+        return f"countdown_ops{'_'.join(map(str, self._n_ops))}_n{'_'.join(map(str, self._n_total))}_lg{'_'.join(map(str, self._n_larges))}"
+
     def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
         if seed is not None:
             self.rng.seed(seed)
