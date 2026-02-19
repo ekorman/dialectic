@@ -14,7 +14,8 @@ import os
 import random
 import sys
 from dataclasses import dataclass
-from typing import Callable
+from functools import partial
+from typing import Callable, Literal
 
 import extty
 import torch
@@ -22,7 +23,11 @@ from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
 from dialectic.artifacts import Artifact, get_artifact
-from dialectic.llm.llama import LLAMA_32_TOKENIZER, load_llama_32_1b_instruct
+from dialectic.llm.llama import (
+    LLAMA_32_TOKENIZER,
+    load_llama_32_1b_instruct,
+    load_llama_32_3b_instruct,
+)
 from dialectic.llm.qwen import load_qwen3_06b
 from dialectic.llm.templates import (
     Message,
@@ -38,9 +43,16 @@ from dialectic.rl.reward import (
     think_tags,
     weighted_reward,
 )
-from dialectic.rl.train import train_grpo
+from dialectic.rl.train import (
+    grpo_advantage,
+    rloo_advantage,
+    train_grpo,
+    train_soft_grpo,
+)
 
 load_dotenv()
+
+REASONING_TAG = "reasoning"
 
 
 @dataclass
@@ -77,7 +89,64 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         pad_token_id=128009,
         format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
     ),
+    "llama-3.2-3b-instruct": ModelInfo(
+        net_factory=lambda: load_llama_32_3b_instruct(True),
+        tokenizer=LLAMA_32_TOKENIZER,
+        eos_token_id=128009,
+        pad_token_id=128009,
+        format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
+    ),
 }
+
+# system prompt from Soft Tokens Hard Truths paper (but using answer tags instead of boxed)
+STHT_SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves"
+    " it. The assistant first shows the complete reasoning process step by step, then provides the final"
+    " answer in <answer></answer> tags. The assistant must always follow the format: 'User: [question] Assistant:"
+    " [detailed reasoning] The final answer is: <answer>[answer]</answer>.'"
+)
+SIMPLE_SYSTEM_PROMPT = (
+    "You are a helpful assistant. When asked a question to solve you first show your complete "
+    "reasoning process step by step and then provide the user with the answer in the specified format."
+)
+
+ENV_PROMPT_WITH_REASONING_TAGS = (
+    "Using the numbers {numbers}, create an equation that equals {target}. "
+    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. "
+    f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags."
+    " Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
+)
+ENV_PROMPT_WITHOUT_REASONING_TAGS = (
+    "Using the numbers {numbers}, create an equation that equals {target}. "
+    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. Put your final"
+    " equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>. "
+)
+
+
+@dataclass
+class PromptCollection:
+    system_prompt: str | None
+    env_prompt: str
+    assistant_prefill: str | None
+
+
+PROMPT_COLLECTIONS: list[PromptCollection] = [
+    PromptCollection(
+        system_prompt=None,
+        env_prompt=ENV_PROMPT_WITH_REASONING_TAGS,
+        assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+    ),
+    PromptCollection(
+        system_prompt=STHT_SYSTEM_PROMPT,
+        env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+        assistant_prefill=None,
+    ),
+    PromptCollection(
+        system_prompt=SIMPLE_SYSTEM_PROMPT,
+        env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+        assistant_prefill="Let me solve this step by step.",
+    ),
+]
 
 
 def _is_modal_installed():
@@ -85,28 +154,43 @@ def _is_modal_installed():
 
 
 def get_state_to_str(
+    *,
     format_messages: Callable[[list[Message], bool], str],
-    reasoning_tag: str,
+    system_prompt: str | None = None,
+    assistant_prefill: str | None = None,
 ):
     def _state_to_str(data: Countdown) -> str:
-        ret = format_messages(
-            [Message(role="user", content=data.prompt)],
-            True,
-        )
-        ret += f"Let me solve this step by step\n<{reasoning_tag}>"
+        # TODO: add system prompt here
+        msgs = []
+        if system_prompt:
+            msgs.append(Message(role="system", content=system_prompt))
+        msgs.append(Message(role="user", content=data.prompt))
+        ret = format_messages(msgs, True)
+        if assistant_prefill:
+            ret += assistant_prefill
         return ret
 
     return _state_to_str
 
 
-def get_prompt_template(enable_thinking: bool):
-    reasoning_tag = "think" if enable_thinking else "reasoning"
-    return (
-        "Using the numbers {numbers}, create an equation that equals {target}. "
-        "You can use basic arithmetic operations (+, -, *, /) and each number at most once. "
-        f"Show your reasoning in <{reasoning_tag}></{reasoning_tag}> tags."
-        "Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
-    )
+def get_reward_fn(answer_tags_weight: float, think_tags_weight: float):
+    components = [
+        ("correct", 1.0, countdown_correct),
+        ("answer_tags", answer_tags_weight, answer_tags),
+    ]
+    if think_tags_weight > 0:
+        components.append(
+            (
+                "think_tags",
+                think_tags_weight,
+                think_tags(REASONING_TAG, prefilled_open=True),
+            )
+        )
+    reward_fn = weighted_reward(components)
+    return reward_fn
+
+
+# update prompt? especially for soft tokens using <reasoning> tags don't make sense
 
 
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
@@ -118,16 +202,17 @@ def train(
     model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
+    eps: float = 0.2,
     batch_size: int = 2,
     group_size: int = 8,
     max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
-    binary_reward: bool = False,
     n_larges: int | list[int] = 2,
     n_total: int | list[int] = 6,
     n_ops: int | list[int] = 5,
     seed: int,
+    advantage_fn_type: Literal["grpo", "rloo"],
     compile_model: bool = False,
     mu: int = 1,
     accumulation_steps: int = 16,
@@ -137,6 +222,17 @@ def train(
     use_bf16: bool = True,
     use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
+    soft_tokens: bool = False,
+    noise_std: float = 0.33,
+    temperature: float = 0.7,
+    min_soft_steps: int = 0,
+    answer_tags_weight: float = 0.1,
+    think_tags_weight: float = 0.05,
+    env_prompt_template: str,
+    system_prompt: str | None,
+    assistant_prefill: str | None,
+    normalize_advantages: bool = True,
+    normalize_by_sequence_length: bool,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -155,64 +251,106 @@ def train(
     opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
     if use_qwen_thinking:
-        reasoning_tag = "think"
 
         def format_messages(msgs: list[Message], gen: bool) -> str:
             return get_qwen_input_text_from_messages(msgs, gen, enable_thinking=True)
     else:
-        reasoning_tag = "reasoning"
         format_messages = model_info.format_messages
 
-    if binary_reward:
-        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
-    else:
-        reward_fn = weighted_reward(
-            [
-                ("correct", 1.0, countdown_correct),
-                ("answer_tags", 0.1, answer_tags),
-                ("think_tags", 0.05, think_tags(reasoning_tag, prefilled_open=True)),
-            ]
-        )
+    reward_fn = get_reward_fn(
+        answer_tags_weight=answer_tags_weight, think_tags_weight=think_tags_weight
+    )
 
     env = CountdownEnv(
         seed=seed,
         n_larges=n_larges,
         n_total=n_total,
         n_ops=n_ops,
-        prompt_template=get_prompt_template(enable_thinking=use_qwen_thinking),
+        prompt_template=env_prompt_template,
     )
     device = device or get_default_device()
     print(f"device: {device}")
     net = net.to(device)
 
-    state_to_str = get_state_to_str(format_messages, reasoning_tag)
+    state_to_str = get_state_to_str(
+        format_messages=format_messages,
+        system_prompt=system_prompt,
+        assistant_prefill=assistant_prefill,
+    )
+
+    answer_tag_ids = tokenizer.encode("<answer>", add_special_tokens=False).ids
+    switch_condition = torch.tensor(answer_tag_ids)
+    max_tokens_prefill = torch.tensor(answer_tag_ids)
+
+    if advantage_fn_type == "grpo":
+        advantage_fn = partial(grpo_advantage, normalize=normalize_advantages)
+    elif advantage_fn_type == "rloo":
+        advantage_fn = rloo_advantage
+    else:
+        raise ValueError(f"Got unknown advantage function type {advantage_fn_type}")
 
     try:
-        train_grpo(
-            net=net,
-            opt=opt,
-            env=env,
-            reward_fn=reward_fn,
-            state_to_str=state_to_str,
-            tokenizer=tokenizer,
-            eos_token_id=model_info.eos_token_id,
-            pad_token_id=model_info.pad_token_id,
-            extractor=extract_from_answer_tags,
-            beta=beta,
-            eps=0.2,
-            mu=mu,
-            max_tokens_generated=max_tokens,
-            max_episodes=max_episodes,
-            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-            batch_size=batch_size,
-            group_size=group_size,
-            temperature=0.7,
-            accumulation_steps=accumulation_steps,
-            max_grad_norm=max_grad_norm,
-            logprob_chunk_size=logprob_chunk_size,
-            use_bf16=use_bf16,
-            save_ckpt_freq=save_ckpt_freq,
-        )
+        if soft_tokens:
+            train_soft_grpo(
+                net=net,
+                opt=opt,
+                env=env,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                extractor=extract_from_answer_tags,
+                beta=beta,
+                eps=eps,
+                mu=mu,
+                max_tokens_generated=max_tokens,
+                max_episodes=max_episodes,
+                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+                batch_size=batch_size,
+                group_size=group_size,
+                temperature=temperature,
+                noise_std=noise_std,
+                switch_to_hard_tokens_condition=switch_condition,
+                max_tokens_prefill=max_tokens_prefill,
+                max_tokens_prefill_steps_before_end=20,
+                min_soft_steps=min_soft_steps,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                logprob_chunk_size=logprob_chunk_size,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+                advantage_fn=advantage_fn,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+            )
+        else:
+            train_grpo(
+                net=net,
+                opt=opt,
+                env=env,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                extractor=extract_from_answer_tags,
+                beta=beta,
+                eps=eps,
+                mu=mu,
+                max_tokens_generated=max_tokens,
+                max_episodes=max_episodes,
+                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+                batch_size=batch_size,
+                group_size=group_size,
+                temperature=temperature,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                logprob_chunk_size=logprob_chunk_size,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+                advantage_fn=advantage_fn,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+            )
     finally:
         extty.finish()
 
@@ -260,6 +398,7 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
     parser.add_argument("--group-size", type=int, default=8, help="Group size for GRPO")
+    parser.add_argument("--advantage-fn-type", type=str, default="grpo")
     parser.add_argument(
         "--max-tokens", type=int, default=1024, help="Max tokens to generate"
     )
@@ -267,11 +406,7 @@ def main():
     parser.add_argument(
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
-    parser.add_argument(
-        "--binary-reward",
-        action="store_true",
-        help="Use binary reward (1.0 for correct, 0.0 otherwise). Default uses format shaping.",
-    )
+    parser.add_argument("--eps", type=float, default=0.2, help="clip coefficient")
     parser.add_argument(
         "--n-ops",
         type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),
@@ -357,7 +492,72 @@ def main():
     )
 
     parser.add_argument("--compile-model", action="store_true", help="compile model")
+    parser.add_argument(
+        "--soft-tokens",
+        action="store_true",
+        default=False,
+        help="Use soft token generation (train_soft_grpo)",
+    )
+    parser.add_argument(
+        "--noise-std",
+        type=float,
+        default=0.33,
+        help="Noise scale as a multiplier of the embedding RMS norm (only used with --soft-tokens)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for generation",
+    )
+    parser.add_argument(
+        "--min-soft-steps",
+        type=int,
+        default=0,
+        help="Minimum number of soft-token steps before switching to hard tokens",
+    )
+    parser.add_argument(
+        "--answer-tags-weight",
+        type=float,
+        default=0.1,
+        help="Reward weight for answer tag formatting",
+    )
+    parser.add_argument(
+        "--think-tags-weight",
+        type=float,
+        default=0.05,
+        help="Reward weight for thinking tags formatting",
+    )
+
+    parser.add_argument(
+        "--normalize-advantages",
+        action="store_true",
+        default=True,
+        help="Normalize advantages by standard deviation",
+    )
+    parser.add_argument(
+        "--no-normalize-advantages",
+        dest="normalize_advantages",
+        action="store_false",
+        help="Do not normalize advantages by standard deviation",
+    )
+    parser.add_argument("--prompt-collections-id", type=int, required=True)
+    parser.add_argument(
+        "--normalize-by-sequence-length",
+        action="store_true",
+        default=True,
+        help="Normalize per-token loss by sequence length",
+    )
+    parser.add_argument(
+        "--no-normalize-by-sequence-length",
+        dest="normalize_by_sequence_length",
+        action="store_false",
+        help="Do not normalize per-token loss by sequence length",
+    )
+
     args = parser.parse_args()
+
+    prompt_collection: PromptCollection = PROMPT_COLLECTIONS[args.prompt_collections_id]
 
     train(
         model_name=args.model,
@@ -368,7 +568,6 @@ def main():
         max_tokens=args.max_tokens,
         lr=args.lr,
         beta=args.beta,
-        binary_reward=args.binary_reward,
         n_larges=args.n_larges,
         n_ops=args.n_ops,
         n_total=args.n_total,
@@ -381,6 +580,19 @@ def main():
         use_qwen_thinking=args.use_qwen_thinking,
         compile_model=args.compile_model,
         seed=args.seed,
+        advantage_fn_type=args.advantage_fn_type,
+        soft_tokens=args.soft_tokens,
+        noise_std=args.noise_std,
+        temperature=args.temperature,
+        min_soft_steps=args.min_soft_steps,
+        answer_tags_weight=args.answer_tags_weight,
+        eps=args.eps,
+        normalize_advantages=args.normalize_advantages,
+        normalize_by_sequence_length=args.normalize_by_sequence_length,
+        system_prompt=prompt_collection.system_prompt,
+        env_prompt_template=prompt_collection.env_prompt,
+        assistant_prefill=prompt_collection.assistant_prefill,
+        think_tags_weight=args.think_tags_weight,
     )
 
 

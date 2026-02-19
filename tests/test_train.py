@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 
-from dialectic.rl.train import compute_log_probs, compute_logits_of_group, stack_and_pad
+from dialectic.rl.train import (
+    compute_log_probs,
+    compute_logits_of_group,
+    grpo_advantage,
+    rloo_advantage,
+    stack_and_pad,
+)
 
 
 def test_stack_and_pad():
@@ -151,3 +157,38 @@ def test_compute_logits_of_group_attention_mask_extended():
     assert net.received_mask_shape == expected_mask_shape, (
         f"Expected mask shape {expected_mask_shape}, got {net.received_mask_shape}"
     )
+
+
+def test_grpo_advantage():
+    g, b = 2, 4
+    rewards = torch.rand((g, b))
+
+    advs = grpo_advantage(rewards, normalize=True)
+    assert advs.shape == torch.Size((g, b))
+    for i in range(b):
+        r_mean_at_batch = rewards[:, i].mean()
+        r_std_at_batch = rewards[:, i].std()
+        for j in range(g):
+            assert (
+                abs(
+                    advs[j, i].item()
+                    - ((rewards[j, i] - r_mean_at_batch) / r_std_at_batch).item()
+                )
+                < 1e-6
+            )
+
+
+def test_rloo_advantage():
+    g, b = 3, 4
+    rewards = torch.rand((g, b))
+
+    advs = rloo_advantage(rewards)
+    assert advs.shape == torch.Size((g, b))
+
+    for i in range(b):
+        for j in range(g):
+            sum_others = sum([rewards[k, i] for k in range(g) if k != j]).item()
+            assert (
+                abs(advs[j, i].item() - (rewards[j, i].item() - sum_others / (g - 1)))
+                < 1e-6
+            )
