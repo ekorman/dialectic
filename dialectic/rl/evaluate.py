@@ -143,6 +143,7 @@ def evaluate(
         extty.Example(
             prompt=all_prompts[i],
             responses=all_output_strs_nested[i],
+            rewards=all_reward_results[i],
         )
         for i in sample_idxs
     ]
