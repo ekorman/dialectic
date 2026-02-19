@@ -67,8 +67,7 @@ uv run train_scripts/grpo_countdown.py --seed 20 --prompt-collections-id 2 --no-
 ```
 
 ### Second sweep
-For each model take top temperature and `eps` combination and sweep `beta` in {0, 0.1}
-
+For each model take top temperature and `eps` combination and sweep `beta` in {0, 0.1}. After that sweep group size and batch size/accumulation steps.
 
 
 - TODO: Implement RLOO and compare
