@@ -85,7 +85,7 @@ def run_validation(
             metrics[f"val/{label}/example"] = extty.BatchExample(
                 prompts=[e.prompt for e in examples],
                 responses=[e.responses for e in examples],
-                rewards=None,
+                rewards=[e.rewards for e in examples],
             )
         reward_means.append(result.reward_mean)
 
