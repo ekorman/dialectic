@@ -353,6 +353,7 @@ def compute_grpo_loss(
     advs: Float[torch.Tensor, "B G 1"],
     beta: float,
     eps: float,
+    normalize_by_sequence_length: bool,
     clip_ratio_c: float = 3.0,
 ) -> tuple[torch.Tensor, float, float]:
     """Compute GRPO loss without backward pass or optimizer step.
@@ -397,15 +398,19 @@ def compute_grpo_loss(
     # contribute more to the loss just because they have more tokens.
     # Each sequence's contribution is its mean (over tokens), then we average
     # across all sequences.
-    sequence_lengths = completion_mask.sum(dim=-1, keepdim=True).clamp(
-        min=1
-    )  # [B, G, 1]
-    ppo_obj_per_seq = (ppo_obj * completion_mask).sum(
-        dim=-1, keepdim=True
-    ) / sequence_lengths
-    kl_loss_per_seq = (kl_loss * completion_mask).sum(
-        dim=-1, keepdim=True
-    ) / sequence_lengths
+    if normalize_by_sequence_length:
+        sequence_lengths = completion_mask.sum(dim=-1, keepdim=True).clamp(
+            min=1
+        )  # [B, G, 1]
+        ppo_obj_per_seq = (ppo_obj * completion_mask).sum(
+            dim=-1, keepdim=True
+        ) / sequence_lengths
+        kl_loss_per_seq = (kl_loss * completion_mask).sum(
+            dim=-1, keepdim=True
+        ) / sequence_lengths
+    else:
+        ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True)
+        kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
 
     ppo_loss_scalar = -ppo_obj_per_seq.mean()
     kl_loss_scalar = kl_loss_per_seq.mean()
@@ -529,6 +534,7 @@ def _grpo_train_loop(
     batch_size: int,
     group_size: int,
     normalize_advantages: bool,
+    normalize_by_sequence_length: bool,
     accumulation_steps: int,
     max_grad_norm: float,
     use_bf16: bool,
@@ -586,6 +592,7 @@ def _grpo_train_loop(
                     advs=advs_for_loss,
                     beta=beta,
                     eps=eps,
+                    normalize_by_sequence_length=normalize_by_sequence_length,
                 )
 
                 scaled_loss = loss / accumulation_steps
@@ -768,6 +775,7 @@ def train_grpo(
     batch_size: int,
     group_size: int,
     temperature: float,
+    normalize_by_sequence_length: bool,
     normalize_advantages: bool = True,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
@@ -825,6 +833,7 @@ def train_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
+        normalize_by_sequence_length=normalize_by_sequence_length,
     )
 
 
@@ -1455,6 +1464,7 @@ def train_soft_grpo(
     group_size: int,
     temperature: float,
     noise_std: float,
+    normalize_by_sequence_length: bool,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
     max_tokens_prefill: torch.Tensor | None = None,
     min_soft_steps: int = 0,
@@ -1524,6 +1534,7 @@ def train_soft_grpo(
         batch_size=batch_size,
         group_size=group_size,
         normalize_advantages=normalize_advantages,
+        normalize_by_sequence_length=normalize_by_sequence_length,
         accumulation_steps=accumulation_steps,
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,

@@ -225,6 +225,7 @@ def train(
     system_prompt: str | None,
     assistant_prefill: str | None,
     normalize_advantages: bool = True,
+    normalize_by_sequence_length: bool,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -306,6 +307,7 @@ def train(
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
                 normalize_advantages=normalize_advantages,
+                normalize_by_sequence_length=normalize_by_sequence_length,
             )
         else:
             train_grpo(
@@ -333,6 +335,7 @@ def train(
                 use_bf16=use_bf16,
                 save_ckpt_freq=save_ckpt_freq,
                 normalize_advantages=normalize_advantages,
+                normalize_by_sequence_length=normalize_by_sequence_length,
             )
     finally:
         extty.finish()
@@ -524,6 +527,18 @@ def main():
         help="Do not use Qwen's out-of-the-box thinking mode",
     )
     parser.add_argument("--prompt-collections-id", type=int, required=True)
+    parser.add_argument(
+        "--normalize-by-sequence-length",
+        action="store_true",
+        default=True,
+        help="Normalize per-token loss by sequence length",
+    )
+    parser.add_argument(
+        "--no-normalize-by-sequence-length",
+        dest="normalize_by_sequence_length",
+        action="store_false",
+        help="Do not normalize per-token loss by sequence length",
+    )
 
     args = parser.parse_args()
 
@@ -557,6 +572,7 @@ def main():
         answer_tags_weight=args.answer_tags_weight,
         eps=args.eps,
         normalize_advantages=args.normalize_advantages,
+        normalize_by_sequence_length=args.normalize_by_sequence_length,
         system_prompt=prompt_collection.system_prompt,
         env_prompt_template=prompt_collection.env_prompt,
         assistant_prefill=prompt_collection.assistant_prefill,
