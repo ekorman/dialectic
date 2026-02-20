@@ -143,35 +143,57 @@ class TestComputeGRPOLoss:
 class TestGRPOMechanics:
     """Tier 1: Verify training mechanics work with tiny model."""
 
-    def test_training_loop_completes(self, tiny_model, tokenizer, env):
-        """Training loop runs without errors."""
+    def _test_training_loop_completes(
+        self,
+        tiny_model,
+        tokenizer,
+        env,
+        beta=0.04,
+        normalize_by_sequence_length=False,
+        eps=0.1,
+    ):
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+        train_grpo(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151643,
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=beta,
+            eps=eps,
+            mu=1,
+            max_tokens_generated=20,
+            max_episodes=4,
+            update_ref_net_batch_cadence=5,
+            batch_size=2,
+            group_size=2,
+            temperature=1.0,
+            use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+        )
 
-        for beta in [0, 0.01]:
-            for normalize_by_sequence_length in [True, False]:
-                train_grpo(
-                    net=tiny_model,
-                    opt=opt,
-                    env=env,
-                    reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
-                    state_to_str=countdown_state_to_str,
-                    tokenizer=tokenizer,
-                    eos_token_id=151643,
-                    pad_token_id=151643,
-                    extractor=extract_from_answer_tags,
-                    beta=beta,
-                    eps=0.2,
-                    mu=1,
-                    max_tokens_generated=20,
-                    max_episodes=4,
-                    update_ref_net_batch_cadence=5,
-                    batch_size=2,
-                    group_size=2,
-                    temperature=1.0,
-                    use_bf16=False,
-                    advantage_fn=grpo_advantage,
-                    normalize_by_sequence_length=normalize_by_sequence_length,
-                )
+    def test_training_loop_completes_beta_zero(self, tiny_model, tokenizer, env):
+        """Training loop runs without errors."""
+        self._test_training_loop_completes(tiny_model, tokenizer, env, beta=0)
+
+    def test_training_loop_completes_normalize_by_sequence_length_true_and_false(
+        self, tiny_model, tokenizer, env
+    ):
+        for normalize_by_sequence_length in [True, False]:
+            self._test_training_loop_completes(
+                tiny_model,
+                tokenizer,
+                env,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+            )
+
+    def test_training_loop_completes_eps_None(self, tiny_model, tokenizer, env):
+        self._test_training_loop_completes(tiny_model, tokenizer, env, eps=None)
 
     def test_loss_is_finite(self, tiny_model, tokenizer, env):
         """Loss values are not NaN/Inf (verified by no exceptions during training)."""
