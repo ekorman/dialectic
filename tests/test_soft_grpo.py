@@ -270,7 +270,7 @@ class TestComputeSoftLogProbs:
 
 
 class TestTrainSoftGrpo:
-    def test_training_loop_completes(self, tiny_model, tokenizer):
+    def _test_training_loop_completes(self, tiny_model, tokenizer, eps):
         env = CountdownEnv()
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
 
@@ -285,7 +285,7 @@ class TestTrainSoftGrpo:
             pad_token_id=151643,
             extractor=extract_from_answer_tags,
             beta=0.01,
-            eps=0.2,
+            eps=eps,
             mu=1,
             max_tokens_generated=20,
             max_episodes=4,
@@ -298,6 +298,12 @@ class TestTrainSoftGrpo:
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
         )
+
+    def test_training_loop_completes_eps_not_none(self, tiny_model, tokenizer):
+        self._test_training_loop_completes(tiny_model, tokenizer, eps=0.2)
+
+    def test_training_loop_completes_eps_none(self, tiny_model, tokenizer):
+        self._test_training_loop_completes(tiny_model, tokenizer, eps=None)
 
     def test_gradients_flow(self, tiny_model, tokenizer):
         torch.manual_seed(123)
