@@ -203,7 +203,7 @@ def train(
     model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
-    eps: float = 0.2,
+    eps: float | None,
     batch_size: int = 2,
     group_size: int = 8,
     max_tokens: int = 700,
@@ -444,7 +444,7 @@ def main():
     parser.add_argument(
         "--beta", type=float, default=0.04, help="KL penalty coefficient"
     )
-    parser.add_argument("--eps", type=float, default=0.2, help="clip coefficient")
+    parser.add_argument("--eps", type=float, help="clip coefficient")
     parser.add_argument(
         "--n-ops",
         type=lambda s: [int(x) for x in s.split(",")] if "," in s else int(s),

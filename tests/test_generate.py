@@ -760,6 +760,85 @@ def test_soft_generator_noise_shape(tiny_model: BaseTransformer):
     assert out.tokens.shape == (b, prompt_len + n_gen, vocab_size)
 
 
+def test_soft_generator_prompt_noise_is_zero(tiny_model: BaseTransformer):
+    """Prompt is processed as 2D int tokens during generation, so noise is not
+    applied to prompt embeddings. The returned noise tensor must have zeros at
+    prompt positions to keep log-prob recomputation consistent with generation.
+    """
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    b, prompt_len = 2, 6
+    n_gen = 10
+
+    x = torch.randint(1, vocab_size, size=(b, prompt_len))
+    out = generate_soft_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=n_gen,
+        use_kv_cache=True,
+        soft_token_noise_std=0.5,
+    )
+
+    assert out.noise is not None
+    prompt_noise = out.noise[:, :prompt_len]
+    assert prompt_noise.abs().max() == 0.0, (
+        "Prompt noise must be zero — noise is not applied during generation "
+        f"(2D int path) but got max abs value {prompt_noise.abs().max().item()}"
+    )
+
+    gen_noise = out.noise[:, prompt_len:]
+    assert gen_noise.abs().max() > 0.0, "Generated positions should have non-zero noise"
+
+
+def test_soft_generator_logits_consistent_with_zero_prompt_noise(
+    tiny_model: BaseTransformer,
+):
+    """Verify that a forward pass with the generation output (3D one-hot prompt
+    + zero prompt noise) produces the same logits as a forward pass with 2D int
+    prompt tokens (no noise). This confirms the fix: the log-prob recomputation
+    path now matches what actually happened during generation.
+    """
+    torch.manual_seed(42)
+    model = tiny_model.eval()
+    vocab_size = model.vocab_size
+    b, prompt_len = 1, 6
+    n_gen = 5
+
+    x = torch.randint(1, vocab_size, size=(b, prompt_len))
+    out = generate_soft_tokens(
+        net=model,
+        token_ids=x,
+        eos_token_id=-1,
+        pad_token_id=0,
+        max_tokens_generated=n_gen,
+        use_kv_cache=True,
+        soft_token_noise_std=0.3,
+    )
+
+    with torch.no_grad():
+        logits_2d = model(x, return_all_logits=True)
+        first_completion_logit_2d = logits_2d[:, -1:]
+
+        prompt_onehot = out.tokens[:, :prompt_len]
+        logits_3d = model(
+            prompt_onehot,
+            return_all_logits=True,
+            soft_token_noise=out.noise[:, :prompt_len],
+        )
+        first_completion_logit_3d = logits_3d[:, -1:]
+
+    torch.testing.assert_close(
+        first_completion_logit_2d,
+        first_completion_logit_3d,
+        msg="Logits at first completion position should match between 2D int "
+        "prompt (generation path) and 3D one-hot prompt with zero noise "
+        "(log-prob recomputation path)",
+    )
+
+
 def test_soft_generate_with_switch_condition_and_attention_mask(
     tiny_model: BaseTransformer,
 ):
