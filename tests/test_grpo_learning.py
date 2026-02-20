@@ -54,7 +54,6 @@ class TestComputeGRPOLoss:
         # Create log probs (uniform for simplicity)
         log_probs = torch.full((B, G, L), -1.0)
         old_log_probs = torch.full((B, G, L), -1.0)
-        ref_log_probs = torch.full((B, G, L), -1.0)
 
         # Key: completion masks of different lengths
         # Sequence (0,0): 10 tokens, Sequence (0,1): 2 tokens
@@ -68,10 +67,10 @@ class TestComputeGRPOLoss:
         # Same advantage for all sequences
         advs = torch.ones((B, G, 1))
 
-        loss1, ppo_loss1, _ = compute_grpo_loss(
+        loss1, _, _ = compute_grpo_loss(
             log_probs=log_probs,
             old_log_probs=old_log_probs,
-            ref_log_probs=ref_log_probs,
+            ref_log_probs=None,
             completion_mask=completion_mask,
             advs=advs,
             beta=0.0,  # Disable KL penalty for clarity
@@ -86,7 +85,7 @@ class TestComputeGRPOLoss:
         loss2, ppo_loss2, _ = compute_grpo_loss(
             log_probs=log_probs,
             old_log_probs=old_log_probs,
-            ref_log_probs=ref_log_probs,
+            ref_log_probs=None,
             completion_mask=uniform_mask,
             advs=advs,
             beta=0.0,
@@ -112,7 +111,6 @@ class TestComputeGRPOLoss:
 
         log_probs = torch.full((B, G, L), -1.0)
         old_log_probs = torch.full((B, G, L), -1.0)
-        ref_log_probs = torch.full((B, G, L), -1.0)
 
         # Group member 0: long (20 tokens), negative advantage
         # Group member 1: short (2 tokens), positive advantage
@@ -122,10 +120,10 @@ class TestComputeGRPOLoss:
 
         advs = torch.tensor([[[-1.0], [1.0]]])  # Shape [1, 2, 1]
 
-        loss, ppo_loss, _ = compute_grpo_loss(
+        _, ppo_loss, _ = compute_grpo_loss(
             log_probs=log_probs,
             old_log_probs=old_log_probs,
-            ref_log_probs=ref_log_probs,
+            ref_log_probs=None,
             completion_mask=completion_mask,
             advs=advs,
             beta=0.0,
@@ -149,29 +147,31 @@ class TestGRPOMechanics:
         """Training loop runs without errors."""
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
 
-        train_grpo(
-            net=tiny_model,
-            opt=opt,
-            env=env,
-            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
-            state_to_str=countdown_state_to_str,
-            tokenizer=tokenizer,
-            eos_token_id=151643,
-            pad_token_id=151643,
-            extractor=extract_from_answer_tags,
-            beta=0.01,
-            eps=0.2,
-            mu=1,
-            max_tokens_generated=20,
-            max_episodes=4,
-            update_ref_net_batch_cadence=5,
-            batch_size=2,
-            group_size=2,
-            temperature=1.0,
-            use_bf16=False,
-            advantage_fn=grpo_advantage,
-            normalize_by_sequence_length=True,
-        )
+        for beta in [0, 0.01]:
+            for normalize_by_sequence_length in [True, False]:
+                train_grpo(
+                    net=tiny_model,
+                    opt=opt,
+                    env=env,
+                    reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
+                    state_to_str=countdown_state_to_str,
+                    tokenizer=tokenizer,
+                    eos_token_id=151643,
+                    pad_token_id=151643,
+                    extractor=extract_from_answer_tags,
+                    beta=beta,
+                    eps=0.2,
+                    mu=1,
+                    max_tokens_generated=20,
+                    max_episodes=4,
+                    update_ref_net_batch_cadence=5,
+                    batch_size=2,
+                    group_size=2,
+                    temperature=1.0,
+                    use_bf16=False,
+                    advantage_fn=grpo_advantage,
+                    normalize_by_sequence_length=normalize_by_sequence_length,
+                )
 
     def test_loss_is_finite(self, tiny_model, tokenizer, env):
         """Loss values are not NaN/Inf (verified by no exceptions during training)."""

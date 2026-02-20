@@ -169,6 +169,7 @@ def compute_log_probs(
             l_prompt=l_prompt,
             chunk_size=chunk_size,
         )
+        only_completion = stacked[:, :, l_prompt:]
     else:
         logits: Float[torch.Tensor, "B G L_completion VC"] = compute_logits_of_group(
             net=net,
@@ -183,8 +184,6 @@ def compute_log_probs(
             only_completion.reshape(B * G * L),
             reduction="none",
         ).reshape(B, G, L)
-
-    only_completion = stacked[:, :, l_prompt:]
     completion_mask = only_completion != pad_token_id
     return log_probs, completion_mask
 
@@ -278,14 +277,14 @@ def compute_grpo_loss(
     *,
     log_probs: Float[torch.Tensor, "B G L_new"],
     old_log_probs: Float[torch.Tensor, "B G L_new"],
-    ref_log_probs: Float[torch.Tensor, "B G L_new"],
+    ref_log_probs: Float[torch.Tensor, "B G L_new"] | None,
     completion_mask: Bool[torch.Tensor, "B G L_new"],
     advs: Float[torch.Tensor, "B G 1"],
     beta: float,
     eps: float,
     normalize_by_sequence_length: bool,
     clip_ratio_c: float = 3.0,
-) -> tuple[torch.Tensor, float, float]:
+) -> tuple[torch.Tensor, float, float | None]:
     """Compute GRPO loss without backward pass or optimizer step.
 
     Parameters
@@ -312,6 +311,11 @@ def compute_grpo_loss(
     tuple[torch.Tensor, float, float]
         (loss tensor, ppo_loss scalar, kl_loss scalar)
     """
+    if bool(beta == 0) != bool(ref_log_probs is None):
+        raise RuntimeError("Should have ref_log_probs None if and only if beta is 0")
+
+    compute_kl_loss = beta != 0
+
     ratio = (log_probs - old_log_probs).exp()
     unclipped = ratio * advs
     clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
@@ -319,10 +323,14 @@ def compute_grpo_loss(
     ppo_obj = torch.min(unclipped, clipped)
     dual_clip_obj = clip_ratio_c * advs
     ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
-    kl_diff = ref_log_probs - log_probs
-    kl_diff = torch.clamp(kl_diff, min=-20, max=20)
-    kl_loss = torch.exp(kl_diff) - kl_diff - 1
-    kl_loss = torch.clamp(kl_loss, min=-10, max=10)
+
+    if compute_kl_loss:
+        kl_diff = ref_log_probs - log_probs
+        kl_diff = torch.clamp(kl_diff, min=-20, max=20)
+        kl_loss = torch.exp(kl_diff) - kl_diff - 1
+        kl_loss = torch.clamp(kl_loss, min=-10, max=10)
+    else:
+        kl_loss = None
 
     # Normalize per-sequence to avoid length bias: longer sequences should not
     # contribute more to the loss just because they have more tokens.
@@ -335,25 +343,35 @@ def compute_grpo_loss(
         ppo_obj_per_seq = (ppo_obj * completion_mask).sum(
             dim=-1, keepdim=True
         ) / sequence_lengths
-        kl_loss_per_seq = (kl_loss * completion_mask).sum(
-            dim=-1, keepdim=True
-        ) / sequence_lengths
+        kl_loss_per_seq = (
+            (kl_loss * completion_mask).sum(dim=-1, keepdim=True) / sequence_lengths
+            if compute_kl_loss
+            else None
+        )
     else:
         ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True)
-        kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
+        kl_loss_per_seq = (
+            (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
+            if compute_kl_loss
+            else None
+        )
 
     ppo_loss_scalar = -ppo_obj_per_seq.mean()
-    kl_loss_scalar = kl_loss_per_seq.mean()
+    kl_loss_scalar = kl_loss_per_seq.mean() if compute_kl_loss else 0
 
     loss = ppo_loss_scalar + beta * kl_loss_scalar
-    return loss, ppo_loss_scalar.item(), kl_loss_scalar.item()
+    return (
+        loss,
+        ppo_loss_scalar.item(),
+        kl_loss_scalar.item() if compute_kl_loss else None,
+    )
 
 
 @torch.no_grad()
 def collect_micro_batch(
     *,
     net: BaseTransformer,
-    ref_net: BaseTransformer,
+    ref_net: BaseTransformer | None,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -390,14 +408,17 @@ def collect_micro_batch(
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
-        ref_log_probs, completion_mask = compute_log_probs(
-            net=ref_net,
-            attention_mask=rollout.attention_mask,
-            completion_token_ids=rollout.completion_token_ids,
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-        )
-        old_log_probs, _ = compute_log_probs(
+        if ref_net is not None:
+            ref_log_probs, _ = compute_log_probs(
+                net=ref_net,
+                attention_mask=rollout.attention_mask,
+                completion_token_ids=rollout.completion_token_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=logprob_chunk_size,
+            )
+        else:
+            ref_log_probs = None
+        old_log_probs, completion_mask = compute_log_probs(
             net=net,
             attention_mask=rollout.attention_mask,
             completion_token_ids=rollout.completion_token_ids,
@@ -450,8 +471,9 @@ def _grpo_train_loop(
     n_episodes = 0
     step = 0
 
+    ref_net = None
     while n_episodes < max_episodes:
-        if step % update_ref_net_batch_cadence == 0:
+        if beta != 0 and (step % update_ref_net_batch_cadence == 0):
             ref_net = deepcopy(net)
 
         t_gen_total = 0.0
@@ -472,7 +494,7 @@ def _grpo_train_loop(
         t_opt_start = time.perf_counter()
         total_loss = 0.0
         total_ppo_loss = 0.0
-        total_kl_loss = 0.0
+        total_kl_loss = 0.0 if beta != 0 else None
 
         for _ in range(mu):
             opt.zero_grad()
@@ -504,7 +526,8 @@ def _grpo_train_loop(
 
                 total_loss += loss.item() / accumulation_steps
                 total_ppo_loss += ppo_loss / accumulation_steps
-                total_kl_loss += kl_loss / accumulation_steps
+                if kl_loss is not None:
+                    total_kl_loss += kl_loss / accumulation_steps
 
             if max_grad_norm > 0:
                 params = [p for group in opt.param_groups for p in group["params"]]
@@ -554,81 +577,80 @@ def _grpo_train_loop(
         )
 
         if extty._active_run is not None:
-            extty.log(
-                {
-                    "train/loss": total_loss / mu,
-                    "train/ppo_loss": total_ppo_loss / mu,
-                    "train/kl_loss": total_kl_loss / mu,
-                    "train/reward_mean": all_rewards.mean().item(),
-                    "train/reward_std": all_rewards.std().item(),
-                    "train/completion_token_len_mean": completion_token_len_mean,
-                    "train/example": examples,
-                    "train/generation_time": t_gen_total,
-                    "train/logprobs_time": t_logprobs_total,
-                    "train/optimization_time": t_opt,
-                    **(
-                        {
-                            "train/hard_completion_ratio": sum(
-                                mb["hard_completion_ratio"] for mb in micro_batches
-                            )
-                            / len(micro_batches)
-                        }
-                        if "hard_completion_ratio" in micro_batches[0]
-                        else {}
-                    ),
-                    **(
-                        {
-                            "train/hard_lp_mean": sum(
-                                mb["hard_lp_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_lp_std": sum(
-                                mb["hard_lp_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_lp_mean": sum(
-                                mb["soft_lp_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_lp_std": sum(
-                                mb["soft_lp_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_entropy_mean": sum(
-                                mb["hard_ent_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_entropy_std": sum(
-                                mb["hard_ent_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_entropy_mean": sum(
-                                mb["soft_ent_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_entropy_std": sum(
-                                mb["soft_ent_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/entropy_mean": sum(
-                                mb["entropy_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/entropy_std": sum(
-                                mb["entropy_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                        }
-                        if "hard_lp_mean" in micro_batches[0]
-                        else {}
-                    ),
-                    **{
-                        f"train/reward/{name}": mean
-                        for name, mean in component_means.items()
-                    },
+            metrics = {
+                "train/loss": total_loss / mu,
+                "train/ppo_loss": total_ppo_loss / mu,
+                "train/reward_mean": all_rewards.mean().item(),
+                "train/reward_std": all_rewards.std().item(),
+                "train/completion_token_len_mean": completion_token_len_mean,
+                "train/example": examples,
+                "train/generation_time": t_gen_total,
+                "train/logprobs_time": t_logprobs_total,
+                "train/optimization_time": t_opt,
+                **(
+                    {
+                        "train/hard_completion_ratio": sum(
+                            mb["hard_completion_ratio"] for mb in micro_batches
+                        )
+                        / len(micro_batches)
+                    }
+                    if "hard_completion_ratio" in micro_batches[0]
+                    else {}
+                ),
+                **(
+                    {
+                        "train/hard_lp_mean": sum(
+                            mb["hard_lp_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_lp_std": sum(
+                            mb["hard_lp_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_lp_mean": sum(
+                            mb["soft_lp_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_lp_std": sum(
+                            mb["soft_lp_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_entropy_mean": sum(
+                            mb["hard_ent_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_entropy_std": sum(
+                            mb["hard_ent_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_entropy_mean": sum(
+                            mb["soft_ent_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_entropy_std": sum(
+                            mb["soft_ent_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/entropy_mean": sum(
+                            mb["entropy_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/entropy_std": sum(
+                            mb["entropy_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                    }
+                    if "hard_lp_mean" in micro_batches[0]
+                    else {}
+                ),
+                **{
+                    f"train/reward/{name}": mean
+                    for name, mean in component_means.items()
                 },
-                step=step,
-            )
+            }
+            if total_kl_loss is not None:
+                metrics["train/kl_loss"] = total_kl_loss / mu
+            extty.log(metrics, step=step)
 
             if step % save_ckpt_freq == 0:
                 extty.save_checkpoint(
@@ -682,7 +704,7 @@ def train_grpo(
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
 
-    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer) -> dict:
+    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
         return collect_micro_batch(
             net=net,
             ref_net=ref_net,
@@ -1109,19 +1131,22 @@ def collect_soft_micro_batch(
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
-        ref_log_probs, completion_mask = compute_soft_log_probs(
-            net=ref_net,
-            attention_mask=rollout.attention_mask,
-            completion_tokens=rollout.completion_tokens,
-            completion_noise=rollout.completion_noise,
-            completion_action_embeddings=rollout.completion_action_embeddings,
-            hard_tokens_mask=rollout.hard_tokens_mask,
-            noise_std=rollout.noise_std,
-            temperature=rollout.temperature,
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-        )
-        old_log_probs, _, entropy = compute_soft_log_probs(
+        if ref_net is not None:
+            ref_log_probs, _ = compute_soft_log_probs(
+                net=ref_net,
+                attention_mask=rollout.attention_mask,
+                completion_tokens=rollout.completion_tokens,
+                completion_noise=rollout.completion_noise,
+                completion_action_embeddings=rollout.completion_action_embeddings,
+                hard_tokens_mask=rollout.hard_tokens_mask,
+                noise_std=rollout.noise_std,
+                temperature=rollout.temperature,
+                pad_token_id=pad_token_id,
+                chunk_size=logprob_chunk_size,
+            )
+        else:
+            ref_log_probs = None
+        old_log_probs, completion_mask, entropy = compute_soft_log_probs(
             net=net,
             attention_mask=rollout.attention_mask,
             completion_tokens=rollout.completion_tokens,
