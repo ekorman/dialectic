@@ -577,81 +577,80 @@ def _grpo_train_loop(
         )
 
         if extty._active_run is not None:
-            extty.log(
-                {
-                    "train/loss": total_loss / mu,
-                    "train/ppo_loss": total_ppo_loss / mu,
-                    "train/kl_loss": total_kl_loss / mu,
-                    "train/reward_mean": all_rewards.mean().item(),
-                    "train/reward_std": all_rewards.std().item(),
-                    "train/completion_token_len_mean": completion_token_len_mean,
-                    "train/example": examples,
-                    "train/generation_time": t_gen_total,
-                    "train/logprobs_time": t_logprobs_total,
-                    "train/optimization_time": t_opt,
-                    **(
-                        {
-                            "train/hard_completion_ratio": sum(
-                                mb["hard_completion_ratio"] for mb in micro_batches
-                            )
-                            / len(micro_batches)
-                        }
-                        if "hard_completion_ratio" in micro_batches[0]
-                        else {}
-                    ),
-                    **(
-                        {
-                            "train/hard_lp_mean": sum(
-                                mb["hard_lp_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_lp_std": sum(
-                                mb["hard_lp_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_lp_mean": sum(
-                                mb["soft_lp_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_lp_std": sum(
-                                mb["soft_lp_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_entropy_mean": sum(
-                                mb["hard_ent_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/hard_entropy_std": sum(
-                                mb["hard_ent_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_entropy_mean": sum(
-                                mb["soft_ent_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/soft_entropy_std": sum(
-                                mb["soft_ent_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/entropy_mean": sum(
-                                mb["entropy_mean"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                            "train/entropy_std": sum(
-                                mb["entropy_std"] for mb in micro_batches
-                            )
-                            / len(micro_batches),
-                        }
-                        if "hard_lp_mean" in micro_batches[0]
-                        else {}
-                    ),
-                    **{
-                        f"train/reward/{name}": mean
-                        for name, mean in component_means.items()
-                    },
+            metrics = {
+                "train/loss": total_loss / mu,
+                "train/ppo_loss": total_ppo_loss / mu,
+                "train/reward_mean": all_rewards.mean().item(),
+                "train/reward_std": all_rewards.std().item(),
+                "train/completion_token_len_mean": completion_token_len_mean,
+                "train/example": examples,
+                "train/generation_time": t_gen_total,
+                "train/logprobs_time": t_logprobs_total,
+                "train/optimization_time": t_opt,
+                **(
+                    {
+                        "train/hard_completion_ratio": sum(
+                            mb["hard_completion_ratio"] for mb in micro_batches
+                        )
+                        / len(micro_batches)
+                    }
+                    if "hard_completion_ratio" in micro_batches[0]
+                    else {}
+                ),
+                **(
+                    {
+                        "train/hard_lp_mean": sum(
+                            mb["hard_lp_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_lp_std": sum(
+                            mb["hard_lp_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_lp_mean": sum(
+                            mb["soft_lp_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_lp_std": sum(
+                            mb["soft_lp_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_entropy_mean": sum(
+                            mb["hard_ent_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/hard_entropy_std": sum(
+                            mb["hard_ent_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_entropy_mean": sum(
+                            mb["soft_ent_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/soft_entropy_std": sum(
+                            mb["soft_ent_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/entropy_mean": sum(
+                            mb["entropy_mean"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                        "train/entropy_std": sum(
+                            mb["entropy_std"] for mb in micro_batches
+                        )
+                        / len(micro_batches),
+                    }
+                    if "hard_lp_mean" in micro_batches[0]
+                    else {}
+                ),
+                **{
+                    f"train/reward/{name}": mean
+                    for name, mean in component_means.items()
                 },
-                step=step,
-            )
+            }
+            if total_kl_loss is not None:
+                metrics["train/kl_loss"] = (total_kl_loss / mu,)
+            extty.log(metrics, step=step)
 
             if step % save_ckpt_freq == 0:
                 extty.save_checkpoint(
