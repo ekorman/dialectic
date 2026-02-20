@@ -350,7 +350,11 @@ def compute_grpo_loss(
         )
     else:
         ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True)
-        kl_loss_per_seq = (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
+        kl_loss_per_seq = (
+            (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
+            if compute_kl_loss
+            else None
+        )
 
     ppo_loss_scalar = -ppo_obj_per_seq.mean()
     kl_loss_scalar = kl_loss_per_seq.mean() if compute_kl_loss else 0
