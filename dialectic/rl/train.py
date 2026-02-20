@@ -649,7 +649,7 @@ def _grpo_train_loop(
                 },
             }
             if total_kl_loss is not None:
-                metrics["train/kl_loss"] = (total_kl_loss / mu,)
+                metrics["train/kl_loss"] = total_kl_loss / mu
             extty.log(metrics, step=step)
 
             if step % save_ckpt_freq == 0:
