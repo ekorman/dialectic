@@ -525,6 +525,11 @@ def _grpo_train_loop(
     n_episodes = 0
     step = 0
 
+    if mu > 1 and eps is None:
+        raise RuntimeError(
+            "Should not have `mu` > 1 when not doing PPO style training."
+        )
+
     ref_net = None
     while n_episodes < max_episodes:
         if beta != 0 and (step % update_ref_net_batch_cadence == 0):
