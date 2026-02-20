@@ -128,6 +128,41 @@ def compute_logits_of_group(
     return out
 
 
+def get_completion_mask(
+    *,
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
+    completion_token_ids: list[Integer[torch.Tensor, "B L_completion"]]
+    | list[Float[torch.Tensor, "B L_completion V"]],
+    pad_token_id: int,
+) -> Bool[torch.Tensor, "B G L_new"]:
+    stacked = stack_and_pad(tensors=completion_token_ids, pad_token_id=pad_token_id)
+    l_prompt = attention_mask.shape[1]
+    only_completion = stacked[:, :, l_prompt:]
+    completion_mask = only_completion != pad_token_id
+    return completion_mask
+
+
+def get_completion_mask_soft(
+    *,
+    attention_mask: Bool[torch.Tensor, "B L_prompt"],
+    completion_tokens: list[Float[torch.Tensor, "B L V"]],
+    completion_noise: list[Float[torch.Tensor, "B L D"]],
+    hard_tokens_mask: list[Bool[torch.Tensor, "B L"]],
+    pad_token_id: int,
+) -> Bool[torch.Tensor, "B G L_new"]:
+    l_prompt = attention_mask.shape[1]
+    stacked_tokens, _, _, non_pad_mask = stack_and_pad_soft(
+        tokens=completion_tokens,
+        noise=completion_noise,
+        hard_masks=hard_tokens_mask,
+        pad_token_id=pad_token_id,
+    )
+    shadow_ids = stacked_tokens.argmax(-1)
+    pad_mask = shadow_ids != pad_token_id
+    completion_mask = (non_pad_mask & pad_mask)[:, :, l_prompt:]
+    return completion_mask
+
+
 def compute_log_probs(
     *,
     net: BaseTransformer,
@@ -276,12 +311,12 @@ def rloo_advantage(rewards: Float[torch.Tensor, "G B"]) -> Float[torch.Tensor, "
 def compute_grpo_loss(
     *,
     log_probs: Float[torch.Tensor, "B G L_new"],
-    old_log_probs: Float[torch.Tensor, "B G L_new"],
+    old_log_probs: Float[torch.Tensor, "B G L_new"] | None,
     ref_log_probs: Float[torch.Tensor, "B G L_new"] | None,
     completion_mask: Bool[torch.Tensor, "B G L_new"],
     advs: Float[torch.Tensor, "B G 1"],
     beta: float,
-    eps: float,
+    eps: float | None,
     normalize_by_sequence_length: bool,
     clip_ratio_c: float = 3.0,
 ) -> tuple[torch.Tensor, float, float | None]:
@@ -302,7 +337,7 @@ def compute_grpo_loss(
     beta
         KL penalty coefficient.
     eps
-        PPO clipping epsilon.
+        PPO clipping epsilon. (if None then no clipping)
     clip_ratio_c
         Dual-clip ratio for negative advantages.
 
@@ -311,18 +346,27 @@ def compute_grpo_loss(
     tuple[torch.Tensor, float, float]
         (loss tensor, ppo_loss scalar, kl_loss scalar)
     """
-    if bool(beta == 0) != bool(ref_log_probs is None):
-        raise RuntimeError("Should have ref_log_probs None if and only if beta is 0")
+    if (beta == 0) != (ref_log_probs is None):
+        raise RuntimeError("`ref_log_probs` should be None if and only if `beta` is 0")
+
+    if (eps is None) != (old_log_probs is None):
+        raise RuntimeError(
+            "`eps` should be None if and only if `old_log_probs` is None"
+        )
 
     compute_kl_loss = beta != 0
 
-    ratio = (log_probs - old_log_probs).exp()
-    unclipped = ratio * advs
-    clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
-
-    ppo_obj = torch.min(unclipped, clipped)
-    dual_clip_obj = clip_ratio_c * advs
-    ppo_obj = torch.where(advs < 0, torch.max(ppo_obj, dual_clip_obj), ppo_obj)
+    if eps is not None:
+        # PPO style
+        ratio = (log_probs - old_log_probs).exp()
+        unclipped = ratio * advs
+        clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs
+        main_obj = torch.min(unclipped, clipped)
+        dual_clip_obj = clip_ratio_c * advs
+        main_obj = torch.where(advs < 0, torch.max(main_obj, dual_clip_obj), main_obj)
+    else:
+        # REINFORCE
+        main_obj = log_probs * advs
 
     if compute_kl_loss:
         kl_diff = ref_log_probs - log_probs
@@ -340,7 +384,7 @@ def compute_grpo_loss(
         sequence_lengths = completion_mask.sum(dim=-1, keepdim=True).clamp(
             min=1
         )  # [B, G, 1]
-        ppo_obj_per_seq = (ppo_obj * completion_mask).sum(
+        main_obj_per_seq = (main_obj * completion_mask).sum(
             dim=-1, keepdim=True
         ) / sequence_lengths
         kl_loss_per_seq = (
@@ -349,20 +393,20 @@ def compute_grpo_loss(
             else None
         )
     else:
-        ppo_obj_per_seq = (ppo_obj * completion_mask).sum(dim=-1, keepdim=True)
+        main_obj_per_seq = (main_obj * completion_mask).sum(dim=-1, keepdim=True)
         kl_loss_per_seq = (
             (kl_loss * completion_mask).sum(dim=-1, keepdim=True)
             if compute_kl_loss
             else None
         )
 
-    ppo_loss_scalar = -ppo_obj_per_seq.mean()
+    main_loss_scalar = -main_obj_per_seq.mean()
     kl_loss_scalar = kl_loss_per_seq.mean() if compute_kl_loss else 0
 
-    loss = ppo_loss_scalar + beta * kl_loss_scalar
+    loss = main_loss_scalar + beta * kl_loss_scalar
     return (
         loss,
-        ppo_loss_scalar.item(),
+        main_loss_scalar.item(),
         kl_loss_scalar.item() if compute_kl_loss else None,
     )
 
@@ -382,6 +426,7 @@ def collect_micro_batch(
     batch_size: int,
     group_size: int,
     temperature: float,
+    collect_old_log_probs: bool,
     max_tokens_generated: int,
     logprob_chunk_size: int = 0,
     use_bf16: bool = False,
@@ -418,13 +463,22 @@ def collect_micro_batch(
             )
         else:
             ref_log_probs = None
-        old_log_probs, completion_mask = compute_log_probs(
-            net=net,
-            attention_mask=rollout.attention_mask,
-            completion_token_ids=rollout.completion_token_ids,
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-        )
+        if collect_old_log_probs:
+            old_log_probs, completion_mask = compute_log_probs(
+                net=net,
+                attention_mask=rollout.attention_mask,
+                completion_token_ids=rollout.completion_token_ids,
+                pad_token_id=pad_token_id,
+                chunk_size=logprob_chunk_size,
+            )
+        else:
+            old_log_probs = None
+            completion_mask = get_completion_mask(
+                attention_mask=rollout.attention_mask,
+                completion_token_ids=rollout.completion_token_ids,
+                pad_token_id=pad_token_id,
+            )
+
     t_logprobs = time.perf_counter() - t_logprobs_start
 
     return {
@@ -452,7 +506,7 @@ def _grpo_train_loop(
         [BaseTransformer, dict], tuple[torch.Tensor, torch.Tensor]
     ],
     beta: float,
-    eps: float,
+    eps: float | None,
     mu: int,
     max_episodes: int,
     update_ref_net_batch_cadence: int,
@@ -470,6 +524,11 @@ def _grpo_train_loop(
     device = next(net.parameters()).device
     n_episodes = 0
     step = 0
+
+    if mu > 1 and eps is None:
+        raise RuntimeError(
+            "Should not have `mu` > 1 when not doing PPO style training."
+        )
 
     ref_net = None
     while n_episodes < max_episodes:
@@ -493,7 +552,7 @@ def _grpo_train_loop(
 
         t_opt_start = time.perf_counter()
         total_loss = 0.0
-        total_ppo_loss = 0.0
+        total_main_loss = 0.0
         total_kl_loss = 0.0 if beta != 0 else None
 
         for _ in range(mu):
@@ -510,7 +569,7 @@ def _grpo_train_loop(
                 ):
                     log_probs, _ = recompute_log_probs_fn(net, micro_batch)
 
-                loss, ppo_loss, kl_loss = compute_grpo_loss(
+                loss, main_loss, kl_loss = compute_grpo_loss(
                     log_probs=log_probs,
                     old_log_probs=micro_batch["old_log_probs"],
                     ref_log_probs=micro_batch["ref_log_probs"],
@@ -525,7 +584,7 @@ def _grpo_train_loop(
                 scaled_loss.backward()
 
                 total_loss += loss.item() / accumulation_steps
-                total_ppo_loss += ppo_loss / accumulation_steps
+                total_main_loss += main_loss / accumulation_steps
                 if kl_loss is not None:
                     total_kl_loss += kl_loss / accumulation_steps
 
@@ -579,7 +638,7 @@ def _grpo_train_loop(
         if extty._active_run is not None:
             metrics = {
                 "train/loss": total_loss / mu,
-                "train/ppo_loss": total_ppo_loss / mu,
+                "train/main_loss": total_main_loss / mu,
                 "train/reward_mean": all_rewards.mean().item(),
                 "train/reward_std": all_rewards.std().item(),
                 "train/completion_token_len_mean": completion_token_len_mean,
@@ -683,7 +742,7 @@ def train_grpo(
     pad_token_id: int,
     extractor: Callable[[str], E],
     beta: float,
-    eps: float,
+    eps: float | None,
     mu: int,  # number of optimization passes per accumulated batch
     max_tokens_generated: int,
     max_episodes: int,
@@ -704,6 +763,8 @@ def train_grpo(
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
 
+    collect_old_log_probs = eps is not None
+
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
         return collect_micro_batch(
             net=net,
@@ -721,6 +782,7 @@ def train_grpo(
             max_tokens_generated=max_tokens_generated,
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
+            collect_old_log_probs=collect_old_log_probs,
         )
 
     def recompute_fn(
@@ -836,11 +898,7 @@ def compute_soft_log_probs(
     temperature: float,
     pad_token_id: int,
     chunk_size: int = 0,
-    return_entropy: bool = False,
-) -> (
-    tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]
-    | tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"], torch.Tensor]
-):
+) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
     l_prompt = attention_mask.shape[1]
     stacked_tokens, stacked_noise, stacked_masks, non_pad_mask = stack_and_pad_soft(
         tokens=completion_tokens,
@@ -855,7 +913,7 @@ def compute_soft_log_probs(
         )
 
     if chunk_size > 0:
-        log_probs, entropy = _compute_soft_log_probs_chunked(
+        log_probs = _compute_soft_log_probs_chunked(
             net=net,
             stacked_tokens=stacked_tokens,
             stacked_noise=stacked_noise,
@@ -866,10 +924,9 @@ def compute_soft_log_probs(
             noise_std=noise_std,
             temperature=temperature,
             chunk_size=chunk_size,
-            return_entropy=return_entropy,
         )
     else:
-        log_probs, entropy = _compute_soft_log_probs_full(
+        log_probs = _compute_soft_log_probs_full(
             net=net,
             stacked_tokens=stacked_tokens,
             stacked_noise=stacked_noise,
@@ -879,15 +936,13 @@ def compute_soft_log_probs(
             l_prompt=l_prompt,
             noise_std=noise_std,
             temperature=temperature,
-            return_entropy=return_entropy,
         )
 
     # Treat explicit pad tokens as masked-out (finished sequences emit pad tokens).
     shadow_ids = stacked_tokens.argmax(-1)
     pad_mask = shadow_ids != pad_token_id
     completion_mask = (non_pad_mask & pad_mask)[:, :, l_prompt:]
-    if return_entropy:
-        return log_probs, completion_mask, entropy
+
     return log_probs, completion_mask
 
 
@@ -922,8 +977,7 @@ def _compute_soft_log_probs_full(
     l_prompt: int,
     noise_std: float,
     temperature: float,
-    return_entropy: bool = False,
-) -> tuple[Float[torch.Tensor, "B G L_c"], Float[torch.Tensor, "B G L_c"] | None]:
+) -> Float[torch.Tensor, "B G L_c"]:
     batch_size, group_size, seq_len, V = stacked_tokens.shape
     BG = batch_size * group_size
 
@@ -947,7 +1001,6 @@ def _compute_soft_log_probs_full(
     comp_noise = flat_noise[:, l_prompt:]
     comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
     completion_len = seq_len - l_prompt
-    entropy = None
 
     W = net.embed_tokens.weight
 
@@ -969,16 +1022,11 @@ def _compute_soft_log_probs_full(
         mu_new = torch.softmax(logits.float() / temperature, dim=-1) @ W.float()
         # Normalize by embedding dimension to keep scale comparable to hard log-probs.
         soft_lp = -0.5 * ((e_action - mu_new) ** 2).mean(-1) / (noise_std**2)
-        if return_entropy:
-            logp = torch.log_softmax(logits.float() / temperature, dim=-1)
-            entropy = -(logp.exp() * logp).sum(-1)
 
     log_probs = torch.where(comp_masks, hard_lp, soft_lp)
     log_probs = log_probs.view(batch_size, group_size, completion_len)
-    if return_entropy:
-        entropy = entropy.view(batch_size, group_size, completion_len)
-        return log_probs, entropy
-    return log_probs, None
+
+    return log_probs
 
 
 def _compute_soft_log_probs_chunked(
@@ -993,8 +1041,7 @@ def _compute_soft_log_probs_chunked(
     noise_std: float,
     temperature: float,
     chunk_size: int,
-    return_entropy: bool = False,
-) -> tuple[Float[torch.Tensor, "B G L_c"], Float[torch.Tensor, "B G L_c"] | None]:
+) -> Float[torch.Tensor, "B G L_c"]:
     batch_size, group_size, seq_len, V = stacked_tokens.shape
     BG = batch_size * group_size
 
@@ -1021,7 +1068,6 @@ def _compute_soft_log_probs_chunked(
     W = net.embed_tokens.weight
 
     log_probs_list = []
-    entropy_list = [] if return_entropy else None
     for chunk_start in range(0, completion_len, chunk_size):
         chunk_end = min(chunk_start + chunk_size, completion_len)
 
@@ -1058,25 +1104,17 @@ def _compute_soft_log_probs_chunked(
             )
             # Normalize by embedding dimension to keep scale comparable to hard log-probs.
             soft_lp = -0.5 * ((e_action - mu_new) ** 2).mean(-1) / (noise_std**2)
-            if return_entropy:
-                logp = torch.log_softmax(chunk_logits.float() / temperature, dim=-1)
-                entropy = -(logp.exp() * logp).sum(-1)
 
         chunk_log_probs = torch.where(chunk_masks, hard_lp, soft_lp)
         log_probs_list.append(chunk_log_probs)
-        if return_entropy:
-            entropy_list.append(entropy)
+
         del chunk_logits
 
     log_probs_flat = torch.cat(log_probs_list, dim=1).view(
         batch_size, group_size, completion_len
     )
-    if return_entropy:
-        entropy_flat = torch.cat(entropy_list, dim=1).view(
-            batch_size, group_size, completion_len
-        )
-        return log_probs_flat, entropy_flat
-    return log_probs_flat, None
+
+    return log_probs_flat
 
 
 @torch.no_grad()
@@ -1096,6 +1134,7 @@ def collect_soft_micro_batch(
     temperature: float,
     max_tokens_generated: int,
     noise_std: float,
+    collect_old_log_probs: bool,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
     max_tokens_prefill: torch.Tensor | None = None,
     max_tokens_prefill_steps_before_end: int = 0,
@@ -1146,19 +1185,28 @@ def collect_soft_micro_batch(
             )
         else:
             ref_log_probs = None
-        old_log_probs, completion_mask, entropy = compute_soft_log_probs(
-            net=net,
-            attention_mask=rollout.attention_mask,
-            completion_tokens=rollout.completion_tokens,
-            completion_noise=rollout.completion_noise,
-            completion_action_embeddings=rollout.completion_action_embeddings,
-            hard_tokens_mask=rollout.hard_tokens_mask,
-            noise_std=rollout.noise_std,
-            temperature=rollout.temperature,
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-            return_entropy=True,
-        )
+        if collect_old_log_probs:
+            old_log_probs, completion_mask = compute_soft_log_probs(
+                net=net,
+                attention_mask=rollout.attention_mask,
+                completion_tokens=rollout.completion_tokens,
+                completion_noise=rollout.completion_noise,
+                completion_action_embeddings=rollout.completion_action_embeddings,
+                hard_tokens_mask=rollout.hard_tokens_mask,
+                noise_std=rollout.noise_std,
+                temperature=rollout.temperature,
+                pad_token_id=pad_token_id,
+                chunk_size=logprob_chunk_size,
+            )
+        else:
+            old_log_probs = None
+            completion_mask = get_completion_mask_soft(
+                attention_mask=rollout.attention_mask,
+                completion_tokens=rollout.completion_tokens,
+                completion_noise=rollout.completion_noise,
+                hard_tokens_mask=rollout.hard_tokens_mask,
+                pad_token_id=pad_token_id,
+            )
     t_logprobs = time.perf_counter() - t_logprobs_start
 
     # Soft-token debug stats (cheap): fraction of completion tokens that are hard,
@@ -1189,20 +1237,6 @@ def collect_soft_micro_batch(
         / completion_mask.sum().float().clamp_min(1.0)
     ).item()
 
-    def _masked_stats(values: torch.Tensor, mask: torch.Tensor) -> tuple[float, float]:
-        if not torch.any(mask):
-            return float("nan"), float("nan")
-        vals = values[mask]
-        return vals.mean().item(), vals.std().item()
-
-    hard_mask = hard_completion_mask & completion_mask
-    soft_mask = (~hard_completion_mask) & completion_mask
-    hard_lp_mean, hard_lp_std = _masked_stats(old_log_probs, hard_mask)
-    soft_lp_mean, soft_lp_std = _masked_stats(old_log_probs, soft_mask)
-    hard_ent_mean, hard_ent_std = _masked_stats(entropy, hard_mask)
-    soft_ent_mean, soft_ent_std = _masked_stats(entropy, soft_mask)
-    all_ent_mean, all_ent_std = _masked_stats(entropy, completion_mask)
-
     return {
         "prompts": rollout.prompts,
         "env_responses": rollout.env_responses,
@@ -1220,16 +1254,6 @@ def collect_soft_micro_batch(
         "old_log_probs": old_log_probs,
         "completion_mask": completion_mask,
         "hard_completion_ratio": hard_completion_ratio,
-        "hard_lp_mean": hard_lp_mean,
-        "hard_lp_std": hard_lp_std,
-        "soft_lp_mean": soft_lp_mean,
-        "soft_lp_std": soft_lp_std,
-        "hard_ent_mean": hard_ent_mean,
-        "hard_ent_std": hard_ent_std,
-        "soft_ent_mean": soft_ent_mean,
-        "soft_ent_std": soft_ent_std,
-        "entropy_mean": all_ent_mean,
-        "entropy_std": all_ent_std,
         "t_gen": rollout.t_generation,
         "t_logprobs": t_logprobs,
     }
@@ -1247,7 +1271,7 @@ def train_soft_grpo(
     pad_token_id: int,
     extractor: Callable[[str], E],
     beta: float,
-    eps: float,
+    eps: float | None,
     mu: int,
     max_tokens_generated: int,
     max_episodes: int,
@@ -1274,6 +1298,8 @@ def train_soft_grpo(
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
 
+    collect_old_log_probs = eps is not None
+
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer) -> dict:
         return collect_soft_micro_batch(
             net=net,
@@ -1289,6 +1315,7 @@ def train_soft_grpo(
             group_size=group_size,
             temperature=temperature,
             max_tokens_generated=max_tokens_generated,
+            collect_old_log_probs=collect_old_log_probs,
             noise_std=noise_std,
             switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
             max_tokens_prefill=max_tokens_prefill,
