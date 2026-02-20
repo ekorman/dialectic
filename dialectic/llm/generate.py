@@ -432,7 +432,7 @@ class _SoftGenerator(_BaseTokenGenerator):
         kv_caches: list[KVCache] | None,
         attention_mask: Bool[torch.Tensor, "B L"],
     ):
-        if self.soft_token_noise_std is not None:
+        if self.soft_token_noise_std is not None and input_tokens.ndim > 2:
             noise = torch.normal(
                 0.0,
                 self.soft_token_noise_std,
@@ -442,6 +442,15 @@ class _SoftGenerator(_BaseTokenGenerator):
             self.all_noise.append(noise)
         else:
             noise = None
+            if self.soft_token_noise_std is not None:
+                self.all_noise.append(
+                    torch.zeros(
+                        input_tokens.shape[0],
+                        input_tokens.shape[1],
+                        net.d,
+                        device=input_tokens.device,
+                    )
+                )
         return net(
             input_tokens,
             kv_caches=kv_caches,
