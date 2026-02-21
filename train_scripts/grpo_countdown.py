@@ -28,7 +28,7 @@ from dialectic.llm.llama import (
     load_llama_32_1b_instruct,
     load_llama_32_3b_instruct,
 )
-from dialectic.llm.qwen import load_qwen3_06b
+from dialectic.llm.qwen import load_qwen3_06b, load_qwen3_17b
 from dialectic.llm.templates import (
     Message,
     get_llama_input_text_from_messages,
@@ -77,6 +77,15 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
         net_factory=lambda: load_qwen3_06b(True),
         tokenizer="Qwen/Qwen3-0.6B",
+        eos_token_id=151645,
+        pad_token_id=151643,
+        format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
+            msgs, gen, enable_thinking=False
+        ),
+    ),
+    "qwen3-1.7b": ModelInfo(
+        net_factory=lambda: load_qwen3_17b(True),
+        tokenizer="Qwen/Qwen3-1.7B",
         eos_token_id=151645,
         pad_token_id=151643,
         format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
@@ -598,7 +607,7 @@ def main():
     parser.add_argument(
         "--normalize-soft-pdf-by-dim",
         action="store_true",
-        default=True,
+        default=False,
         help="Normalize soft token probs by embedding dimension",
     )
     parser.add_argument(
