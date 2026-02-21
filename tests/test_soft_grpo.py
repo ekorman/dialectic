@@ -106,6 +106,7 @@ class TestComputeSoftLogProbs:
                 temperature=temperature,
                 pad_token_id=pad_token_id,
                 chunk_size=0,
+                normalize_soft_pdf_by_dim=True,
             )
 
             lp_chunked, mask_chunked = compute_soft_log_probs(
@@ -118,6 +119,7 @@ class TestComputeSoftLogProbs:
                 temperature=temperature,
                 pad_token_id=pad_token_id,
                 chunk_size=4,
+                normalize_soft_pdf_by_dim=True,
             )
 
         assert lp_full.shape == (B, G, completion_len)
@@ -162,6 +164,7 @@ class TestComputeSoftLogProbs:
                 temperature=1.0,
                 pad_token_id=pad_token_id,
                 chunk_size=0,
+                normalize_soft_pdf_by_dim=False,
             )
 
         assert lp.shape == (B, G, completion_len)
@@ -206,6 +209,7 @@ class TestComputeSoftLogProbs:
                 temperature=1.0,
                 pad_token_id=pad_token_id,
                 chunk_size=0,
+                normalize_soft_pdf_by_dim=True,
             )
 
         assert lp.shape == (B, G, completion_len)
@@ -266,6 +270,7 @@ class TestComputeSoftLogProbs:
             temperature=1.0,
             pad_token_id=pad_token_id,
             chunk_size=0,
+            normalize_soft_pdf_by_dim=False,
         )
 
         loss = lp.sum()
@@ -307,6 +312,7 @@ class TestTrainSoftGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            normalize_soft_pdf_by_dim=False,
         )
 
     def test_training_loop_completes_eps_not_none(self, tiny_model, tokenizer):
@@ -360,6 +366,7 @@ class TestTrainSoftGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            normalize_soft_pdf_by_dim=False,
         )
 
         params_changed = False

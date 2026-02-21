@@ -234,6 +234,7 @@ def train(
     assistant_prefill: str | None,
     normalize_advantages: bool = True,
     normalize_by_sequence_length: bool,
+    normalize_soft_pdf_by_dim: bool,
     val_freq: int = 0,
     val_episodes: int = 50,
     val_batch_size: int = 4,
@@ -358,6 +359,7 @@ def train(
                 normalize_by_sequence_length=normalize_by_sequence_length,
                 val_config=val_config,
                 val_freq=val_freq,
+                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
             )
         else:
             train_grpo(
@@ -594,6 +596,19 @@ def main():
     )
 
     parser.add_argument(
+        "--normalize-soft-pdf-by-dim",
+        action="store_true",
+        default=True,
+        help="Normalize soft token probs by embedding dimension",
+    )
+    parser.add_argument(
+        "--no-normalize-soft-pdf-by-dim",
+        dest="normalize_soft_pdf_by_dim",
+        action="store_false",
+        help="Do not normalize soft token probs by embedding dimension",
+    )
+
+    parser.add_argument(
         "--val-freq",
         type=int,
         default=50,
@@ -653,6 +668,7 @@ def main():
         val_freq=args.val_freq,
         val_episodes=args.val_episodes,
         val_batch_size=args.val_batch_size,
+        normalize_soft_pdf_by_dim=args.normalize_soft_pdf_by_dim,
     )
 
 

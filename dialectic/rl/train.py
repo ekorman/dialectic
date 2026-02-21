@@ -862,6 +862,7 @@ def compute_soft_log_probs(
     noise_std: float,
     temperature: float,
     pad_token_id: int,
+    normalize_soft_pdf_by_dim: bool,
     chunk_size: int = 0,
 ) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
     l_prompt = attention_mask.shape[1]
@@ -884,6 +885,7 @@ def compute_soft_log_probs(
         noise_std=noise_std,
         temperature=temperature,
         chunk_size=chunk_size,
+        normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
     )
 
     pad_mask = stacked_shadow_ids != pad_token_id
@@ -923,6 +925,7 @@ def _compute_soft_log_probs_chunked(
     noise_std: float,
     temperature: float,
     chunk_size: int,
+    normalize_soft_pdf_by_dim: bool,
 ) -> Float[torch.Tensor, "B G L_c"]:
     batch_size, group_size, seq_len, D = stacked_embeddings.shape
     BG = batch_size * group_size
@@ -973,7 +976,11 @@ def _compute_soft_log_probs_chunked(
             mu_new = (
                 torch.softmax(chunk_logits.float() / temperature, dim=-1) @ W.float()
             )
-            soft_lp = -0.5 * ((e_action - mu_new) ** 2).mean(-1) / (noise_std**2)
+            soft_lp = -0.5 * ((e_action - mu_new) ** 2) / (noise_std**2)
+            if normalize_soft_pdf_by_dim:
+                soft_lp = soft_lp.mean(-1)
+            else:
+                soft_lp = soft_lp.sum(-1)
 
         chunk_log_probs = torch.where(chunk_masks, hard_lp, soft_lp)
         log_probs_list.append(chunk_log_probs)
@@ -1005,6 +1012,7 @@ def collect_soft_micro_batch(
     max_tokens_generated: int,
     noise_std: float,
     collect_old_log_probs: bool,
+    normalize_soft_pdf_by_dim: bool,
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
     max_tokens_prefill: torch.Tensor | None = None,
     max_tokens_prefill_steps_before_end: int = 0,
@@ -1051,6 +1059,7 @@ def collect_soft_micro_batch(
                 temperature=rollout.temperature,
                 pad_token_id=pad_token_id,
                 chunk_size=logprob_chunk_size,
+                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
             )
         else:
             ref_log_probs = None
@@ -1065,6 +1074,7 @@ def collect_soft_micro_batch(
                 temperature=rollout.temperature,
                 pad_token_id=pad_token_id,
                 chunk_size=logprob_chunk_size,
+                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
             )
         else:
             old_log_probs = None
@@ -1147,6 +1157,7 @@ def train_soft_grpo(
     temperature: float,
     noise_std: float,
     normalize_by_sequence_length: bool,
+    normalize_soft_pdf_by_dim: bool,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     switch_to_hard_tokens_condition: torch.Tensor | None = None,
     max_tokens_prefill: torch.Tensor | None = None,
@@ -1190,6 +1201,7 @@ def train_soft_grpo(
             prefill=prefill,
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
+            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
         )
 
     def recompute_fn(
@@ -1205,6 +1217,7 @@ def train_soft_grpo(
             temperature=mb["temperature"],
             pad_token_id=pad_token_id,
             chunk_size=logprob_chunk_size,
+            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
         )
 
     _grpo_train_loop(
