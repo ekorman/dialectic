@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 
@@ -62,7 +63,8 @@ def test_compute_logits_of_group():
     torch.testing.assert_close(actual, expected)
 
 
-def test_compute_log_probs():
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_compute_log_probs(chunk_size):
     vocab_size = 10
     batch_size = 2
     group_size = 3
@@ -74,9 +76,6 @@ def test_compute_log_probs():
         def __init__(self):
             super().__init__()
             d = 16
-            # self.logits = nn.Parameter(
-            #     torch.randn(batch_size * group_size, total_len, vocab_size)
-            # )
             self.hidden_states = nn.Parameter(
                 torch.randn(batch_size * group_size, total_len, d)
             )
@@ -108,6 +107,7 @@ def test_compute_log_probs():
         attention_mask=attention_mask,
         completion_token_ids=completion_token_ids,
         pad_token_id=pad_token_id,
+        chunk_size=chunk_size,
     )
 
     assert result.shape == (batch_size, group_size, completion_len)

@@ -185,8 +185,9 @@ def compute_log_probs(
     pad_token_id
         Token ID used for padding.
     chunk_size
-        If > 0, compute log probs in chunks to reduce memory usage.
-        Recommended: 64-128 for large vocab models.
+        Size of chunks for log prob computation. 0 means no chunking
+        (process full completion at once). Recommended: 64-128 for large
+        vocab models to reduce memory usage.
 
     Returns
     -------
