@@ -185,8 +185,9 @@ def compute_log_probs(
     pad_token_id
         Token ID used for padding.
     chunk_size
-        If > 0, compute log probs in chunks to reduce memory usage.
-        Recommended: 64-128 for large vocab models.
+        Size of chunks for log prob computation. 0 means no chunking
+        (process full completion at once). Recommended: 64-128 for large
+        vocab models to reduce memory usage.
 
     Returns
     -------
@@ -196,29 +197,15 @@ def compute_log_probs(
     l_prompt = attention_mask.shape[1]
     stacked = stack_and_pad(tensors=completion_token_ids, pad_token_id=pad_token_id)
 
-    if chunk_size > 0:
-        log_probs = _compute_log_probs_chunked(
-            net=net,
-            input_ids=stacked,
-            attention_mask=attention_mask,
-            l_prompt=l_prompt,
-            chunk_size=chunk_size,
-        )
-        only_completion = stacked[:, :, l_prompt:]
-    else:
-        logits: Float[torch.Tensor, "B G L_completion VC"] = compute_logits_of_group(
-            net=net,
-            input_ids=stacked,
-            attention_mask=attention_mask,
-        )
-        logits = logits[:, :, l_prompt - 1 : -1]
-        only_completion = stacked[:, :, l_prompt:]
-        B, G, L, V = logits.shape
-        log_probs = -torch.nn.functional.cross_entropy(
-            logits.reshape(B * G * L, V),
-            only_completion.reshape(B * G * L),
-            reduction="none",
-        ).reshape(B, G, L)
+    log_probs = _compute_log_probs_chunked(
+        net=net,
+        input_ids=stacked,
+        attention_mask=attention_mask,
+        l_prompt=l_prompt,
+        chunk_size=chunk_size,
+    )
+    only_completion = stacked[:, :, l_prompt:]
+
     completion_mask = only_completion != pad_token_id
     return log_probs, completion_mask
 
@@ -246,6 +233,9 @@ def _compute_log_probs_chunked(
     completion_len = seq_len - l_prompt
     hidden_for_completion = hidden_states[:, l_prompt - 1 : -1]
     target_tokens = flat_input_ids[:, l_prompt:]
+
+    if chunk_size == 0:
+        chunk_size = completion_len
 
     log_probs_list = []
     for chunk_start in range(0, completion_len, chunk_size):
@@ -912,31 +902,18 @@ def compute_soft_log_probs(
             actions=completion_action_embeddings, max_len=stacked_tokens.shape[2]
         )
 
-    if chunk_size > 0:
-        log_probs = _compute_soft_log_probs_chunked(
-            net=net,
-            stacked_tokens=stacked_tokens,
-            stacked_noise=stacked_noise,
-            stacked_masks=stacked_masks,
-            stacked_actions=stacked_actions,
-            attention_mask=attention_mask,
-            l_prompt=l_prompt,
-            noise_std=noise_std,
-            temperature=temperature,
-            chunk_size=chunk_size,
-        )
-    else:
-        log_probs = _compute_soft_log_probs_full(
-            net=net,
-            stacked_tokens=stacked_tokens,
-            stacked_noise=stacked_noise,
-            stacked_masks=stacked_masks,
-            stacked_actions=stacked_actions,
-            attention_mask=attention_mask,
-            l_prompt=l_prompt,
-            noise_std=noise_std,
-            temperature=temperature,
-        )
+    log_probs = _compute_soft_log_probs_chunked(
+        net=net,
+        stacked_tokens=stacked_tokens,
+        stacked_noise=stacked_noise,
+        stacked_masks=stacked_masks,
+        stacked_actions=stacked_actions,
+        attention_mask=attention_mask,
+        l_prompt=l_prompt,
+        noise_std=noise_std,
+        temperature=temperature,
+        chunk_size=chunk_size,
+    )
 
     # Treat explicit pad tokens as masked-out (finished sequences emit pad tokens).
     shadow_ids = stacked_tokens.argmax(-1)
@@ -964,69 +941,6 @@ def _expand_attention_mask(
     full_mask[:, :l_prompt] = attention_mask
     full_mask = full_mask.unsqueeze(1).expand(-1, group_size, -1)
     return full_mask.reshape(batch_size * group_size, seq_len)
-
-
-def _compute_soft_log_probs_full(
-    *,
-    net: BaseTransformer,
-    stacked_tokens: Float[torch.Tensor, "B G L V"],
-    stacked_noise: Float[torch.Tensor, "B G L D"],
-    stacked_masks: Bool[torch.Tensor, "B G L"],
-    stacked_actions: Float[torch.Tensor, "B G L D"] | None,
-    attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    l_prompt: int,
-    noise_std: float,
-    temperature: float,
-) -> Float[torch.Tensor, "B G L_c"]:
-    batch_size, group_size, seq_len, V = stacked_tokens.shape
-    BG = batch_size * group_size
-
-    flat_tokens = stacked_tokens.view(BG, seq_len, V)
-    flat_noise = stacked_noise.view(BG, seq_len, -1)
-    flat_actions = (
-        stacked_actions.view(BG, seq_len, -1) if stacked_actions is not None else None
-    )
-
-    full_mask = _expand_attention_mask(attention_mask, batch_size, group_size, seq_len)
-
-    logits = net(
-        flat_tokens,
-        return_all_logits=True,
-        attention_mask=full_mask,
-        soft_token_noise=flat_noise,
-    )
-
-    logits = logits[:, l_prompt - 1 : -1]
-    comp_tokens = flat_tokens[:, l_prompt:]
-    comp_noise = flat_noise[:, l_prompt:]
-    comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
-    completion_len = seq_len - l_prompt
-
-    W = net.embed_tokens.weight
-
-    shadow_ids = comp_tokens.argmax(-1)
-    hard_lp = -torch.nn.functional.cross_entropy(
-        logits.reshape(BG * completion_len, V),
-        shadow_ids.reshape(BG * completion_len),
-        reduction="none",
-    ).reshape(BG, completion_len)
-
-    # compute Gaussian log-probs in float32 to avoid bfloat16 overflow in the
-    # backward pass: 1/σ² can be ~10k and amplifies gradients beyond bf16 range
-    device_type = comp_tokens.device.type
-    with torch.amp.autocast(device_type=device_type, enabled=False):
-        if flat_actions is not None:
-            e_action = flat_actions[:, l_prompt:].float()
-        else:
-            e_action = comp_tokens.float() @ W.float() + comp_noise.float()
-        mu_new = torch.softmax(logits.float() / temperature, dim=-1) @ W.float()
-        # Normalize by embedding dimension to keep scale comparable to hard log-probs.
-        soft_lp = -0.5 * ((e_action - mu_new) ** 2).mean(-1) / (noise_std**2)
-
-    log_probs = torch.where(comp_masks, hard_lp, soft_lp)
-    log_probs = log_probs.view(batch_size, group_size, completion_len)
-
-    return log_probs
 
 
 def _compute_soft_log_probs_chunked(
@@ -1066,6 +980,9 @@ def _compute_soft_log_probs_chunked(
     comp_noise = flat_noise[:, l_prompt:]
     comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
     W = net.embed_tokens.weight
+
+    if chunk_size == 0:
+        chunk_size = completion_len
 
     log_probs_list = []
     for chunk_start in range(0, completion_len, chunk_size):

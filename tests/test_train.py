@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 
@@ -62,7 +63,8 @@ def test_compute_logits_of_group():
     torch.testing.assert_close(actual, expected)
 
 
-def test_compute_log_probs():
+@pytest.mark.parametrize("chunk_size", [0, 2])
+def test_compute_log_probs(chunk_size):
     vocab_size = 10
     batch_size = 2
     group_size = 3
@@ -73,14 +75,24 @@ def test_compute_log_probs():
     class MockNet(nn.Module):
         def __init__(self):
             super().__init__()
-            self.logits = nn.Parameter(
-                torch.randn(batch_size * group_size, total_len, vocab_size)
+            d = 16
+            self.hidden_states = nn.Parameter(
+                torch.randn(batch_size * group_size, total_len, d)
             )
+            self.lm_head = nn.Linear(d, vocab_size, bias=False)
 
-        def forward(self, x, return_all_logits=False, attention_mask=None):
+        def forward(
+            self,
+            x,
+            return_all_logits=False,
+            attention_mask=None,
+            return_hidden_states: bool = False,
+        ):
+            if return_hidden_states:
+                return self.hidden_states
             if return_all_logits:
-                return self.logits
-            return self.logits[:, -1:]
+                return self.lm_head(self.hidden_states)
+            return self.lm_head(self.hidden_states)[:, -1:]
 
     net = MockNet()
     pad_token_id = 0
@@ -95,13 +107,16 @@ def test_compute_log_probs():
         attention_mask=attention_mask,
         completion_token_ids=completion_token_ids,
         pad_token_id=pad_token_id,
+        chunk_size=chunk_size,
     )
 
     assert result.shape == (batch_size, group_size, completion_len)
     assert completion_mask.shape == (batch_size, group_size, completion_len)
 
     stacked = stack_and_pad(completion_token_ids, pad_token_id)
-    all_logits = net.logits.view(batch_size, group_size, total_len, vocab_size)
+    all_logits = net.lm_head(net.hidden_states).view(
+        batch_size, group_size, total_len, vocab_size
+    )
     all_logits = all_logits[:, :, :-1]
     all_log_probs = all_logits.log_softmax(-1)
 
