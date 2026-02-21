@@ -92,7 +92,7 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
 @torch.inference_mode()
 def test_soft_tokens_forward_pass(tiny_model: BaseTransformer):
     """Tests that the forward pass gives the same thing if we pass an integer tensor
-    of token ids or the corresponding one-hot float tensor
+    of token ids, the corresponding one-hot float tensor, or pre-computed embeddings
     """
     b, l = 4, 6
     token_ids = torch.randint(0, tiny_model.vocab_size, (b, l))
@@ -101,10 +101,14 @@ def test_soft_tokens_forward_pass(tiny_model: BaseTransformer):
     ).float()
     assert one_hot_tokens.shape == torch.Size((b, l, tiny_model.vocab_size))
 
+    embeddings = tiny_model.embed_tokens(token_ids)
+
     out1 = tiny_model(token_ids)
     out2 = tiny_model(one_hot_tokens)
+    out3 = tiny_model(embeddings)
 
     torch.testing.assert_close(out1, out2)
+    torch.testing.assert_close(out1, out3)
 
 
 @torch.inference_mode()
@@ -121,7 +125,8 @@ def test_soft_tokens_generation(tiny_model: BaseTransformer):
         use_kv_cache=True,
     )
 
-    assert output.tokens.shape == torch.Size((b, l + 24, tiny_model.vocab_size))
+    assert output.embeddings.shape == torch.Size((b, l + 24, tiny_model.d))
+    assert output.shadow_ids.shape == torch.Size((b, l + 24))
 
 
 def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerateModel):
@@ -150,22 +155,13 @@ def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerate
         use_kv_cache=True,
     )
 
-    assert output.tokens.shape == torch.Size((3, 2 + max_tokens_generated, vocab_size))
-    generated_tokens = output.tokens[:, 2:]
+    assert output.shadow_ids.shape == torch.Size((3, 2 + max_tokens_generated))
+    generated_ids = output.shadow_ids[:, 2:]
 
-    pad_token_one_hot = torch.nn.functional.one_hot(
-        torch.tensor(pad_token_id), vocab_size
-    )
-    eos_token_one_hot = torch.nn.functional.one_hot(
-        torch.tensor(eos_token_id), vocab_size
-    )
+    assert generated_ids[2, 0] == eos_token_id
+    assert (generated_ids[2, 1:] == pad_token_id).all()
 
-    # last element of batch should terminated immediately and just have pad token distribution
-    assert (generated_tokens[2, 0] == eos_token_one_hot).all()
-    assert (generated_tokens[2, 1:] == pad_token_one_hot).all()
-
-    # others should always have no pad token component
-    assert (generated_tokens[:2, :, pad_token_id] == 0).all()
+    assert (generated_ids[:2] != pad_token_id).all()
 
 
 def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateModel):
@@ -193,28 +189,13 @@ def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateMod
         use_kv_cache=True,
     )
 
-    assert output.tokens.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.tokens.shape == torch.Size((3, 5, vocab_size))
-    generated_tokens = output.tokens[:, 2:]
+    assert output.shadow_ids.shape[1] < token_ids.shape[1] + max_tokens_generated
+    assert output.shadow_ids.shape == torch.Size((3, 5))
+    generated_ids = output.shadow_ids[:, 2:]
 
-    def _create_one_hot(token_id):
-        return torch.nn.functional.one_hot(torch.tensor(token_id), vocab_size)
-
-    pad_token_one_hot = _create_one_hot(pad_token_id)
-    eos_token_one_hot = _create_one_hot(eos_token_id)
-
-    assert (
-        generated_tokens[0]
-        == torch.stack([eos_token_one_hot, pad_token_one_hot, pad_token_one_hot])
-    ).all()
-    assert (
-        generated_tokens[1]
-        == torch.stack([_create_one_hot(5), eos_token_one_hot, pad_token_one_hot])
-    ).all()
-    assert (
-        generated_tokens[2]
-        == torch.stack([_create_one_hot(6), _create_one_hot(8), eos_token_one_hot])
-    ).all()
+    assert generated_ids[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
+    assert generated_ids[1].tolist() == [5, eos_token_id, pad_token_id]
+    assert generated_ids[2].tolist() == [6, 8, eos_token_id]
 
 
 def test_prefill_pos():
@@ -397,16 +378,8 @@ def test_generate_with_prefill_without_kv_cache(tiny_model: BaseTransformer):
     )
 
 
-def _is_one_hot(tensor: torch.Tensor, tol: float = 1e-6) -> bool:
-    """Check if a tensor is approximately one-hot encoded."""
-    max_val = tensor.max()
-    num_ones = (tensor > 1 - tol).sum()
-    num_zeros = (tensor < tol).sum()
-    return abs(max_val - 1.0) < tol and num_ones == 1 and num_zeros == len(tensor) - 1
-
-
 def test_soft_generator_switch_to_hard_tokens(MockGenerateModel):
-    """Once the switch condition fires, ALL subsequent tokens must be hard (one-hot)
+    """Once the switch condition fires, ALL subsequent tokens must be hard
     even when the shadow sequence no longer ends with the condition (latching).
 
     Uses a mock with distinct scheduled tokens so the condition provably cannot
@@ -440,18 +413,13 @@ def test_soft_generator_switch_to_hard_tokens(MockGenerateModel):
         switch_to_hard_tokens_condition=switch_condition,
     )
 
-    generated = out.tokens[0, x.shape[1] :]
-    shadow = generated.argmax(-1)
+    shadow = out.shadow_ids[0, x.shape[1] :]
 
-    # condition [5,3,7] appears in the shadow sequence at positions 0-2;
-    # verify it does NOT re-appear anywhere later
     for i in range(1, len(shadow) - len(switch_condition) + 1):
         assert not (shadow[i : i + len(switch_condition)] == switch_condition).all(), (
             f"Condition re-triggers at position {i} — test cannot verify latching"
         )
 
-    # shadow_seq checked BEFORE appending each token, so condition fires at step 3
-    # (when shadow_seq ends with [..., 5, 3, 7]). Tokens 0-2 are soft, 3+ are hard.
     prompt_len = x.shape[1]
     mask = out.hard_tokens_mask[0]
     assert mask[:prompt_len].all(), "Prompt tokens should be hard"
@@ -462,9 +430,14 @@ def test_soft_generator_switch_to_hard_tokens(MockGenerateModel):
         "All tokens after switch should be hard (latching)"
     )
 
+    W = net.embed_tokens.weight
     for i in range(3, 10):
-        assert _is_one_hot(generated[i]), (
-            f"Token {i} should be one-hot encoded (hard from latching)"
+        expected_emb = W[shadow[i]].float()
+        actual_emb = out.embeddings[0, prompt_len + i].float()
+        torch.testing.assert_close(
+            actual_emb,
+            expected_emb,
+            msg=f"Token {i} embedding should match W[shadow_id] (hard token)",
         )
 
 
@@ -487,8 +460,8 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
         pad_token_id=0,
         max_tokens_generated=10,
         use_kv_cache=True,
-    ).tokens
-    shadow1 = out1[0, x1.shape[1] :].argmax(-1)
+    )
+    shadow1 = out1.shadow_ids[0, x1.shape[1] :]
 
     out2 = generate_soft_tokens(
         net=model,
@@ -497,8 +470,8 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
         pad_token_id=0,
         max_tokens_generated=10,
         use_kv_cache=True,
-    ).tokens
-    shadow2 = out2[0, x2.shape[1] :].argmax(-1)
+    )
+    shadow2 = out2.shadow_ids[0, x2.shape[1] :]
 
     switch_condition = shadow1[:2]
 
@@ -519,38 +492,36 @@ def test_soft_generator_switch_to_hard_tokens_batch(tiny_model: BaseTransformer)
         max_tokens_generated=10,
         use_kv_cache=True,
         switch_to_hard_tokens_condition=switch_condition,
-    ).tokens
+    )
 
-    generated_batched = out_batched[:, x1.shape[1] :]
+    mask_batched = out_batched.hard_tokens_mask[:, x1.shape[1] :]
 
     for i in range(switch_step_1):
-        assert not _is_one_hot(generated_batched[0, i]), (
+        assert not mask_batched[0, i], (
             f"Batch 0, token {i}: should be soft (before switch)"
         )
     for i in range(switch_step_1, 10):
-        assert _is_one_hot(generated_batched[0, i]), (
-            f"Batch 0, token {i}: should be hard (after switch)"
-        )
+        assert mask_batched[0, i], f"Batch 0, token {i}: should be hard (after switch)"
 
     if switch_step_2 is not None:
         for i in range(switch_step_2):
-            assert not _is_one_hot(generated_batched[1, i]), (
+            assert not mask_batched[1, i], (
                 f"Batch 1, token {i}: should be soft (before switch)"
             )
         for i in range(switch_step_2, 10):
-            assert _is_one_hot(generated_batched[1, i]), (
+            assert mask_batched[1, i], (
                 f"Batch 1, token {i}: should be hard (after switch)"
             )
     else:
         for i in range(10):
-            assert not _is_one_hot(generated_batched[1, i]), (
+            assert not mask_batched[1, i], (
                 f"Batch 1, token {i}: should be soft (never switched)"
             )
 
 
 def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer):
     """Without a switch condition, all generated tokens should remain soft
-    (not one-hot).
+    (hard_tokens_mask should be False for all generated positions).
     """
 
     torch.manual_seed(42)
@@ -566,19 +537,16 @@ def test_soft_generator_no_switch_without_condition(tiny_model: BaseTransformer)
         pad_token_id=0,
         max_tokens_generated=10,
         use_kv_cache=True,
-    ).tokens
+    )
 
-    generated = out[0, x.shape[1] :]
+    mask = out.hard_tokens_mask[0, x.shape[1] :]
 
     for i in range(10):
-        token_dist = generated[i]
-        assert not _is_one_hot(token_dist), (
-            f"Token {i} should be soft (no switch condition set)"
-        )
+        assert not mask[i], f"Token {i} should be soft (no switch condition set)"
 
 
 def test_soft_token_argmax_matches_hard_greedy(tiny_model: BaseTransformer):
-    """The argmax of soft tokens should equal greedy hard token generation.
+    """The shadow_ids of soft tokens should equal greedy hard token generation.
 
     Both process identical logits on the first step (same prompt embeddings).
     From step 2 onward, soft feeds back a mixture embedding while hard feeds
@@ -613,11 +581,11 @@ def test_soft_token_argmax_matches_hard_greedy(tiny_model: BaseTransformer):
     )
 
     hard_generated = hard_out.tokens[0, x.shape[1] :]
-    soft_argmax = soft_out.tokens[0, x.shape[1] :].argmax(-1)
+    soft_shadow = soft_out.shadow_ids[0, x.shape[1] :]
 
-    assert hard_generated[0] == soft_argmax[0], (
+    assert hard_generated[0] == soft_shadow[0], (
         f"First generated token should match: hard={hard_generated[0].item()}, "
-        f"soft argmax={soft_argmax[0].item()}"
+        f"soft shadow={soft_shadow[0].item()}"
     )
 
 
@@ -687,9 +655,9 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
         pad_token_id=pad_token_id,
         max_tokens_generated=20,
         use_kv_cache=True,
-    ).tokens
+    )
 
-    shadow_tokens = out1_natural[0, x1.shape[1] :].argmax(-1)
+    shadow_tokens = out1_natural.shadow_ids[0, x1.shape[1] :]
     trigger = shadow_tokens[:3]
     natural_fill = shadow_tokens[3:5]
     fill = (natural_fill + 1) % vocab_size
@@ -705,11 +673,10 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
         max_tokens_generated=20,
         use_kv_cache=True,
         prefill=prefill,
-    ).tokens
+    )
 
-    fill_one_hot = torch.nn.functional.one_hot(fill, vocab_size).float()
-    assert (out1[0, x1.shape[1] + 3 : x1.shape[1] + 5] == fill_one_hot).all(), (
-        "Prefill did not fire: one-hot fill tokens not found after trigger"
+    assert (out1.shadow_ids[0, x1.shape[1] + 3 : x1.shape[1] + 5] == fill).all(), (
+        "Prefill did not fire: fill tokens not found after trigger"
     )
 
     x_batched = torch.full((2, 7), pad_token_id, dtype=torch.long)
@@ -728,16 +695,19 @@ def test_soft_generate_with_prefill_and_attention_mask(tiny_model: BaseTransform
         use_kv_cache=True,
         attention_mask=attention_mask,
         prefill=prefill,
-    ).tokens
+    )
 
     torch.testing.assert_close(
-        out1[0],
-        out_batched[0, 3:],
+        out1.embeddings[0],
+        out_batched.embeddings[0, 3:],
         msg="Batch element 0 (with prefill) doesn't match individual generation",
     )
 
 
 def test_soft_generator_noise_shape(tiny_model: BaseTransformer):
+    """Verify that embeddings include noise: generated-position embeddings
+    should differ from the noiseless W[shadow_id] embeddings.
+    """
     torch.manual_seed(42)
     model = tiny_model.eval()
     vocab_size = model.vocab_size
@@ -755,15 +725,22 @@ def test_soft_generator_noise_shape(tiny_model: BaseTransformer):
         soft_token_noise_std=0.1,
     )
 
-    assert out.noise is not None
-    assert out.noise.shape == (b, prompt_len + n_gen, model.d)
-    assert out.tokens.shape == (b, prompt_len + n_gen, vocab_size)
+    assert out.embeddings.shape == (b, prompt_len + n_gen, model.d)
+    assert out.shadow_ids.shape == (b, prompt_len + n_gen)
+
+    with torch.no_grad():
+        W = model.embed_tokens.weight
+        noiseless = W[out.shadow_ids[:, prompt_len:]].float()
+        actual = out.embeddings[:, prompt_len:].float()
+    assert not torch.allclose(actual, noiseless, atol=1e-6), (
+        "Generated embeddings should differ from noiseless W[shadow_id] when noise is applied"
+    )
 
 
 def test_soft_generator_prompt_noise_is_zero(tiny_model: BaseTransformer):
     """Prompt is processed as 2D int tokens during generation, so noise is not
-    applied to prompt embeddings. The returned noise tensor must have zeros at
-    prompt positions to keep log-prob recomputation consistent with generation.
+    applied to prompt embeddings. The returned embeddings at prompt positions
+    should match W[shadow_ids] exactly (no noise).
     """
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -782,24 +759,30 @@ def test_soft_generator_prompt_noise_is_zero(tiny_model: BaseTransformer):
         soft_token_noise_std=0.5,
     )
 
-    assert out.noise is not None
-    prompt_noise = out.noise[:, :prompt_len]
-    assert prompt_noise.abs().max() == 0.0, (
-        "Prompt noise must be zero — noise is not applied during generation "
-        f"(2D int path) but got max abs value {prompt_noise.abs().max().item()}"
-    )
+    with torch.no_grad():
+        W = model.embed_tokens.weight
+        prompt_embeddings = out.embeddings[:, :prompt_len].float()
+        expected_prompt_embeddings = W[out.shadow_ids[:, :prompt_len]].float()
+        torch.testing.assert_close(
+            prompt_embeddings,
+            expected_prompt_embeddings,
+            msg="Prompt embeddings should equal W[shadow_ids] (no noise applied)",
+        )
 
-    gen_noise = out.noise[:, prompt_len:]
-    assert gen_noise.abs().max() > 0.0, "Generated positions should have non-zero noise"
+        gen_embeddings = out.embeddings[:, prompt_len:].float()
+        expected_gen_embeddings = W[out.shadow_ids[:, prompt_len:]].float()
+    assert not torch.allclose(gen_embeddings, expected_gen_embeddings, atol=1e-6), (
+        "Generated embeddings should differ from W[shadow_ids] (noise applied)"
+    )
 
 
 def test_soft_generator_logits_consistent_with_zero_prompt_noise(
     tiny_model: BaseTransformer,
 ):
-    """Verify that a forward pass with the generation output (3D one-hot prompt
-    + zero prompt noise) produces the same logits as a forward pass with 2D int
-    prompt tokens (no noise). This confirms the fix: the log-prob recomputation
-    path now matches what actually happened during generation.
+    """Verify that a forward pass with the prompt embeddings from generation
+    output produces the same logits as a forward pass with 2D int prompt
+    tokens. This confirms: the D-dim recomputation path matches what happened
+    during generation.
     """
     torch.manual_seed(42)
     model = tiny_model.eval()
@@ -822,20 +805,18 @@ def test_soft_generator_logits_consistent_with_zero_prompt_noise(
         logits_2d = model(x, return_all_logits=True)
         first_completion_logit_2d = logits_2d[:, -1:]
 
-        prompt_onehot = out.tokens[:, :prompt_len]
-        logits_3d = model(
-            prompt_onehot,
+        prompt_embeddings = out.embeddings[:, :prompt_len]
+        logits_d = model(
+            prompt_embeddings,
             return_all_logits=True,
-            soft_token_noise=out.noise[:, :prompt_len],
         )
-        first_completion_logit_3d = logits_3d[:, -1:]
+        first_completion_logit_d = logits_d[:, -1:]
 
     torch.testing.assert_close(
         first_completion_logit_2d,
-        first_completion_logit_3d,
+        first_completion_logit_d,
         msg="Logits at first completion position should match between 2D int "
-        "prompt (generation path) and 3D one-hot prompt with zero noise "
-        "(log-prob recomputation path)",
+        "prompt (generation path) and D-dim embeddings (recomputation path)",
     )
 
 
@@ -878,12 +859,16 @@ def test_soft_generate_with_switch_condition_and_attention_mask(
         min_soft_steps=0,
     )
 
-    assert out.tokens.ndim == 3
-    assert out.tokens.shape[0] == 2
-    assert out.tokens.shape[2] == vocab_size
+    assert out.embeddings.ndim == 3
+    assert out.embeddings.shape[0] == 2
+    assert out.embeddings.shape[2] == model.d
 
 
 def test_soft_generator_no_noise_without_std(tiny_model: BaseTransformer):
+    """Without noise_std, prompt embeddings should equal W[shadow_ids] and
+    generated soft embeddings should be mixture embeddings (softmax @ W),
+    which differ from W[argmax].
+    """
     torch.manual_seed(42)
     model = tiny_model.eval()
     vocab_size = model.vocab_size
@@ -899,4 +884,18 @@ def test_soft_generator_no_noise_without_std(tiny_model: BaseTransformer):
         use_kv_cache=True,
     )
 
-    assert out.noise is None
+    with torch.no_grad():
+        W = model.embed_tokens.weight
+        prompt_expected = W[out.shadow_ids[:, :prompt_len]].float()
+        torch.testing.assert_close(
+            out.embeddings[:, :prompt_len].float(),
+            prompt_expected,
+            msg="Prompt embeddings should equal W[shadow_ids]",
+        )
+
+        gen_expected = W[out.shadow_ids[:, prompt_len:]].float()
+        gen_actual = out.embeddings[:, prompt_len:].float()
+    assert not torch.allclose(gen_actual, gen_expected, atol=1e-6), (
+        "Soft generated embeddings are mixture embeddings (softmax @ W), "
+        "should differ from W[argmax]"
+    )

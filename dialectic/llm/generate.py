@@ -36,11 +36,10 @@ class HardTokenGeneratorOutput:
 
 @dataclass
 class SoftTokenGeneratorOutput:
-    tokens: Float[torch.Tensor, "B L V"]  # softmax
+    embeddings: Float[torch.Tensor, "B L D"]
+    shadow_ids: Int[torch.Tensor, "B L"]
     attention_mask: Bool[torch.Tensor, "B L"] | None
     hard_tokens_mask: Bool[torch.Tensor, "B L"]
-    embedding_weight: Float[torch.Tensor, "V D"]
-    noise: Float[torch.Tensor, "B L D"] | None
 
 
 def check_and_apply_prefill(
@@ -608,6 +607,9 @@ class _SoftGenerator(_BaseTokenGenerator):
             use_bf16=use_bf16,
         )
 
+        W = net.embed_tokens.weight
+        embeddings = self.all_tokens.float() @ W.float()
+
         if self.all_noise:
             noise = torch.cat(self.all_noise, dim=1)
             n_pad = self.all_tokens.shape[1] - noise.shape[1]
@@ -621,15 +623,15 @@ class _SoftGenerator(_BaseTokenGenerator):
                     ],
                     dim=1,
                 )
-        else:
-            noise = None
+            embeddings = embeddings + noise.float()
+
+        shadow_ids = self.all_tokens.argmax(-1)
 
         return SoftTokenGeneratorOutput(
-            tokens=self.all_tokens,
+            embeddings=embeddings,
+            shadow_ids=shadow_ids,
             attention_mask=self.attention_mask,
             hard_tokens_mask=self.hard_tokens_mask,
-            embedding_weight=net.embed_tokens.weight,
-            noise=noise,
         )
 
     @property

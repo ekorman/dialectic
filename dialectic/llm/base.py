@@ -50,7 +50,9 @@ class BaseTransformer(nn.Module):
 
     def forward(
         self,
-        x: Int[torch.Tensor, "B L"] | Float[torch.Tensor, "B L V"],
+        x: Int[torch.Tensor, "B L"]
+        | Float[torch.Tensor, "B L V"]
+        | Float[torch.Tensor, "B L D"],
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
@@ -59,10 +61,12 @@ class BaseTransformer(nn.Module):
     ):
         if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
-        else:
+        elif x.shape[-1] == self.vocab_size:
             x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
             if soft_token_noise is not None:
                 x += soft_token_noise
+        else:
+            pass  # D-dim embeddings (noise already folded in)
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)

@@ -51,13 +51,8 @@ class SoftRolloutBatch(Generic[T]):
     output_strs: list[list[str]]  # [G][B]
     reward_results: list[list[RewardResult]]  # [G][B]
     rewards: Float[torch.Tensor, "G B"]
-    completion_tokens: list[
-        Float[torch.Tensor, "B L V"]
-    ]  # len G, full seq (prompt+gen)
-    completion_action_embeddings: list[
-        Float[torch.Tensor, "B L D"]
-    ]  # len G, full seq (prompt+gen), from behavior net
-    completion_noise: list[Float[torch.Tensor, "B L D"]]  # len G
+    completion_embeddings: list[Float[torch.Tensor, "B L D"]]  # len G
+    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]]  # len G
     hard_tokens_mask: list[Bool[torch.Tensor, "B L"]]  # len G
     noise_std: float
     temperature: float
@@ -221,27 +216,21 @@ def generate_soft_rollout_batch(
     if was_training:
         net.train()
 
-    all_soft_tokens = gen_output.tokens.view(
-        batch_size, group_size, *gen_output.tokens.shape[1:]
+    all_embeddings = gen_output.embeddings.view(
+        batch_size, group_size, *gen_output.embeddings.shape[1:]
     )
-    all_soft_tokens = all_soft_tokens.permute(1, 0, 2, 3)
-    completion_tokens: list[Float[torch.Tensor, "B L V"]] = list(
-        all_soft_tokens.unbind(0)
+    all_embeddings = all_embeddings.permute(1, 0, 2, 3)
+    completion_embeddings: list[Float[torch.Tensor, "B L D"]] = list(
+        all_embeddings.unbind(0)
     )
 
-    noise = gen_output.noise
-    if noise is None:
-        raise RuntimeError("soft token generation did not produce noise")
-    all_noise = noise.view(batch_size, group_size, *noise.shape[1:])
-    all_noise = all_noise.permute(1, 0, 2, 3)
-    completion_noise: list[Float[torch.Tensor, "B L D"]] = list(all_noise.unbind(0))
-
-    # Action embeddings computed with behavior policy's embedding matrix.
-    behavior_W = net.embed_tokens.weight
-    completion_action_embeddings: list[Float[torch.Tensor, "B L D"]] = [
-        (c.float() @ behavior_W.float()) + n.float()
-        for c, n in zip(completion_tokens, completion_noise)
-    ]
+    all_shadow_ids = gen_output.shadow_ids.view(
+        batch_size, group_size, gen_output.shadow_ids.shape[1]
+    )
+    all_shadow_ids = all_shadow_ids.permute(1, 0, 2)
+    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]] = list(
+        all_shadow_ids.unbind(0)
+    )
 
     all_hard_masks = gen_output.hard_tokens_mask.view(
         batch_size, group_size, gen_output.hard_tokens_mask.shape[1]
@@ -253,8 +242,8 @@ def generate_soft_rollout_batch(
 
     prompt_len = token_ids.shape[1]
     output_strs: list[list[str]] = [
-        tokenizer.decode_batch(c[:, prompt_len:].argmax(-1).tolist())
-        for c in completion_tokens
+        tokenizer.decode_batch(s[:, prompt_len:].tolist())
+        for s in completion_shadow_ids
     ]
 
     reward_results: list[list[RewardResult]] = [
@@ -280,9 +269,8 @@ def generate_soft_rollout_batch(
         output_strs=output_strs,
         reward_results=reward_results,
         rewards=rewards,
-        completion_tokens=completion_tokens,
-        completion_action_embeddings=completion_action_embeddings,
-        completion_noise=completion_noise,
+        completion_embeddings=completion_embeddings,
+        completion_shadow_ids=completion_shadow_ids,
         hard_tokens_mask=hard_tokens_mask_list,
         noise_std=actual_noise_std,
         temperature=temperature if temperature > 0 else 1.0,

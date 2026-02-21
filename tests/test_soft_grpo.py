@@ -18,34 +18,34 @@ def countdown_state_to_str(data: Countdown) -> str:
 
 class TestStackAndPadSoft:
     def test_shapes_and_padding(self):
-        B, V, D = 2, 10, 4
+        B, D = 2, 4
         pad_token_id = 0
-        t1 = torch.randn(B, 5, V)
-        t2 = torch.randn(B, 3, V)
-        n1 = torch.randn(B, 5, D)
-        n2 = torch.randn(B, 3, D)
+        e1 = torch.randn(B, 5, D)
+        e2 = torch.randn(B, 3, D)
+        s1 = torch.randint(1, 10, (B, 5))
+        s2 = torch.randint(1, 10, (B, 3))
         m1 = torch.ones(B, 5, dtype=torch.bool)
         m2 = torch.zeros(B, 3, dtype=torch.bool)
 
-        st, sn, sm, npm = stack_and_pad_soft(
-            tokens=[t1, t2],
-            noise=[n1, n2],
+        se, ss, sm, npm = stack_and_pad_soft(
+            embeddings=[e1, e2],
+            shadow_ids=[s1, s2],
             hard_masks=[m1, m2],
             pad_token_id=pad_token_id,
         )
 
-        assert st.shape == (B, 2, 5, V)
-        assert sn.shape == (B, 2, 5, D)
+        assert se.shape == (B, 2, 5, D)
+        assert ss.shape == (B, 2, 5)
         assert sm.shape == (B, 2, 5)
         assert npm.shape == (B, 2, 5)
 
-        torch.testing.assert_close(st[:, 0, :5], t1)
-        torch.testing.assert_close(st[:, 1, :3], t2)
-        assert st[:, 1, 3:].argmax(-1).eq(pad_token_id).all()
+        torch.testing.assert_close(se[:, 0, :5], e1)
+        torch.testing.assert_close(se[:, 1, :3], e2)
+        assert se[:, 1, 3:].eq(0).all()
 
-        torch.testing.assert_close(sn[:, 0, :5], n1)
-        torch.testing.assert_close(sn[:, 1, :3], n2)
-        assert sn[:, 1, 3:].eq(0).all()
+        torch.testing.assert_close(ss[:, 0, :5], s1)
+        torch.testing.assert_close(ss[:, 1, :3], s2)
+        assert ss[:, 1, 3:].eq(pad_token_id).all()
 
         assert sm[:, 0, :5].all()
         assert not sm[:, 1, :3].any()
@@ -71,19 +71,23 @@ class TestComputeSoftLogProbs:
         temperature = 1.0
         pad_token_id = 0
 
-        prompt_ids = torch.randint(1, V, (B, prompt_len))
-        prompt_onehot = torch.nn.functional.one_hot(prompt_ids, V).float()
+        W = tiny_model.embed_tokens.weight
 
-        completion_tokens = []
-        completion_noise = []
+        completion_embeddings = []
+        completion_shadow_ids = []
         hard_masks = []
         for _ in range(G):
+            prompt_ids = torch.randint(1, V, (B, prompt_len))
             gen_soft = torch.randn(B, completion_len, V).softmax(-1)
-            full_tokens = torch.cat([prompt_onehot, gen_soft], dim=1)
-            completion_tokens.append(full_tokens)
+            full_shadow_ids = torch.cat([prompt_ids, gen_soft.argmax(-1)], dim=1)
 
-            full_noise = torch.randn(B, total_len, D) * noise_std
-            completion_noise.append(full_noise)
+            prompt_emb = W[prompt_ids].float()
+            gen_emb = (gen_soft.float() @ W.float()) + torch.randn(
+                B, completion_len, D
+            ) * noise_std
+            full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
+            completion_embeddings.append(full_embeddings)
+            completion_shadow_ids.append(full_shadow_ids)
 
             mask = torch.ones(B, total_len, dtype=torch.bool)
             mask[:, prompt_len:] = False
@@ -95,8 +99,8 @@ class TestComputeSoftLogProbs:
             lp_full, mask_full = compute_soft_log_probs(
                 net=tiny_model,
                 attention_mask=attention_mask,
-                completion_tokens=completion_tokens,
-                completion_noise=completion_noise,
+                completion_embeddings=completion_embeddings,
+                completion_shadow_ids=completion_shadow_ids,
                 hard_tokens_mask=hard_masks,
                 noise_std=noise_std,
                 temperature=temperature,
@@ -107,8 +111,8 @@ class TestComputeSoftLogProbs:
             lp_chunked, mask_chunked = compute_soft_log_probs(
                 net=tiny_model,
                 attention_mask=attention_mask,
-                completion_tokens=completion_tokens,
-                completion_noise=completion_noise,
+                completion_embeddings=completion_embeddings,
+                completion_shadow_ids=completion_shadow_ids,
                 hard_tokens_mask=hard_masks,
                 noise_std=noise_std,
                 temperature=temperature,
@@ -134,13 +138,15 @@ class TestComputeSoftLogProbs:
         noise_std = 0.1
         pad_token_id = 0
 
-        prompt_ids = torch.randint(1, V, (B, prompt_len))
-        prompt_onehot = torch.nn.functional.one_hot(prompt_ids, V).float()
+        W = tiny_model.embed_tokens.weight
 
+        prompt_ids = torch.randint(1, V, (B, prompt_len))
         gen_ids = torch.randint(1, V, (B, completion_len))
-        gen_onehot = torch.nn.functional.one_hot(gen_ids, V).float()
-        full_tokens = torch.cat([prompt_onehot, gen_onehot], dim=1)
-        full_noise = torch.randn(B, total_len, D) * noise_std
+        full_shadow_ids = torch.cat([prompt_ids, gen_ids], dim=1)
+
+        prompt_emb = W[prompt_ids].float()
+        gen_emb = W[gen_ids].float() + torch.randn(B, completion_len, D) * noise_std
+        full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
 
         all_hard_mask = torch.ones(B, total_len, dtype=torch.bool)
         attention_mask = torch.ones(B, prompt_len, dtype=torch.bool)
@@ -149,8 +155,8 @@ class TestComputeSoftLogProbs:
             lp, _ = compute_soft_log_probs(
                 net=tiny_model,
                 attention_mask=attention_mask,
-                completion_tokens=[full_tokens],
-                completion_noise=[full_noise],
+                completion_embeddings=[full_embeddings],
+                completion_shadow_ids=[full_shadow_ids],
                 hard_tokens_mask=[all_hard_mask],
                 noise_std=noise_std,
                 temperature=1.0,
@@ -174,12 +180,16 @@ class TestComputeSoftLogProbs:
         noise_std = 0.1
         pad_token_id = 0
 
-        prompt_ids = torch.randint(1, V, (B, prompt_len))
-        prompt_onehot = torch.nn.functional.one_hot(prompt_ids, V).float()
+        W = tiny_model.embed_tokens.weight
 
+        prompt_ids = torch.randint(1, V, (B, prompt_len))
         gen_soft = torch.randn(B, completion_len, V).softmax(-1)
-        full_tokens = torch.cat([prompt_onehot, gen_soft], dim=1)
-        full_noise = torch.randn(B, total_len, D) * noise_std
+        full_shadow_ids = torch.cat([prompt_ids, gen_soft.argmax(-1)], dim=1)
+
+        noise = torch.randn(B, completion_len, D) * noise_std
+        prompt_emb = W[prompt_ids].float()
+        gen_emb = (gen_soft.float() @ W.float()) + noise.float()
+        full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
 
         all_soft_mask = torch.zeros(B, total_len, dtype=torch.bool)
         all_soft_mask[:, :prompt_len] = True
@@ -189,8 +199,8 @@ class TestComputeSoftLogProbs:
             lp, _ = compute_soft_log_probs(
                 net=tiny_model,
                 attention_mask=attention_mask,
-                completion_tokens=[full_tokens],
-                completion_noise=[full_noise],
+                completion_embeddings=[full_embeddings],
+                completion_shadow_ids=[full_shadow_ids],
                 hard_tokens_mask=[all_soft_mask],
                 noise_std=noise_std,
                 temperature=1.0,
@@ -201,23 +211,19 @@ class TestComputeSoftLogProbs:
         assert lp.shape == (B, G, completion_len)
 
         with torch.no_grad():
-            W = tiny_model.embed_tokens.weight
-            stacked = full_tokens.unsqueeze(1)  # [B, 1, L, V]
-            flat = stacked.view(B, total_len, V)
-            noise_flat = full_noise.unsqueeze(1).view(B, total_len, D)
+            stacked_emb = full_embeddings.unsqueeze(1)
+            flat = stacked_emb.view(B, total_len, D)
             full_attn_mask = torch.ones(B, total_len, dtype=torch.bool)
             full_attn_mask[:, :prompt_len] = attention_mask
             logits = tiny_model(
                 flat,
                 return_all_logits=True,
                 attention_mask=full_attn_mask,
-                soft_token_noise=noise_flat,
             )
             logits_comp = logits[:, prompt_len - 1 : -1]
-            comp_tokens = flat[:, prompt_len:]
-            comp_noise = noise_flat[:, prompt_len:]
-            e_action = comp_tokens @ W + comp_noise
-            mu_new = torch.softmax(logits_comp / 1.0, dim=-1) @ W
+            comp_embeddings = flat[:, prompt_len:]
+            e_action = comp_embeddings.float()
+            mu_new = torch.softmax(logits_comp / 1.0, dim=-1) @ W.float()
             expected = -0.5 * ((e_action - mu_new) ** 2).mean(-1) / (noise_std**2)
             expected = expected.view(B, G, completion_len)
 
@@ -235,12 +241,16 @@ class TestComputeSoftLogProbs:
         noise_std = 0.1
         pad_token_id = 0
 
-        prompt_ids = torch.randint(1, V, (B, prompt_len))
-        prompt_onehot = torch.nn.functional.one_hot(prompt_ids, V).float()
+        W = tiny_model.embed_tokens.weight
 
+        prompt_ids = torch.randint(1, V, (B, prompt_len))
         gen_soft = torch.randn(B, completion_len, V).softmax(-1)
-        full_tokens = torch.cat([prompt_onehot, gen_soft], dim=1)
-        full_noise = torch.randn(B, total_len, D) * noise_std
+        full_shadow_ids = torch.cat([prompt_ids, gen_soft.argmax(-1)], dim=1)
+
+        noise = torch.randn(B, completion_len, D) * noise_std
+        prompt_emb = W[prompt_ids].float().detach()
+        gen_emb = (gen_soft.float() @ W.float()).detach() + noise.float()
+        full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
 
         mask = torch.zeros(B, total_len, dtype=torch.bool)
         mask[:, :prompt_len] = True
@@ -249,8 +259,8 @@ class TestComputeSoftLogProbs:
         lp, _ = compute_soft_log_probs(
             net=tiny_model,
             attention_mask=attention_mask,
-            completion_tokens=[full_tokens],
-            completion_noise=[full_noise],
+            completion_embeddings=[full_embeddings],
+            completion_shadow_ids=[full_shadow_ids],
             hard_tokens_mask=[mask],
             noise_std=noise_std,
             temperature=1.0,
@@ -317,9 +327,7 @@ class TestTrainSoftGrpo:
             if not raw_model_output:
                 value = 0.0
             else:
-                # Use a reward that's unlikely to tie across group samples.
                 value = sum(ord(c) for c in raw_model_output) / 10000.0
-            # Deterministic jitter to prevent identical rewards within a group.
             value += torch.rand((), generator=rng).item() * 1e-3
             return RewardResult(total=value, components={"length": value})
 
