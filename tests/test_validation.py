@@ -126,6 +126,27 @@ class TestRunValidation:
         for param in tiny_model.parameters():
             assert param.grad is None
 
+    def test_same_problems_across_validation_steps(self):
+        """Reusing the same env for validation at different training steps
+        should evaluate on the same problems each time."""
+        env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
+        n_episodes = 4
+
+        env.reseed()
+        run1 = [
+            (r.data.numbers, r.data.target)
+            for r in [env.reset() for _ in range(n_episodes)]
+        ]
+        env.reseed()
+        run2 = [
+            (r.data.numbers, r.data.target)
+            for r in [env.reset() for _ in range(n_episodes)]
+        ]
+
+        assert run1 == run2, (
+            "Validation environment produced different problems across runs"
+        )
+
     def test_examples_have_rewards(self, tiny_model, tokenizer):
         env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
         val_config = self._make_val_config(tokenizer, [env])

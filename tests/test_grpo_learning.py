@@ -319,6 +319,9 @@ class TestGRPOMechanics:
                 self._responses = responses
                 self._idx = 0
 
+            def reseed(self) -> None:
+                self._idx = 0
+
             def reset(self, seed: int | None = None) -> EnvResponse[Countdown]:
                 if self._idx >= len(self._responses):
                     raise RuntimeError("Exceeded fixed environment responses")

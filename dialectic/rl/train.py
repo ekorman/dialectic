@@ -59,6 +59,7 @@ def run_validation(
     net.eval()
 
     for env in val_config.envs:
+        env.reseed()
         label = str(env)
         result, examples = evaluate(
             net=net,
