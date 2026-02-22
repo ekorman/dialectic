@@ -20,6 +20,7 @@ from dialectic.llm.qwen import (
     create_qwen,
     create_qwen_decoder_layer,
     load_qwen3_06b,
+    load_qwen3_4b,
     load_qwen3_17b,
 )
 from dialectic.llm.templates import Message
@@ -605,4 +606,34 @@ Two cities in Japan are **Tokyo** and **Osaka**.
 
 - **Tokyo** is the capital and the most populous city in Japan, known for its advanced technology, culture, and iconic landmarks like the Tokyo Tower and Shibuya.
 - **Osaka** is a major metropolitan area in the Kansai region, famous for its vibrant food scene, historic sites like Osaka Castle, and bustling urban life."""
+    )
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_qwen17b_model_generation` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_qwen4b_model_generation():
+    model = load_qwen3_4b(True).eval()
+    tokenizer: Tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-4B")
+    messages = [Message(role="user", content="Name two cities in Japan")]
+
+    resp = qwen_generate_from_chat(
+        model,
+        tokenizer,
+        [messages],
+        sampling_strategy="greedy",
+        enable_thinking=True,
+    )
+
+    assert (
+        resp[0]
+        == """user
+Name two cities in Japan
+assistant
+<think>
+Okay, the user is asking for two cities in Japan. Let me think. Japan has a lot of cities, so I need to pick the most well-known ones. Tokyo is definitely the capital and the largest city, so that's a good first choice. Then, Osaka comes to mind because it's another major city in the Kansai region. But wait, maybe I should consider other popular cities too. Kyoto is a major city with a lot of historical significance. However, the user just needs two, so Tokyo and Osaka are sufficient. Alternatively, maybe Tokyo and Kyoto? But Osaka is also a big city. Let me confirm the rankings. Tokyo is the largest, followed by Osaka, then Kyoto. So either pair would work. I should go with Tokyo and Osaka as they are both major and well-known. Alternatively, maybe Tokyo and Yokohama? But Yokohama is a major city too. Wait, the user didn't specify any particular criteria, so any two major cities would be acceptable. I think Tokyo and Osaka are the safest choices.
+</think>
+
+Two well-known cities in Japan are **Tokyo** (the capital and largest city) and **Osaka** (a major metropolitan area in the Kansai region). Both are iconic examples of Japan's cultural, economic, and historical significance."""
     )
