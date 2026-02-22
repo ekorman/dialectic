@@ -543,8 +543,10 @@ def _grpo_train_loop(
         total_loss = 0.0
         total_main_loss = 0.0
         total_kl_loss = 0.0 if beta != 0 else None
+        grad_norm_val: float | None = None
 
-        for _ in range(mu):
+        logprob_recompute_max_diffs: list[float] = []
+        for mu_idx in range(mu):
             opt.zero_grad()
 
             for accum_idx, micro_batch in enumerate(micro_batches):
@@ -557,6 +559,14 @@ def _grpo_train_loop(
                     device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
                 ):
                     log_probs, _ = recompute_log_probs_fn(net, micro_batch)
+
+                if mu_idx == 0 and "diag_log_probs" in micro_batch:
+                    mask = micro_batch["completion_mask"]
+                    if mask.any():
+                        lp_diff = (
+                            log_probs.detach() - micro_batch["diag_log_probs"]
+                        ).abs()
+                        logprob_recompute_max_diffs.append(lp_diff[mask].max().item())
 
                 loss, main_loss, kl_loss = compute_grpo_loss(
                     log_probs=log_probs,
@@ -577,9 +587,12 @@ def _grpo_train_loop(
                 if kl_loss is not None:
                     total_kl_loss += kl_loss / accumulation_steps
 
+            grad_norm_val = None
             if max_grad_norm > 0:
                 params = [p for group in opt.param_groups for p in group["params"]]
-                torch.nn.utils.clip_grad_norm_(params, max_norm=max_grad_norm)
+                grad_norm_val = torch.nn.utils.clip_grad_norm_(
+                    params, max_norm=max_grad_norm
+                ).item()
             opt.step()
 
         t_opt = time.perf_counter() - t_opt_start
@@ -663,28 +676,16 @@ def _grpo_train_loop(
                             mb["soft_lp_std"] for mb in micro_batches
                         )
                         / len(micro_batches),
-                        "train/hard_entropy_mean": sum(
-                            mb["hard_ent_mean"] for mb in micro_batches
+                        "train/gaussian_dist_mean": sum(
+                            mb["gaussian_dist_mean"] for mb in micro_batches
                         )
                         / len(micro_batches),
-                        "train/hard_entropy_std": sum(
-                            mb["hard_ent_std"] for mb in micro_batches
+                        "train/soft_tokens_per_seq": sum(
+                            mb["soft_tokens_per_seq"] for mb in micro_batches
                         )
                         / len(micro_batches),
-                        "train/soft_entropy_mean": sum(
-                            mb["soft_ent_mean"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/soft_entropy_std": sum(
-                            mb["soft_ent_std"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/entropy_mean": sum(
-                            mb["entropy_mean"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/entropy_std": sum(
-                            mb["entropy_std"] for mb in micro_batches
+                        "train/hard_tokens_per_seq": sum(
+                            mb["hard_tokens_per_seq"] for mb in micro_batches
                         )
                         / len(micro_batches),
                     }
@@ -698,6 +699,12 @@ def _grpo_train_loop(
             }
             if total_kl_loss is not None:
                 metrics["train/kl_loss"] = total_kl_loss / mu
+            if grad_norm_val is not None:
+                metrics["train/grad_norm"] = grad_norm_val
+            if logprob_recompute_max_diffs:
+                metrics["train/logprob_recompute_max_diff"] = max(
+                    logprob_recompute_max_diffs
+                )
             extty.log(metrics, step=step)
 
             if step % save_ckpt_freq == 0:
@@ -1063,28 +1070,19 @@ def collect_soft_micro_batch(
             )
         else:
             ref_log_probs = None
-        if collect_old_log_probs:
-            old_log_probs, completion_mask = compute_soft_log_probs(
-                net=net,
-                attention_mask=rollout.attention_mask,
-                completion_embeddings=rollout.completion_embeddings,
-                completion_shadow_ids=rollout.completion_shadow_ids,
-                hard_tokens_mask=rollout.hard_tokens_mask,
-                noise_std=rollout.noise_std,
-                temperature=rollout.temperature,
-                pad_token_id=pad_token_id,
-                chunk_size=logprob_chunk_size,
-                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-            )
-        else:
-            old_log_probs = None
-            completion_mask = get_completion_mask_soft(
-                attention_mask=rollout.attention_mask,
-                completion_embeddings=rollout.completion_embeddings,
-                completion_shadow_ids=rollout.completion_shadow_ids,
-                hard_tokens_mask=rollout.hard_tokens_mask,
-                pad_token_id=pad_token_id,
-            )
+        diag_log_probs, completion_mask = compute_soft_log_probs(
+            net=net,
+            attention_mask=rollout.attention_mask,
+            completion_embeddings=rollout.completion_embeddings,
+            completion_shadow_ids=rollout.completion_shadow_ids,
+            hard_tokens_mask=rollout.hard_tokens_mask,
+            noise_std=rollout.noise_std,
+            temperature=rollout.temperature,
+            pad_token_id=pad_token_id,
+            chunk_size=logprob_chunk_size,
+            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+        )
+        old_log_probs = diag_log_probs if collect_old_log_probs else None
     t_logprobs = time.perf_counter() - t_logprobs_start
 
     # Soft-token debug stats (cheap): fraction of completion tokens that are hard,
@@ -1114,6 +1112,30 @@ def collect_soft_micro_batch(
         / completion_mask.sum().float().clamp_min(1.0)
     ).item()
 
+    hard_pos_mask = hard_completion_mask & completion_mask
+    soft_pos_mask = ~hard_completion_mask & completion_mask
+
+    if hard_pos_mask.any():
+        hard_lp_vals = diag_log_probs[hard_pos_mask]
+        hard_lp_mean = hard_lp_vals.mean().item()
+        hard_lp_std = hard_lp_vals.std().item()
+    else:
+        hard_lp_mean = hard_lp_std = 0.0
+
+    if soft_pos_mask.any():
+        soft_lp_vals = diag_log_probs[soft_pos_mask]
+        soft_lp_mean = soft_lp_vals.mean().item()
+        soft_lp_std = soft_lp_vals.std().item()
+        if normalize_soft_pdf_by_dim:
+            gaussian_dist_mean = (-2.0 * soft_lp_vals).mean().item()
+        else:
+            gaussian_dist_mean = (-2.0 * soft_lp_vals / net.d).mean().item()
+    else:
+        soft_lp_mean = soft_lp_std = gaussian_dist_mean = 0.0
+
+    soft_tokens_per_seq = soft_pos_mask.sum(dim=-1).float().mean().item()
+    hard_tokens_per_seq = hard_pos_mask.sum(dim=-1).float().mean().item()
+
     return {
         "prompts": rollout.prompts,
         "env_responses": rollout.env_responses,
@@ -1128,8 +1150,16 @@ def collect_soft_micro_batch(
         "rewards": rollout.rewards,
         "ref_log_probs": ref_log_probs,
         "old_log_probs": old_log_probs,
+        "diag_log_probs": diag_log_probs,
         "completion_mask": completion_mask,
         "hard_completion_ratio": hard_completion_ratio,
+        "hard_lp_mean": hard_lp_mean,
+        "hard_lp_std": hard_lp_std,
+        "soft_lp_mean": soft_lp_mean,
+        "soft_lp_std": soft_lp_std,
+        "gaussian_dist_mean": gaussian_dist_mean,
+        "soft_tokens_per_seq": soft_tokens_per_seq,
+        "hard_tokens_per_seq": hard_tokens_per_seq,
         "t_gen": rollout.t_generation,
         "t_logprobs": t_logprobs,
     }
