@@ -127,6 +127,77 @@ class TestComputeSoftLogProbs:
         torch.testing.assert_close(lp_full, lp_chunked, atol=1e-4, rtol=1e-4)
         assert torch.equal(mask_full, mask_chunked)
 
+    def test_sub_group_matches_full(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.eval()
+
+        B, G = 2, 4
+        prompt_len = 6
+        completion_len = 8
+        total_len = prompt_len + completion_len
+        V = tiny_model.vocab_size
+        D = tiny_model.d
+        noise_std = 0.1
+        temperature = 1.0
+        pad_token_id = 0
+
+        W = tiny_model.embed_tokens.weight
+
+        completion_embeddings = []
+        completion_shadow_ids = []
+        hard_masks = []
+        for _ in range(G):
+            prompt_ids = torch.randint(1, V, (B, prompt_len))
+            gen_soft = torch.randn(B, completion_len, V).softmax(-1)
+            full_shadow_ids = torch.cat([prompt_ids, gen_soft.argmax(-1)], dim=1)
+
+            prompt_emb = W[prompt_ids].float()
+            gen_emb = (gen_soft.float() @ W.float()) + torch.randn(
+                B, completion_len, D
+            ) * noise_std
+            full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
+            completion_embeddings.append(full_embeddings)
+            completion_shadow_ids.append(full_shadow_ids)
+
+            mask = torch.ones(B, total_len, dtype=torch.bool)
+            mask[:, prompt_len:] = False
+            hard_masks.append(mask)
+
+        attention_mask = torch.ones(B, prompt_len, dtype=torch.bool)
+
+        with torch.no_grad():
+            lp_full, mask_full = compute_soft_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_embeddings=completion_embeddings,
+                completion_shadow_ids=completion_shadow_ids,
+                hard_tokens_mask=hard_masks,
+                noise_std=noise_std,
+                temperature=temperature,
+                pad_token_id=pad_token_id,
+                chunk_size=0,
+                normalize_soft_pdf_by_dim=True,
+            )
+
+            lp_sub, mask_sub = compute_soft_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_embeddings=completion_embeddings,
+                completion_shadow_ids=completion_shadow_ids,
+                hard_tokens_mask=hard_masks,
+                noise_std=noise_std,
+                temperature=temperature,
+                pad_token_id=pad_token_id,
+                chunk_size=0,
+                normalize_soft_pdf_by_dim=True,
+                max_sub_group_size=2,
+            )
+
+        assert lp_full.shape == (B, G, completion_len)
+        assert lp_full.shape == lp_sub.shape
+        torch.testing.assert_close(lp_full, lp_sub, atol=1e-4, rtol=1e-4)
+        assert torch.equal(mask_full, mask_sub)
+
     def test_hard_positions_get_cross_entropy(self, tiny_model):
         torch.manual_seed(42)
         tiny_model.eval()
@@ -376,3 +447,73 @@ class TestTrainSoftGrpo:
                 break
 
         assert params_changed, "No parameters changed during training"
+
+    def test_sub_group_generation(self, tiny_model, tokenizer):
+        env = CountdownEnv(seed=42)
+        opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+
+        train_soft_grpo(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            reward_fn=weighted_reward([("correct", 1.0, countdown_correct)]),
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151643,
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            beta=0.01,
+            eps=None,
+            mu=1,
+            max_tokens_generated=20,
+            max_episodes=4,
+            update_ref_net_batch_cadence=5,
+            batch_size=2,
+            group_size=4,
+            temperature=1.0,
+            noise_std=0.1,
+            use_bf16=False,
+            advantage_fn=grpo_advantage,
+            normalize_by_sequence_length=True,
+            normalize_soft_pdf_by_dim=False,
+            max_sub_group_size=2,
+        )
+
+    def test_sub_group_rollout_shapes(self, tiny_model, tokenizer):
+        from dialectic.rl.rollout import generate_soft_rollout_batch
+
+        env = CountdownEnv(seed=42)
+        reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
+
+        torch.manual_seed(99)
+        rollout = generate_soft_rollout_batch(
+            net=tiny_model,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=countdown_state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=151643,
+            pad_token_id=151643,
+            extractor=extract_from_answer_tags,
+            batch_size=2,
+            group_size=4,
+            temperature=1.0,
+            max_tokens_generated=20,
+            noise_std=0.1,
+            max_sub_group_size=2,
+        )
+
+        assert len(rollout.completion_embeddings) == 4
+        assert len(rollout.completion_shadow_ids) == 4
+        assert len(rollout.hard_tokens_mask) == 4
+        assert len(rollout.output_strs) == 4
+        assert len(rollout.reward_results) == 4
+        assert rollout.rewards.shape[0] == 4
+        assert rollout.rewards.shape[1] == 2
+        for g in range(4):
+            B = rollout.completion_embeddings[g].shape[0]
+            assert B == 2
+            assert rollout.completion_shadow_ids[g].shape[0] == 2
+            assert rollout.hard_tokens_mask[g].shape[0] == 2
+            assert len(rollout.output_strs[g]) == 2
+            assert len(rollout.reward_results[g]) == 2

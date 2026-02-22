@@ -247,6 +247,7 @@ def train(
     val_freq: int = 0,
     val_episodes: int = 50,
     val_batch_size: int = 4,
+    max_sub_group_size: int | None = None,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -369,6 +370,7 @@ def train(
                 val_config=val_config,
                 val_freq=val_freq,
                 normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+                max_sub_group_size=max_sub_group_size,
             )
         else:
             train_grpo(
@@ -635,6 +637,12 @@ def main():
         default=4,
         help="Batch size for validation",
     )
+    parser.add_argument(
+        "--max-sub-group-size",
+        type=int,
+        default=None,
+        help="Max sub-group size for generation (splits group into smaller batches to save memory)",
+    )
 
     args = parser.parse_args()
 
@@ -678,6 +686,7 @@ def main():
         val_episodes=args.val_episodes,
         val_batch_size=args.val_batch_size,
         normalize_soft_pdf_by_dim=args.normalize_soft_pdf_by_dim,
+        max_sub_group_size=args.max_sub_group_size,
     )
 
 

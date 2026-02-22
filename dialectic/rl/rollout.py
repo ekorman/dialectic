@@ -174,6 +174,7 @@ def generate_soft_rollout_batch(
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
     use_bf16: bool = False,
+    max_sub_group_size: int | None = None,
 ) -> SoftRolloutBatch[T]:
     actual_noise_std = noise_std * _embedding_rms_norm(net)
 
@@ -188,57 +189,56 @@ def generate_soft_rollout_batch(
     )
     token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
-    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
-
     was_training = net.training
     net.eval()
     t_gen_start = time.perf_counter()
 
-    gen_output = generate_soft_tokens(
-        net=net,
-        token_ids=expanded_token_ids,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-        attention_mask=expanded_attention_mask,
-        temperature=temperature if temperature > 0 else 1.0,
-        use_bf16=use_bf16,
-        switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
-        max_tokens_prefill=max_tokens_prefill,
-        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
-        prefill=prefill,
-        soft_token_noise_std=actual_noise_std,
-        min_soft_steps=min_soft_steps,
-    )
+    sub_g = max_sub_group_size or group_size
+    completion_embeddings: list[Float[torch.Tensor, "B L D"]] = []
+    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]] = []
+    hard_tokens_mask_list: list[Bool[torch.Tensor, "B L"]] = []
+
+    for g_start in range(0, group_size, sub_g):
+        cur_sub_g = min(sub_g, group_size - g_start)
+        sub_token_ids = token_ids.repeat_interleave(cur_sub_g, dim=0)
+        sub_attention_mask = attention_mask.repeat_interleave(cur_sub_g, dim=0)
+
+        sub_output = generate_soft_tokens(
+            net=net,
+            token_ids=sub_token_ids,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            max_tokens_generated=max_tokens_generated,
+            use_kv_cache=True,
+            attention_mask=sub_attention_mask,
+            temperature=temperature if temperature > 0 else 1.0,
+            use_bf16=use_bf16,
+            switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
+            max_tokens_prefill=max_tokens_prefill,
+            max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
+            prefill=prefill,
+            soft_token_noise_std=actual_noise_std,
+            min_soft_steps=min_soft_steps,
+        )
+
+        sub_emb = sub_output.embeddings.view(
+            batch_size, cur_sub_g, *sub_output.embeddings.shape[1:]
+        ).permute(1, 0, 2, 3)
+        completion_embeddings.extend(sub_emb.unbind(0))
+
+        sub_sid = sub_output.shadow_ids.view(
+            batch_size, cur_sub_g, sub_output.shadow_ids.shape[1]
+        ).permute(1, 0, 2)
+        completion_shadow_ids.extend(sub_sid.unbind(0))
+
+        sub_hm = sub_output.hard_tokens_mask.view(
+            batch_size, cur_sub_g, sub_output.hard_tokens_mask.shape[1]
+        ).permute(1, 0, 2)
+        hard_tokens_mask_list.extend(sub_hm.unbind(0))
+
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
         net.train()
-
-    all_embeddings = gen_output.embeddings.view(
-        batch_size, group_size, *gen_output.embeddings.shape[1:]
-    )
-    all_embeddings = all_embeddings.permute(1, 0, 2, 3)
-    completion_embeddings: list[Float[torch.Tensor, "B L D"]] = list(
-        all_embeddings.unbind(0)
-    )
-
-    all_shadow_ids = gen_output.shadow_ids.view(
-        batch_size, group_size, gen_output.shadow_ids.shape[1]
-    )
-    all_shadow_ids = all_shadow_ids.permute(1, 0, 2)
-    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]] = list(
-        all_shadow_ids.unbind(0)
-    )
-
-    all_hard_masks = gen_output.hard_tokens_mask.view(
-        batch_size, group_size, gen_output.hard_tokens_mask.shape[1]
-    )
-    all_hard_masks = all_hard_masks.permute(1, 0, 2)
-    hard_tokens_mask_list: list[Bool[torch.Tensor, "B L"]] = list(
-        all_hard_masks.unbind(0)
-    )
 
     prompt_len = token_ids.shape[1]
     output_strs: list[list[str]] = [

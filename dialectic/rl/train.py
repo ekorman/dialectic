@@ -872,7 +872,42 @@ def compute_soft_log_probs(
     pad_token_id: int,
     normalize_soft_pdf_by_dim: bool,
     chunk_size: int = 0,
+    max_sub_group_size: int | None = None,
 ) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
+    G = len(completion_embeddings)
+    sub_g = max_sub_group_size or G
+
+    if sub_g < G:
+        all_log_probs = []
+        all_masks = []
+        for g_start in range(0, G, sub_g):
+            g_end = min(g_start + sub_g, G)
+            sub_lp, sub_mask = compute_soft_log_probs(
+                net=net,
+                attention_mask=attention_mask,
+                completion_embeddings=completion_embeddings[g_start:g_end],
+                completion_shadow_ids=completion_shadow_ids[g_start:g_end],
+                hard_tokens_mask=hard_tokens_mask[g_start:g_end],
+                noise_std=noise_std,
+                temperature=temperature,
+                pad_token_id=pad_token_id,
+                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+                chunk_size=chunk_size,
+            )
+            all_log_probs.append(sub_lp)
+            all_masks.append(sub_mask)
+        max_lc = max(lp.shape[2] for lp in all_log_probs)
+        padded_lps = []
+        padded_masks = []
+        for lp, m in zip(all_log_probs, all_masks):
+            if lp.shape[2] < max_lc:
+                pad_len = max_lc - lp.shape[2]
+                lp = torch.nn.functional.pad(lp, (0, pad_len), value=0.0)
+                m = torch.nn.functional.pad(m, (0, pad_len), value=False)
+            padded_lps.append(lp)
+            padded_masks.append(m)
+        return torch.cat(padded_lps, dim=1), torch.cat(padded_masks, dim=1)
+
     l_prompt = attention_mask.shape[1]
     stacked_embeddings, stacked_shadow_ids, stacked_masks, non_pad_mask = (
         stack_and_pad_soft(
@@ -1028,6 +1063,7 @@ def collect_soft_micro_batch(
     prefill: PreFill | None = None,
     logprob_chunk_size: int = 0,
     use_bf16: bool = False,
+    max_sub_group_size: int | None = None,
 ) -> dict:
     rollout = generate_soft_rollout_batch(
         net=net,
@@ -1049,6 +1085,7 @@ def collect_soft_micro_batch(
         min_soft_steps=min_soft_steps,
         prefill=prefill,
         use_bf16=use_bf16,
+        max_sub_group_size=max_sub_group_size,
     )
 
     device = next(net.parameters()).device
@@ -1068,6 +1105,7 @@ def collect_soft_micro_batch(
                 pad_token_id=pad_token_id,
                 chunk_size=logprob_chunk_size,
                 normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+                max_sub_group_size=max_sub_group_size,
             )
         else:
             ref_log_probs = None
@@ -1082,6 +1120,7 @@ def collect_soft_micro_batch(
             pad_token_id=pad_token_id,
             chunk_size=logprob_chunk_size,
             normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+            max_sub_group_size=max_sub_group_size,
         )
         old_log_probs = diag_log_probs if collect_old_log_probs else None
     t_logprobs = time.perf_counter() - t_logprobs_start
@@ -1202,6 +1241,7 @@ def train_soft_grpo(
     save_ckpt_freq: int = sys.maxsize,
     val_config: ValidationConfig | None = None,
     val_freq: int = 0,
+    max_sub_group_size: int | None = None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -1233,6 +1273,7 @@ def train_soft_grpo(
             logprob_chunk_size=logprob_chunk_size,
             use_bf16=use_bf16,
             normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+            max_sub_group_size=max_sub_group_size,
         )
 
     def recompute_fn(
@@ -1249,6 +1290,7 @@ def train_soft_grpo(
             pad_token_id=pad_token_id,
             chunk_size=logprob_chunk_size,
             normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+            max_sub_group_size=max_sub_group_size,
         )
 
     _grpo_train_loop(
