@@ -76,6 +76,7 @@ def run_validation(
             group_size=1,
             temperature=0.0,
             use_bf16=val_config.use_bf16,
+            n_examples=val_config.max_episodes,
         )
 
         metrics[f"val/{label}/reward_mean"] = result.reward_mean
