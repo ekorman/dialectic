@@ -249,7 +249,7 @@ def _compute_log_probs_chunked(
 
         BG, L_chunk, V = chunk_logits.shape
         chunk_log_probs = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG * L_chunk, V),
+            chunk_logits.reshape(BG * L_chunk, V).float(),
             chunk_targets.reshape(BG * L_chunk),
             reduction="none",
         ).reshape(BG, L_chunk)
@@ -974,7 +974,7 @@ def _compute_soft_log_probs_chunked(
         BG_c, L_chunk, _ = chunk_logits.shape
 
         hard_lp = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG_c * L_chunk, V),
+            chunk_logits.reshape(BG_c * L_chunk, V).float(),
             chunk_shadow_ids.reshape(BG_c * L_chunk),
             reduction="none",
         ).reshape(BG_c, L_chunk)
