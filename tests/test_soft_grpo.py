@@ -4,6 +4,7 @@ from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import countdown_correct, weighted_reward
 from dialectic.rl.train import (
+    compute_grpo_loss,
     compute_soft_log_probs,
     grpo_advantage,
     stack_and_pad_soft,
@@ -478,6 +479,115 @@ class TestTrainSoftGrpo:
             normalize_soft_pdf_by_dim=False,
             max_sub_group_size=2,
         )
+
+    def test_sub_group_backward_gradient_equivalence(self, tiny_model):
+        tiny_model.train()
+        torch.manual_seed(42)
+
+        B, G = 1, 4
+        prompt_len = 4
+        completion_len = 6
+        total_len = prompt_len + completion_len
+        V = tiny_model.vocab_size
+        D = tiny_model.d
+        noise_std = 0.1
+        pad_token_id = 0
+
+        W = tiny_model.embed_tokens.weight
+
+        completion_embeddings = []
+        completion_shadow_ids = []
+        hard_masks = []
+        for _ in range(G):
+            prompt_ids = torch.randint(1, V, (B, prompt_len))
+            gen_soft = torch.randn(B, completion_len, V).softmax(-1)
+            full_shadow_ids = torch.cat([prompt_ids, gen_soft.argmax(-1)], dim=1)
+            prompt_emb = W[prompt_ids].float().detach()
+            gen_emb = (gen_soft.float() @ W.float()).detach() + torch.randn(
+                B, completion_len, D
+            ) * noise_std
+            full_embeddings = torch.cat([prompt_emb, gen_emb], dim=1)
+            completion_embeddings.append(full_embeddings)
+            completion_shadow_ids.append(full_shadow_ids)
+            mask = torch.zeros(B, total_len, dtype=torch.bool)
+            mask[:, :prompt_len] = True
+            hard_masks.append(mask)
+
+        attention_mask = torch.ones(B, prompt_len, dtype=torch.bool)
+        rewards = torch.randn(G, B)
+        advs = grpo_advantage(rewards)
+        advs_for_loss = advs.T.unsqueeze(-1)
+
+        tiny_model.zero_grad()
+        lp_full, mask_full = compute_soft_log_probs(
+            net=tiny_model,
+            attention_mask=attention_mask,
+            completion_embeddings=completion_embeddings,
+            completion_shadow_ids=completion_shadow_ids,
+            hard_tokens_mask=hard_masks,
+            noise_std=noise_std,
+            temperature=1.0,
+            pad_token_id=pad_token_id,
+            chunk_size=0,
+            normalize_soft_pdf_by_dim=False,
+        )
+        loss_full, _, _ = compute_grpo_loss(
+            log_probs=lp_full,
+            old_log_probs=None,
+            ref_log_probs=None,
+            completion_mask=mask_full,
+            advs=advs_for_loss,
+            beta=0.0,
+            eps=None,
+            normalize_by_sequence_length=False,
+        )
+        loss_full.backward()
+        grads_full = {
+            n: p.grad.clone()
+            for n, p in tiny_model.named_parameters()
+            if p.grad is not None
+        }
+
+        sub_g = 2
+        tiny_model.zero_grad()
+        for g_start in range(0, G, sub_g):
+            g_end = min(g_start + sub_g, G)
+            cur_sub_g = g_end - g_start
+            sub_lp, sub_mask = compute_soft_log_probs(
+                net=tiny_model,
+                attention_mask=attention_mask,
+                completion_embeddings=completion_embeddings[g_start:g_end],
+                completion_shadow_ids=completion_shadow_ids[g_start:g_end],
+                hard_tokens_mask=hard_masks[g_start:g_end],
+                noise_std=noise_std,
+                temperature=1.0,
+                pad_token_id=pad_token_id,
+                chunk_size=0,
+                normalize_soft_pdf_by_dim=False,
+            )
+            sub_advs = advs_for_loss[:, g_start:g_end, :]
+            sub_loss, _, _ = compute_grpo_loss(
+                log_probs=sub_lp,
+                old_log_probs=None,
+                ref_log_probs=None,
+                completion_mask=sub_mask,
+                advs=sub_advs,
+                beta=0.0,
+                eps=None,
+                normalize_by_sequence_length=False,
+            )
+            (sub_loss * cur_sub_g / G).backward()
+
+        grads_sub = {
+            n: p.grad.clone()
+            for n, p in tiny_model.named_parameters()
+            if p.grad is not None
+        }
+
+        for name in grads_full:
+            torch.testing.assert_close(
+                grads_full[name], grads_sub[name], atol=1e-4, rtol=1e-4
+            )
 
     def test_sub_group_rollout_shapes(self, tiny_model, tokenizer):
         from dialectic.rl.rollout import generate_soft_rollout_batch

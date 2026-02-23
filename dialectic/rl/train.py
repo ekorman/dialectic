@@ -487,6 +487,27 @@ def collect_micro_batch(
     }
 
 
+def _slice_micro_batch_groups(mb: dict, g_start: int, g_end: int) -> dict:
+    """Slice a micro_batch dict to contain only groups [g_start:g_end].
+
+    Handles both list-of-tensor keys (per-group lists) and [B, G, ...]
+    tensor keys. Returns a shallow copy with the relevant group slice.
+    """
+    sliced = dict(mb)
+    for key in (
+        "completion_token_ids",
+        "completion_embeddings",
+        "completion_shadow_ids",
+        "hard_tokens_mask",
+    ):
+        if key in sliced:
+            sliced[key] = sliced[key][g_start:g_end]
+    for key in ("ref_log_probs", "old_log_probs", "completion_mask", "diag_log_probs"):
+        if key in sliced and sliced[key] is not None:
+            sliced[key] = sliced[key][:, g_start:g_end]
+    return sliced
+
+
 def _grpo_train_loop(
     *,
     net: BaseTransformer,
@@ -510,6 +531,7 @@ def _grpo_train_loop(
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     val_config: ValidationConfig | None = None,
     val_freq: int = 0,
+    max_sub_group_size: int | None = None,
 ) -> None:
     device = next(net.parameters()).device
     n_episodes = 0
@@ -547,6 +569,7 @@ def _grpo_train_loop(
         grad_norm_val: float | None = None
 
         logprob_recompute_max_diffs: list[float] = []
+        sub_g = max_sub_group_size or group_size
         for mu_idx in range(mu):
             opt.zero_grad()
 
@@ -554,39 +577,58 @@ def _grpo_train_loop(
                 advs_slice = global_advs[
                     :, accum_idx * batch_size : (accum_idx + 1) * batch_size
                 ]
-                advs_for_loss: Float[torch.Tensor, "B G 1"] = advs_slice.T.unsqueeze(-1)
 
-                with torch.autocast(
-                    device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-                ):
-                    log_probs, _ = recompute_log_probs_fn(net, micro_batch)
+                for g_start in range(0, group_size, sub_g):
+                    g_end = min(g_start + sub_g, group_size)
+                    cur_sub_g = g_end - g_start
 
-                if mu_idx == 0 and "diag_log_probs" in micro_batch:
-                    mask = micro_batch["completion_mask"]
-                    if mask.any():
-                        lp_diff = (
-                            log_probs.detach() - micro_batch["diag_log_probs"]
-                        ).abs()
-                        logprob_recompute_max_diffs.append(lp_diff[mask].max().item())
+                    sliced_mb = _slice_micro_batch_groups(micro_batch, g_start, g_end)
+                    advs_for_sub = advs_slice[g_start:g_end]
+                    advs_for_loss = advs_for_sub.T.unsqueeze(-1)
 
-                loss, main_loss, kl_loss = compute_grpo_loss(
-                    log_probs=log_probs,
-                    old_log_probs=micro_batch["old_log_probs"],
-                    ref_log_probs=micro_batch["ref_log_probs"],
-                    completion_mask=micro_batch["completion_mask"],
-                    advs=advs_for_loss,
-                    beta=beta,
-                    eps=eps,
-                    normalize_by_sequence_length=normalize_by_sequence_length,
-                )
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=use_bf16,
+                    ):
+                        log_probs, completion_mask = recompute_log_probs_fn(
+                            net, sliced_mb
+                        )
 
-                scaled_loss = loss / accumulation_steps
-                scaled_loss.backward()
+                    L_sub = log_probs.shape[2]
+                    if mu_idx == 0 and "diag_log_probs" in sliced_mb:
+                        sub_diag = sliced_mb["diag_log_probs"][:, :, :L_sub]
+                        if completion_mask.any():
+                            lp_diff = (log_probs.detach() - sub_diag).abs()
+                            logprob_recompute_max_diffs.append(
+                                lp_diff[completion_mask].max().item()
+                            )
 
-                total_loss += loss.item() / accumulation_steps
-                total_main_loss += main_loss / accumulation_steps
-                if kl_loss is not None:
-                    total_kl_loss += kl_loss / accumulation_steps
+                    sub_old_lp = sliced_mb.get("old_log_probs")
+                    sub_ref_lp = sliced_mb.get("ref_log_probs")
+                    if sub_old_lp is not None:
+                        sub_old_lp = sub_old_lp[:, :, :L_sub]
+                    if sub_ref_lp is not None:
+                        sub_ref_lp = sub_ref_lp[:, :, :L_sub]
+
+                    loss, main_loss, kl_loss = compute_grpo_loss(
+                        log_probs=log_probs,
+                        old_log_probs=sub_old_lp,
+                        ref_log_probs=sub_ref_lp,
+                        completion_mask=completion_mask,
+                        advs=advs_for_loss,
+                        beta=beta,
+                        eps=eps,
+                        normalize_by_sequence_length=normalize_by_sequence_length,
+                    )
+
+                    scale = cur_sub_g / (group_size * accumulation_steps)
+                    (loss * scale).backward()
+
+                    total_loss += loss.item() * scale
+                    total_main_loss += main_loss * scale
+                    if kl_loss is not None:
+                        total_kl_loss += kl_loss * scale
 
             grad_norm_val = None
             if max_grad_norm > 0:
@@ -1313,4 +1355,5 @@ def train_soft_grpo(
         save_ckpt_freq=save_ckpt_freq,
         val_config=val_config,
         val_freq=val_freq,
+        max_sub_group_size=max_sub_group_size,
     )
