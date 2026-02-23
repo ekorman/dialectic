@@ -1,4 +1,3 @@
-import random
 from dataclasses import dataclass
 from typing import Callable
 
@@ -135,9 +134,7 @@ def evaluate(
             name: sum(vals) / len(vals) for name, vals in all_components.items()
         }
 
-    sample_idxs = random.sample(
-        range(len(all_prompts)), min(n_examples, len(all_prompts))
-    )
+    sample_idxs = range(min(n_examples, len(all_prompts)))
 
     examples = [
         extty.Example(
