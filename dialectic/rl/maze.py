@@ -25,8 +25,6 @@ class MazeConfig:
         Start placement: "top_left", "random", "corners".
     goal_pos : str
         Goal placement: "bottom_right", "random", "farthest", "corners".
-    seed : int or None
-        Random seed for reproducibility.
     """
 
     height: int = 5
@@ -37,7 +35,6 @@ class MazeConfig:
     openness: float = 0.0
     start_pos: str = "top_left"
     goal_pos: str = "bottom_right"
-    seed: int | None = None
 
 
 DIRECTIONS: dict[str, tuple[int, int]] = {

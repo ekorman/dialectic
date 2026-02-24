@@ -128,9 +128,6 @@ def length_bonus(
     return fn
 
 
-# --- Arithmetic ---
-
-
 # --- Maze-specific ---
 
 
