@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic
 
+from dialectic.rl.maze import Maze, MazeConfig, generate_maze, tokenize_maze
 from dialectic.rl.types import QA, A, EnvResponse, T
 
 
@@ -275,6 +276,73 @@ class CountdownEnv(Env[Countdown, None]):
         return EnvResponse(
             is_done=True,
             data=Countdown(prompt=prompt, numbers=numbers, target=target),
+        )
+
+    def step(self, action: None):
+        raise EpisodeIsDoneError
+
+
+@dataclass
+class MazeState:
+    prompt: str
+    maze: Maze
+
+
+DEFAULT_MAZE_PROMPT = (
+    "Navigate from Start to Goal. "
+    "Each line shows a cell and the directions you can move from it. "
+    "Respond with a sequence of moves (up/down/left/right) inside <answer> tags.\n\n"
+    "{maze}"
+)
+
+
+class MazeEnv(Env[MazeState, None]):
+    """
+    Maze navigation environment.
+
+    Generates a random solvable maze each episode. Single-step:
+    the model sees the tokenized maze and must output a full path.
+
+    Parameters
+    ----------
+    config : MazeConfig
+        Maze generation parameters.
+    prompt_template : str
+        Template with a {maze} placeholder for the tokenized maze.
+    seed : int or None
+        Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: MazeConfig | None = None,
+        prompt_template: str = DEFAULT_MAZE_PROMPT,
+        seed: int | None = None,
+    ):
+        self.config = config or MazeConfig()
+        self.prompt_template = prompt_template
+        self._seed = seed
+        self.rng = random.Random(seed)
+
+    def reseed(self) -> None:
+        self.rng = random.Random(self._seed)
+
+    def __str__(self) -> str:
+        return (
+            f"maze_{self.config.height}x{self.config.width}_open{self.config.openness}"
+        )
+
+    def reset(self, seed: int | None = None) -> EnvResponse[MazeState]:
+        if seed is not None:
+            self.rng.seed(seed)
+
+        maze = generate_maze(self.config, self.rng)
+        prompt = self.prompt_template.format(maze=tokenize_maze(maze))
+
+        return EnvResponse(
+            is_done=True,
+            data=MazeState(prompt=prompt, maze=maze),
         )
 
     def step(self, action: None):

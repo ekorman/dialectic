@@ -35,11 +35,15 @@ from dialectic.llm.templates import (
     get_qwen_input_text_from_messages,
 )
 from dialectic.llm.utils import get_default_device
-from dialectic.rl.env import Countdown, CountdownEnv
-from dialectic.rl.extractors import extract_from_answer_tags
+from dialectic.rl.env import Countdown, CountdownEnv, MazeEnv, MazeState
+from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
+from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import (
     answer_tags,
     countdown_correct,
+    maze_correct,
+    maze_distance,
+    maze_validity,
     think_tags,
     weighted_reward,
 )
@@ -140,23 +144,61 @@ class PromptCollection:
     assistant_prefill: str | None
 
 
-PROMPT_COLLECTIONS: list[PromptCollection] = [
-    PromptCollection(
-        system_prompt=None,
-        env_prompt=ENV_PROMPT_WITH_REASONING_TAGS,
-        assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
-    ),
-    PromptCollection(
-        system_prompt=STHT_SYSTEM_PROMPT,
-        env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
-        assistant_prefill=None,
-    ),
-    PromptCollection(
-        system_prompt=SIMPLE_SYSTEM_PROMPT,
-        env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
-        assistant_prefill="Let me solve this step by step.",
-    ),
-]
+PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
+    "countdown": [
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=ENV_PROMPT_WITH_REASONING_TAGS,
+            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+        ),
+        PromptCollection(
+            system_prompt=STHT_SYSTEM_PROMPT,
+            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill=None,
+        ),
+        PromptCollection(
+            system_prompt=SIMPLE_SYSTEM_PROMPT,
+            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill="Let me solve this step by step.",
+        ),
+    ],
+    "maze": [
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=(
+                "Navigate the maze from Start to Goal. "
+                "Each line shows a cell and the directions you can move from it.\n\n"
+                "{maze}\n\n"
+                f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
+                "Put your moves in <answer></answer> tags as a comma-separated list, "
+                "for example <answer>right, down, right, down</answer>."
+            ),
+            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+        ),
+        PromptCollection(
+            system_prompt=STHT_SYSTEM_PROMPT,
+            env_prompt=(
+                "Navigate the maze from Start to Goal. "
+                "Each line shows a cell and the directions you can move from it.\n\n"
+                "{maze}\n\n"
+                "Put your moves in <answer></answer> tags as a comma-separated list, "
+                "for example <answer>right, down, right, down</answer>."
+            ),
+            assistant_prefill=None,
+        ),
+        PromptCollection(
+            system_prompt=SIMPLE_SYSTEM_PROMPT,
+            env_prompt=(
+                "Navigate the maze from Start to Goal. "
+                "Each line shows a cell and the directions you can move from it.\n\n"
+                "{maze}\n\n"
+                "Put your moves in <answer></answer> tags as a comma-separated list, "
+                "for example <answer>right, down, right, down</answer>."
+            ),
+            assistant_prefill="Let me solve this step by step.",
+        ),
+    ],
+}
 
 
 def _is_modal_installed():
@@ -169,8 +211,7 @@ def get_state_to_str(
     system_prompt: str | None = None,
     assistant_prefill: str | None = None,
 ):
-    def _state_to_str(data: Countdown) -> str:
-        # TODO: add system prompt here
+    def _state_to_str(data: Countdown | MazeState) -> str:
         msgs = []
         if system_prompt:
             msgs.append(Message(role="system", content=system_prompt))
@@ -200,15 +241,39 @@ def get_reward_fn(answer_tags_weight: float, think_tags_weight: float):
     return reward_fn
 
 
+def get_maze_reward_fn(
+    answer_tags_weight: float,
+    validity_weight: float,
+    distance_weight: float,
+    think_tags_weight: float,
+):
+    components = [
+        ("correct", 1.0, maze_correct),
+        ("distance", distance_weight, maze_distance),
+        ("validity", validity_weight, maze_validity),
+        ("answer_tags", answer_tags_weight, answer_tags),
+    ]
+    if think_tags_weight > 0:
+        components.append(
+            (
+                "think_tags",
+                think_tags_weight,
+                think_tags(REASONING_TAG, prefilled_open=True),
+            )
+        )
+    return weighted_reward(components)
+
+
 # update prompt? especially for soft tokens using <reasoning> tags don't make sense
 
 
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
-@extty.experiment(project="grpo-countdown")
+@extty.experiment(project="grpo")
 def train(
     *,
+    env_type: Literal["countdown", "maze"] = "countdown",
     model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
@@ -218,9 +283,20 @@ def train(
     max_tokens: int = 700,
     lr: float = 1e-5,
     beta: float = 0.04,
+    # countdown params
     n_larges: int | list[int] = 2,
     n_total: int | list[int] = 6,
     n_ops: int | list[int] = 5,
+    # maze params
+    maze_height: int = 5,
+    maze_width: int = 5,
+    maze_openness: float = 0.0,
+    maze_min_solution_length: int | None = None,
+    maze_max_solution_length: int | None = None,
+    maze_start_pos: str = "top_left",
+    maze_goal_pos: str = "bottom_right",
+    maze_validity_weight: float = 0.0,
+    maze_distance_weight: float = 0.5,
     seed: int,
     advantage_fn_type: Literal["grpo", "rloo"],
     compile_model: bool = False,
@@ -271,17 +347,41 @@ def train(
     else:
         format_messages = model_info.format_messages
 
-    reward_fn = get_reward_fn(
-        answer_tags_weight=answer_tags_weight, think_tags_weight=think_tags_weight
-    )
+    if env_type == "countdown":
+        env = CountdownEnv(
+            seed=seed,
+            n_larges=n_larges,
+            n_total=n_total,
+            n_ops=n_ops,
+            prompt_template=env_prompt_template,
+        )
+        reward_fn = get_reward_fn(
+            answer_tags_weight=answer_tags_weight, think_tags_weight=think_tags_weight
+        )
+        extractor = extract_from_answer_tags
+    elif env_type == "maze":
+        maze_config = MazeConfig(
+            height=maze_height,
+            width=maze_width,
+            openness=maze_openness,
+            min_solution_length=maze_min_solution_length,
+            max_solution_length=maze_max_solution_length,
+            start_pos=maze_start_pos,
+            goal_pos=maze_goal_pos,
+        )
+        env = MazeEnv(
+            config=maze_config, prompt_template=env_prompt_template, seed=seed
+        )
+        reward_fn = get_maze_reward_fn(
+            answer_tags_weight=answer_tags_weight,
+            validity_weight=maze_validity_weight,
+            distance_weight=maze_distance_weight,
+            think_tags_weight=think_tags_weight,
+        )
+        extractor = extract_maze_moves
+    else:
+        raise ValueError(f"Unknown env_type: {env_type}")
 
-    env = CountdownEnv(
-        seed=seed,
-        n_larges=n_larges,
-        n_total=n_total,
-        n_ops=n_ops,
-        prompt_template=env_prompt_template,
-    )
     device = device or get_default_device()
     print(f"device: {device}")
     net = net.to(device)
@@ -305,25 +405,32 @@ def train(
 
     val_config: ValidationConfig | None = None
     if val_freq > 0:
-        n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
-        n_total_list = [n_total] if isinstance(n_total, int) else n_total
-        n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
-        val_envs = []
-        for i in range(len(n_ops_list)):
-            val_envs.append(
-                CountdownEnv(
-                    seed=2026 + i,
-                    n_larges=n_larges_list[i],
-                    n_total=n_total_list[i],
-                    n_ops=n_ops_list[i],
-                    prompt_template=env_prompt_template,
+        if env_type == "countdown":
+            n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
+            n_total_list = [n_total] if isinstance(n_total, int) else n_total
+            n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
+            val_envs = []
+            for i in range(len(n_ops_list)):
+                val_envs.append(
+                    CountdownEnv(
+                        seed=2026 + i,
+                        n_larges=n_larges_list[i],
+                        n_total=n_total_list[i],
+                        n_ops=n_ops_list[i],
+                        prompt_template=env_prompt_template,
+                    )
                 )
-            )
+        else:
+            val_envs = [
+                MazeEnv(
+                    config=maze_config, prompt_template=env_prompt_template, seed=2026
+                )
+            ]
         val_config = ValidationConfig(
             envs=val_envs,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
-            extractor=extract_from_answer_tags,
+            extractor=extractor,
             tokenizer=tokenizer,
             eos_token_id=model_info.eos_token_id,
             pad_token_id=model_info.pad_token_id,
@@ -344,7 +451,7 @@ def train(
                 tokenizer=tokenizer,
                 eos_token_id=model_info.eos_token_id,
                 pad_token_id=model_info.pad_token_id,
-                extractor=extract_from_answer_tags,
+                extractor=extractor,
                 beta=beta,
                 eps=eps,
                 mu=mu,
@@ -380,7 +487,7 @@ def train(
                 tokenizer=tokenizer,
                 eos_token_id=model_info.eos_token_id,
                 pad_token_id=model_info.pad_token_id,
-                extractor=extract_from_answer_tags,
+                extractor=extractor,
                 beta=beta,
                 eps=eps,
                 mu=mu,
@@ -438,8 +545,15 @@ if _is_modal_installed():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify GRPO learning on Countdown")
+    parser = argparse.ArgumentParser(description="GRPO training on Countdown or Maze")
 
+    parser.add_argument(
+        "--env",
+        type=str,
+        default="countdown",
+        choices=["countdown", "maze"],
+        help="Environment to train on",
+    )
     parser.add_argument("--model", type=str, default="qwen3-0.6b")
     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
     parser.add_argument(
@@ -474,6 +588,32 @@ def main():
         default=2,
         help="Number of large numbers for Countdown (comma-separated for multiple configs)",
     )
+    # maze params
+    parser.add_argument("--maze-height", type=int, default=5, help="Maze grid height")
+    parser.add_argument("--maze-width", type=int, default=5, help="Maze grid width")
+    parser.add_argument(
+        "--maze-openness",
+        type=float,
+        default=0.0,
+        help="Fraction of extra walls to remove (0.0=perfect maze)",
+    )
+    parser.add_argument("--maze-min-solution-length", type=int, default=None)
+    parser.add_argument("--maze-max-solution-length", type=int, default=None)
+    parser.add_argument("--maze-start-pos", type=str, default="top_left")
+    parser.add_argument("--maze-goal-pos", type=str, default="bottom_right")
+    parser.add_argument(
+        "--maze-validity-weight",
+        type=float,
+        default=0.0,
+        help="Reward weight for move validity",
+    )
+    parser.add_argument(
+        "--maze-distance-weight",
+        type=float,
+        default=0.5,
+        help="Reward weight for proximity to goal",
+    )
+
     parser.add_argument(
         "--mu", type=int, default=1, help="Optimization passes per batch"
     )
@@ -590,7 +730,7 @@ def main():
         action="store_false",
         help="Do not normalize advantages by standard deviation",
     )
-    parser.add_argument("--prompt-collections-id", type=int, required=True)
+    parser.add_argument("--prompt-collections-id", type=int, default=0)
     parser.add_argument(
         "--normalize-by-sequence-length",
         action="store_true",
@@ -638,9 +778,10 @@ def main():
 
     args = parser.parse_args()
 
-    prompt_collection: PromptCollection = PROMPT_COLLECTIONS[args.prompt_collections_id]
+    prompt_collection = PROMPT_COLLECTIONS[args.env][args.prompt_collections_id]
 
     train(
+        env_type=args.env,
         model_name=args.model,
         device=args.device,
         max_episodes=args.max_episodes,
@@ -652,6 +793,15 @@ def main():
         n_larges=args.n_larges,
         n_ops=args.n_ops,
         n_total=args.n_total,
+        maze_height=args.maze_height,
+        maze_width=args.maze_width,
+        maze_openness=args.maze_openness,
+        maze_min_solution_length=args.maze_min_solution_length,
+        maze_max_solution_length=args.maze_max_solution_length,
+        maze_start_pos=args.maze_start_pos,
+        maze_goal_pos=args.maze_goal_pos,
+        maze_validity_weight=args.maze_validity_weight,
+        maze_distance_weight=args.maze_distance_weight,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
