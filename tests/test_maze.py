@@ -11,11 +11,12 @@ from dialectic.rl.maze import (
     VERY_HARD,
     Maze,
     MazeConfig,
+    bfs_distance,
     generate_maze,
     tokenize_maze,
     validate_path,
 )
-from dialectic.rl.reward import maze_correct, maze_validity
+from dialectic.rl.reward import maze_correct, maze_distance, maze_validity
 from dialectic.rl.types import EnvResponse
 
 
@@ -213,6 +214,51 @@ class TestReward:
             resp = self._make_env_response(maze)
             v = maze_validity(env_response=resp, extracted_model_output=moves)
             assert v == 0.5
+
+    def test_distance_reward_on_solution(self, maze: Maze):
+        resp = self._make_env_response(maze)
+        assert (
+            maze_distance(env_response=resp, extracted_model_output=maze.solution)
+            == 1.0
+        )
+
+    def test_distance_reward_on_none(self, maze: Maze):
+        resp = self._make_env_response(maze)
+        assert maze_distance(env_response=resp, extracted_model_output=None) == 0.0
+
+    def test_distance_reward_no_movement(self, maze: Maze):
+        resp = self._make_env_response(maze)
+        bad_dirs = [
+            d
+            for d in ["up", "down", "left", "right"]
+            if d not in maze.connections[maze.start]
+        ]
+        if bad_dirs:
+            d = maze_distance(env_response=resp, extracted_model_output=[bad_dirs[0]])
+            assert d == 0.0
+
+    def test_distance_reward_partial_progress(self, maze: Maze):
+        resp = self._make_env_response(maze)
+        half = maze.solution[: len(maze.solution) // 2]
+        d = maze_distance(env_response=resp, extracted_model_output=half)
+        assert 0.0 < d < 1.0
+
+
+class TestBfsDistance:
+    def test_same_cell(self):
+        maze = generate_maze(MazeConfig(), random.Random(0))
+        assert bfs_distance(maze.connections, maze.start, maze.start) == 0
+
+    def test_start_to_goal(self):
+        maze = generate_maze(MazeConfig(), random.Random(0))
+        dist = bfs_distance(maze.connections, maze.start, maze.goal)
+        assert dist == maze.solution_length
+
+    def test_symmetric(self):
+        maze = generate_maze(MazeConfig(), random.Random(0))
+        d1 = bfs_distance(maze.connections, maze.start, maze.goal)
+        d2 = bfs_distance(maze.connections, maze.goal, maze.start)
+        assert d1 == d2
 
 
 class TestExtractor:

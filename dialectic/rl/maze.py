@@ -356,6 +356,43 @@ def validate_path(maze: Maze, moves: list[str]) -> PathResult:
     )
 
 
+def bfs_distance(
+    connections: dict[tuple[int, int], set[str]],
+    start: tuple[int, int],
+    goal: tuple[int, int],
+) -> int | None:
+    """
+    Compute shortest path distance between two cells.
+
+    Parameters
+    ----------
+    connections : dict
+        Maze adjacency structure.
+    start : tuple[int, int]
+    goal : tuple[int, int]
+
+    Returns
+    -------
+    int or None
+        Number of moves in shortest path, or None if unreachable.
+    """
+    if start == goal:
+        return 0
+    queue: deque[tuple[tuple[int, int], int]] = deque([(start, 0)])
+    visited: set[tuple[int, int]] = {start}
+    while queue:
+        pos, dist = queue.popleft()
+        for direction in connections.get(pos, set()):
+            dr, dc = DIRECTIONS[direction]
+            neighbor = (pos[0] + dr, pos[1] + dc)
+            if neighbor == goal:
+                return dist + 1
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, dist + 1))
+    return None
+
+
 EASY = MazeConfig(
     height=5,
     width=5,

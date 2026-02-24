@@ -42,6 +42,7 @@ from dialectic.rl.reward import (
     answer_tags,
     countdown_correct,
     maze_correct,
+    maze_distance,
     maze_validity,
     think_tags,
     weighted_reward,
@@ -241,10 +242,14 @@ def get_reward_fn(answer_tags_weight: float, think_tags_weight: float):
 
 
 def get_maze_reward_fn(
-    answer_tags_weight: float, validity_weight: float, think_tags_weight: float
+    answer_tags_weight: float,
+    validity_weight: float,
+    distance_weight: float,
+    think_tags_weight: float,
 ):
     components = [
         ("correct", 1.0, maze_correct),
+        ("distance", distance_weight, maze_distance),
         ("validity", validity_weight, maze_validity),
         ("answer_tags", answer_tags_weight, answer_tags),
     ]
@@ -290,7 +295,8 @@ def train(
     maze_max_solution_length: int | None = None,
     maze_start_pos: str = "top_left",
     maze_goal_pos: str = "bottom_right",
-    maze_validity_weight: float = 0.5,
+    maze_validity_weight: float = 0.0,
+    maze_distance_weight: float = 0.5,
     seed: int,
     advantage_fn_type: Literal["grpo", "rloo"],
     compile_model: bool = False,
@@ -369,6 +375,7 @@ def train(
         reward_fn = get_maze_reward_fn(
             answer_tags_weight=answer_tags_weight,
             validity_weight=maze_validity_weight,
+            distance_weight=maze_distance_weight,
             think_tags_weight=think_tags_weight,
         )
         extractor = extract_maze_moves
@@ -597,8 +604,14 @@ def main():
     parser.add_argument(
         "--maze-validity-weight",
         type=float,
-        default=0.5,
+        default=0.0,
         help="Reward weight for move validity",
+    )
+    parser.add_argument(
+        "--maze-distance-weight",
+        type=float,
+        default=0.5,
+        help="Reward weight for proximity to goal",
     )
 
     parser.add_argument(
@@ -788,6 +801,7 @@ def main():
         maze_start_pos=args.maze_start_pos,
         maze_goal_pos=args.maze_goal_pos,
         maze_validity_weight=args.maze_validity_weight,
+        maze_distance_weight=args.maze_distance_weight,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,

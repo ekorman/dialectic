@@ -2,7 +2,7 @@ import re
 from typing import Callable, Protocol, Sequence
 
 from dialectic.rl.env import Countdown, MazeState
-from dialectic.rl.maze import validate_path
+from dialectic.rl.maze import bfs_distance, validate_path
 from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
 RewardComponentFn = Callable[..., float]
@@ -158,6 +158,32 @@ def maze_validity(
     if result.total_moves == 0:
         return 0.0
     return result.valid_moves / result.total_moves
+
+
+def maze_distance(
+    *,
+    env_response: EnvResponse[MazeState],
+    extracted_model_output: list[str] | None,
+    **_,
+) -> float:
+    """
+    Proportional credit for getting closer to the goal.
+
+    Returns 1.0 if at goal, 0.0 if at start or farther, linear in between.
+    """
+    maze = env_response.data.maze
+    if not extracted_model_output:
+        return 0.0
+    result = validate_path(maze, extracted_model_output)
+    if result.reached_goal:
+        return 1.0
+    start_dist = bfs_distance(maze.connections, maze.start, maze.goal)
+    if start_dist is None or start_dist == 0:
+        return 0.0
+    final_dist = bfs_distance(maze.connections, result.final_pos, maze.goal)
+    if final_dist is None:
+        return 0.0
+    return max(0.0, 1.0 - final_dist / start_dist)
 
 
 # --- Arithmetic ---
