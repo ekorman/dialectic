@@ -1,7 +1,8 @@
 import re
 from typing import Callable, Protocol, Sequence
 
-from dialectic.rl.env import Countdown
+from dialectic.rl.env import Countdown, MazeState
+from dialectic.rl.maze import validate_path
 from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
 RewardComponentFn = Callable[..., float]
@@ -125,6 +126,38 @@ def length_bonus(
         return min(len(raw_model_output) / normalize_length, max_bonus)
 
     return fn
+
+
+# --- Arithmetic ---
+
+
+# --- Maze-specific ---
+
+
+def maze_correct(
+    *,
+    env_response: EnvResponse[MazeState],
+    extracted_model_output: list[str] | None,
+    **_,
+) -> float:
+    if not extracted_model_output:
+        return 0.0
+    result = validate_path(env_response.data.maze, extracted_model_output)
+    return 1.0 if result.reached_goal else 0.0
+
+
+def maze_validity(
+    *,
+    env_response: EnvResponse[MazeState],
+    extracted_model_output: list[str] | None,
+    **_,
+) -> float:
+    if not extracted_model_output:
+        return 0.0
+    result = validate_path(env_response.data.maze, extracted_model_output)
+    if result.total_moves == 0:
+        return 0.0
+    return result.valid_moves / result.total_moves
 
 
 # --- Arithmetic ---
