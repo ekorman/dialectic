@@ -45,8 +45,19 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
+        self.soft_projection: nn.Linear | None = None
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
+
+    def enable_soft_projection(self) -> None:
+        """Add a learnable D->D linear layer applied to soft token hidden states.
+
+        Initialized as identity so behavior is equivalent to plain passthrough
+        until trained.
+        """
+        proj = nn.Linear(self.d, self.d, bias=False)
+        nn.init.eye_(proj.weight)
+        self.soft_projection = proj
 
     def forward(
         self,

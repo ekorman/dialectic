@@ -50,3 +50,45 @@ class KVCache:
 
     def get_position_offset(self) -> int:
         return self._seq_len
+
+
+class GradSafeKVCache:
+    """KV cache using list-based concatenation instead of in-place buffer writes.
+
+    Standard KVCache uses in-place assignment (buffer[:, :, start:end] = k) which
+    breaks autograd when gradients need to flow through cached K/V tensors. This
+    implementation appends to a list and concatenates, producing new tensors each
+    time so autograd graphs remain valid.
+    """
+
+    def __init__(self) -> None:
+        self._keys_list: list[torch.Tensor] = []
+        self._values_list: list[torch.Tensor] = []
+        self._seq_len: int = 0
+
+    @classmethod
+    def from_standard(cls, kv_cache: KVCache) -> "GradSafeKVCache":
+        gc = cls()
+        if kv_cache._keys is not None and kv_cache._seq_len > 0:
+            gc._keys_list = [kv_cache._keys[:, :, : kv_cache._seq_len].detach()]
+            gc._values_list = [kv_cache._values[:, :, : kv_cache._seq_len].detach()]
+            gc._seq_len = kv_cache._seq_len
+        return gc
+
+    def update_and_get_keys(self, k: torch.Tensor) -> torch.Tensor:
+        self._keys_list.append(k)
+        return torch.cat(self._keys_list, dim=2)
+
+    def update_and_get_values(self, v: torch.Tensor) -> torch.Tensor:
+        self._values_list.append(v)
+        self._seq_len += v.shape[2]
+        return torch.cat(self._values_list, dim=2)
+
+    def get_position_offset(self) -> int:
+        return self._seq_len
+
+    def freeze(self) -> None:
+        """Detach and consolidate all cached K/V into a single tensor."""
+        if self._keys_list:
+            self._keys_list = [torch.cat(self._keys_list, dim=2).detach()]
+            self._values_list = [torch.cat(self._values_list, dim=2).detach()]
