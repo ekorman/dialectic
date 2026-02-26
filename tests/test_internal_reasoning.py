@@ -644,6 +644,41 @@ class TestTrainInternalReasoningGrpo:
 
 
 class TestSoftProjection:
+    def test_applied_to_soft_tokens_not_hard(self, tiny_model):
+        """Projection is called exactly soft_block_size times per cycle (soft only, not hard)."""
+        torch.manual_seed(42)
+        tiny_model.enable_soft_projection()
+
+        call_count = 0
+        orig_forward = tiny_model.soft_projection.forward
+
+        def counting_forward(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return orig_forward(*args, **kwargs)
+
+        tiny_model.soft_projection.forward = counting_forward
+
+        B, L = 1, 6
+        token_ids = torch.randint(0, 100, (B, L))
+        out = generate_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        completed_cycles = out.n_cycles[0].item()
+        expected_calls = SOFT_BLOCK_SIZE * completed_cycles
+        assert call_count == expected_calls, (
+            f"soft_projection called {call_count} times, "
+            f"expected {expected_calls} ({SOFT_BLOCK_SIZE} soft * {completed_cycles} cycles)"
+        )
+
     def test_identity_init_matches_no_projection(self, tiny_model):
         """With identity-initialized projection, outputs should match plain passthrough."""
         torch.manual_seed(42)
