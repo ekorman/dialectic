@@ -644,25 +644,25 @@ class TestTrainInternalReasoningGrpo:
 
 
 class TestSoftProjection:
-    def test_applied_to_soft_tokens_not_hard(self, tiny_model):
+    def test_applied_to_soft_tokens_not_hard(self, tiny_model_with_soft_projection):
         """Projection is called exactly soft_block_size times per cycle (soft only, not hard)."""
         torch.manual_seed(42)
-        tiny_model.enable_soft_projection()
+        model = tiny_model_with_soft_projection
 
         call_count = 0
-        orig_forward = tiny_model.soft_projection.forward
+        orig_apply = model.apply_soft_projection
 
-        def counting_forward(*args, **kwargs):
+        def counting_apply(h):
             nonlocal call_count
             call_count += 1
-            return orig_forward(*args, **kwargs)
+            return orig_apply(h)
 
-        tiny_model.soft_projection.forward = counting_forward
+        model.apply_soft_projection = counting_apply
 
         B, L = 1, 6
         token_ids = torch.randint(0, 100, (B, L))
         out = generate_internal_reasoning_tokens(
-            net=tiny_model,
+            net=model,
             token_ids=token_ids,
             soft_block_size=SOFT_BLOCK_SIZE,
             max_cycles=MAX_CYCLES,
@@ -675,12 +675,14 @@ class TestSoftProjection:
         completed_cycles = out.n_cycles[0].item()
         expected_calls = SOFT_BLOCK_SIZE * completed_cycles
         assert call_count == expected_calls, (
-            f"soft_projection called {call_count} times, "
+            f"apply_soft_projection called {call_count} times, "
             f"expected {expected_calls} ({SOFT_BLOCK_SIZE} soft * {completed_cycles} cycles)"
         )
 
-    def test_identity_init_matches_no_projection(self, tiny_model):
-        """With identity-initialized projection, outputs should match plain passthrough."""
+    def test_zero_alpha_matches_no_projection(
+        self, tiny_model, tiny_model_with_soft_projection
+    ):
+        """With alpha=0, outputs match model without projection."""
         torch.manual_seed(42)
         B, L = 2, 8
         token_ids = torch.randint(0, 100, (B, L))
@@ -696,10 +698,9 @@ class TestSoftProjection:
             temperature=1.0,
         )
 
-        tiny_model.enable_soft_projection()
         torch.manual_seed(42)
         out_with_proj = generate_internal_reasoning_tokens(
-            net=tiny_model,
+            net=tiny_model_with_soft_projection,
             token_ids=token_ids,
             soft_block_size=SOFT_BLOCK_SIZE,
             max_cycles=MAX_CYCLES,
@@ -717,11 +718,11 @@ class TestSoftProjection:
         )
         assert (out_with_proj.hard_token_ids == out_no_proj.hard_token_ids).all()
 
-    def test_projection_receives_gradients(self, tiny_model):
-        """Soft projection weights should receive gradients during training."""
+    def test_alpha_receives_gradients_at_zero(self, tiny_model_with_soft_projection):
+        """With alpha=0, alpha gets gradients so it can grow."""
         torch.manual_seed(42)
-        tiny_model.enable_soft_projection()
-        tiny_model.train()
+        model = tiny_model_with_soft_projection
+        model.train()
 
         B, G, C = 1, 1, 3
         L = 4
@@ -731,7 +732,7 @@ class TestSoftProjection:
         n_cycles = torch.full((B, G), C, dtype=torch.long)
 
         log_probs, mask = compute_internal_reasoning_log_probs(
-            net=tiny_model,
+            net=model,
             prompt_token_ids=prompt_ids,
             attention_mask=attention_mask,
             hard_token_ids=hard_ids,
@@ -744,6 +745,194 @@ class TestSoftProjection:
         loss = (log_probs * mask).sum()
         loss.backward()
 
-        assert tiny_model.soft_projection is not None
-        assert tiny_model.soft_projection.weight.grad is not None
-        assert tiny_model.soft_projection.weight.grad.abs().sum() > 0
+        assert model.soft_projection_alpha is not None
+        assert model.soft_projection_alpha.grad is not None
+        assert model.soft_projection_alpha.grad.abs().item() > 0
+
+    def test_projection_weight_receives_gradients_when_alpha_nonzero(
+        self, tiny_model_with_soft_projection
+    ):
+        """With alpha != 0, projection weights also receive gradients."""
+        torch.manual_seed(42)
+        model = tiny_model_with_soft_projection
+        model.soft_projection_alpha.data.fill_(1.0)
+        model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        assert model.soft_projection is not None
+        assert model.soft_projection.weight.grad is not None
+        assert model.soft_projection.weight.grad.abs().sum() > 0
+
+
+class TestSoftBpttWindow:
+    def test_full_window_matches_default(self, tiny_model):
+        """soft_bptt_window=soft_block_size should match default (None)."""
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 2
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        tiny_model.zero_grad()
+        lp_default, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+        lp_default.sum().backward()
+        grads_default = {
+            n: p.grad.clone()
+            for n, p in tiny_model.named_parameters()
+            if p.grad is not None
+        }
+
+        tiny_model.zero_grad()
+        lp_full, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            soft_bptt_window=SOFT_BLOCK_SIZE,
+        )
+        lp_full.sum().backward()
+        grads_full = {
+            n: p.grad.clone()
+            for n, p in tiny_model.named_parameters()
+            if p.grad is not None
+        }
+
+        torch.testing.assert_close(lp_default, lp_full, atol=1e-5, rtol=1e-5)
+        for name in grads_default:
+            torch.testing.assert_close(
+                grads_default[name], grads_full[name], atol=1e-5, rtol=1e-5
+            )
+
+    def test_window_reduces_grad_norm(self, tiny_model):
+        """Smaller bptt window should produce smaller or equal gradient norms."""
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        soft_block_size = 4
+        B, G, C = 1, 1, 2
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        tiny_model.zero_grad()
+        lp_full, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=soft_block_size,
+            pad_token_id=PAD_TOKEN_ID,
+            soft_bptt_window=soft_block_size,
+        )
+        lp_full.sum().backward()
+        grad_norm_full = (
+            sum(
+                p.grad.norm().item() ** 2
+                for p in tiny_model.parameters()
+                if p.grad is not None
+            )
+            ** 0.5
+        )
+
+        tiny_model.zero_grad()
+        lp_window, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=soft_block_size,
+            pad_token_id=PAD_TOKEN_ID,
+            soft_bptt_window=1,
+        )
+        lp_window.sum().backward()
+        grad_norm_window = (
+            sum(
+                p.grad.norm().item() ** 2
+                for p in tiny_model.parameters()
+                if p.grad is not None
+            )
+            ** 0.5
+        )
+
+        # Forward values should be identical (same computation, just different grad)
+        torch.testing.assert_close(lp_full, lp_window, atol=1e-5, rtol=1e-5)
+
+        # Windowed grad norm should be smaller (fewer layers of backprop)
+        assert grad_norm_window <= grad_norm_full * 1.01, (
+            f"Window grad norm {grad_norm_window} > full grad norm {grad_norm_full}"
+        )
+
+    def test_window_zero_raises_or_no_grad(self, tiny_model):
+        """soft_bptt_window=0 means no soft tokens get gradients; only hard token pass."""
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 2
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        tiny_model.zero_grad()
+        lp, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            soft_bptt_window=0,
+        )
+        lp.sum().backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in tiny_model.parameters()
+        )
+        assert has_grad, "Should still have gradients from the hard token forward pass"

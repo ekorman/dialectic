@@ -912,8 +912,7 @@ def generate_internal_reasoning_tokens(
         ):
             for _ in range(soft_block_size):
                 h = net(h, kv_caches=kv_caches, return_hidden_states=True)
-                if net.soft_projection is not None:
-                    h = net.soft_projection(h)
+                h = net.apply_soft_projection(h)
 
             h = net(h, kv_caches=kv_caches, return_hidden_states=True)
             logits = net.lm_head(h)  # [B, 1, V]

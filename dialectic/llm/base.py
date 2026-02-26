@@ -21,6 +21,8 @@ class BaseTransformer(nn.Module):
         rope_base_value: float,
         decoder_layer_factory: Callable,
         tie_weights: bool = False,
+        soft_projection: bool = False,
+        soft_projection_alpha_init: float = 0.0,
     ):
         super().__init__()
         self.d = d
@@ -45,19 +47,26 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
-        self.soft_projection: nn.Linear | None = None
+        if soft_projection:
+            proj = nn.Linear(d, d, bias=False)
+            nn.init.kaiming_uniform_(proj.weight)
+            self.soft_projection: nn.Linear | None = proj
+            self.soft_projection_alpha: nn.Parameter | None = nn.Parameter(
+                torch.tensor(soft_projection_alpha_init)
+            )
+        else:
+            self.soft_projection = None
+            self.soft_projection_alpha = None
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
 
-    def enable_soft_projection(self) -> None:
-        """Add a learnable D->D linear layer applied to soft token hidden states.
-
-        Initialized as identity so behavior is equivalent to plain passthrough
-        until trained.
-        """
-        proj = nn.Linear(self.d, self.d, bias=False)
-        nn.init.eye_(proj.weight)
-        self.soft_projection = proj
+    def apply_soft_projection(
+        self, h: Float[torch.Tensor, "B 1 D"]
+    ) -> Float[torch.Tensor, "B 1 D"]:
+        """Apply residual soft projection: h + alpha * proj(h)."""
+        if self.soft_projection is None:
+            return h
+        return h + self.soft_projection_alpha * self.soft_projection(h)
 
     def forward(
         self,

@@ -69,8 +69,8 @@ class ModelInfo:
     pad_token_id: int
     format_messages: Callable[[list[Message], bool], str]
 
-    def load_net(self):
-        return self.net_factory()
+    def load_net(self, **kwargs):
+        return self.net_factory(**kwargs)
 
     def load_tokenizer(self) -> Tokenizer:
         if isinstance(self.tokenizer, str):
@@ -80,7 +80,7 @@ class ModelInfo:
 
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
-        net_factory=lambda: load_qwen3_06b(True),
+        net_factory=lambda **kw: load_qwen3_06b(True, **kw),
         tokenizer="Qwen/Qwen3-0.6B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -89,7 +89,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "qwen3-1.7b": ModelInfo(
-        net_factory=lambda: load_qwen3_17b(True),
+        net_factory=lambda **kw: load_qwen3_17b(True, **kw),
         tokenizer="Qwen/Qwen3-1.7B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -98,14 +98,14 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "llama-3.2-1b-instruct": ModelInfo(
-        net_factory=lambda: load_llama_32_1b_instruct(True),
+        net_factory=lambda **kw: load_llama_32_1b_instruct(True, **kw),
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
         format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
     ),
     "llama-3.2-3b-instruct": ModelInfo(
-        net_factory=lambda: load_llama_32_3b_instruct(True),
+        net_factory=lambda **kw: load_llama_32_3b_instruct(True, **kw),
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
@@ -336,6 +336,7 @@ def train(
     val_batch_size: int = 4,
     internal_reasoning: bool = False,
     soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
     max_cycles: int = 30,
     soft_projection: bool = False,
 ):
@@ -343,7 +344,7 @@ def train(
     torch.manual_seed(seed)
 
     model_info = MODEL_REGISTRY[model_name]
-    net = model_info.load_net()
+    net = model_info.load_net(soft_projection=soft_projection)
     tokenizer = model_info.load_tokenizer()
 
     if compile_model:
@@ -400,14 +401,13 @@ def train(
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
 
-    if soft_projection:
-        net.enable_soft_projection()
-
     device = device or get_default_device()
     print(f"device: {device}")
     net = net.to(device)
 
     if internal_reasoning:
+        if env_type != "maze":
+            raise ValueError("--internal-reasoning only supported with --env maze")
         state_to_str = get_state_to_str(
             format_messages=format_messages,
             system_prompt=MAZE_INTERNAL_REASONING_PROMPT.system_prompt,
@@ -431,6 +431,28 @@ def train(
     else:
         raise ValueError(f"Got unknown advantage function type {advantage_fn_type}")
 
+    valid_hard_token_ids: list[int] = []
+    move_id_to_name: dict[int, str] = {}
+    ir_reward_fn = reward_fn
+    ir_extractor = extractor
+    if internal_reasoning:
+        direction_words = ["up", "down", "left", "right"]
+        for word in direction_words:
+            ids = tokenizer.encode(word, add_special_tokens=False).ids
+            assert len(ids) == 1, f"'{word}' tokenizes to {len(ids)} tokens, expected 1"
+            tid = ids[0]
+            valid_hard_token_ids.append(tid)
+            move_id_to_name[tid] = word
+        valid_hard_token_ids.append(model_info.eos_token_id)
+
+        ir_reward_fn = get_maze_reward_fn(
+            answer_tags_weight=0.0,
+            validity_weight=maze_validity_weight,
+            distance_weight=maze_distance_weight,
+            think_tags_weight=0.0,
+        )
+        ir_extractor = lambda moves: moves if moves else None  # noqa: E731
+
     val_config: ValidationConfig | None = None
     if val_freq > 0:
         if env_type == "countdown":
@@ -449,52 +471,50 @@ def train(
                     )
                 )
         else:
+            val_maze_prompt = (
+                MAZE_INTERNAL_REASONING_PROMPT.env_prompt
+                if internal_reasoning
+                else env_prompt_template
+            )
             val_envs = [
-                MazeEnv(
-                    config=maze_config, prompt_template=env_prompt_template, seed=2026
-                )
+                MazeEnv(config=maze_config, prompt_template=val_maze_prompt, seed=2026)
             ]
-        val_config = ValidationConfig(
-            envs=val_envs,
-            reward_fn=reward_fn,
-            state_to_str=state_to_str,
-            extractor=extractor,
-            tokenizer=tokenizer,
-            eos_token_id=model_info.eos_token_id,
-            pad_token_id=model_info.pad_token_id,
-            max_episodes=val_episodes,
-            batch_size=val_batch_size,
-            max_tokens_generated=max_tokens,
-            use_bf16=use_bf16,
-        )
+        if internal_reasoning:
+            val_config = ValidationConfig(
+                envs=val_envs,
+                reward_fn=ir_reward_fn,
+                state_to_str=state_to_str,
+                extractor=ir_extractor,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                max_episodes=val_episodes,
+                batch_size=val_batch_size,
+                max_tokens_generated=max_tokens,
+                use_bf16=use_bf16,
+                internal_reasoning=True,
+                valid_hard_token_ids=valid_hard_token_ids,
+                move_id_to_name=move_id_to_name,
+                soft_block_size=soft_block_size,
+                max_cycles=max_cycles,
+            )
+        else:
+            val_config = ValidationConfig(
+                envs=val_envs,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                extractor=extractor,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                max_episodes=val_episodes,
+                batch_size=val_batch_size,
+                max_tokens_generated=max_tokens,
+                use_bf16=use_bf16,
+            )
 
     try:
         if internal_reasoning:
-            if env_type != "maze":
-                raise ValueError("--internal-reasoning only supported with --env maze")
-
-            direction_words = ["up", "down", "left", "right"]
-            valid_hard_token_ids = []
-            move_id_to_name: dict[int, str] = {}
-            for word in direction_words:
-                ids = tokenizer.encode(word, add_special_tokens=False).ids
-                assert len(ids) == 1, (
-                    f"'{word}' tokenizes to {len(ids)} tokens, expected 1"
-                )
-                tid = ids[0]
-                valid_hard_token_ids.append(tid)
-                move_id_to_name[tid] = word
-            valid_hard_token_ids.append(model_info.eos_token_id)
-
-            ir_reward_fn = get_maze_reward_fn(
-                answer_tags_weight=0.0,
-                validity_weight=maze_validity_weight,
-                distance_weight=maze_distance_weight,
-                think_tags_weight=0.0,
-            )
-
-            ir_extractor = lambda moves: moves if moves else None  # noqa: E731
-
             train_internal_reasoning_grpo(
                 net=net,
                 opt=opt,
@@ -508,6 +528,7 @@ def train(
                 move_id_to_name=move_id_to_name,
                 valid_hard_token_ids=valid_hard_token_ids,
                 soft_block_size=soft_block_size,
+                soft_bptt_window=soft_bptt_window,
                 max_cycles=max_cycles,
                 beta=beta,
                 eps=eps,
@@ -779,6 +800,12 @@ def main():
         help="Soft tokens per cycle for internal reasoning",
     )
     parser.add_argument(
+        "--soft-bptt-window",
+        type=int,
+        default=None,
+        help="Number of soft tokens to backprop through per cycle (default: all)",
+    )
+    parser.add_argument(
         "--max-cycles",
         type=int,
         default=30,
@@ -939,6 +966,7 @@ def main():
         normalize_soft_pdf_by_dim=args.normalize_soft_pdf_by_dim,
         internal_reasoning=args.internal_reasoning,
         soft_block_size=args.soft_block_size,
+        soft_bptt_window=args.soft_bptt_window,
         max_cycles=args.max_cycles,
         soft_projection=args.soft_projection,
     )

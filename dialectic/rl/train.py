@@ -14,7 +14,7 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
-from dialectic.rl.evaluate import evaluate
+from dialectic.rl.evaluate import evaluate, evaluate_internal_reasoning
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
     generate_internal_reasoning_rollout_batch,
@@ -49,6 +49,11 @@ class ValidationConfig:
     batch_size: int
     max_tokens_generated: int
     use_bf16: bool
+    internal_reasoning: bool = False
+    valid_hard_token_ids: list[int] | None = None
+    move_id_to_name: dict[int, str] | None = None
+    soft_block_size: int = 4
+    max_cycles: int = 30
 
 
 @torch.no_grad()
@@ -66,23 +71,45 @@ def run_validation(
     for env in val_config.envs:
         env.reseed()
         label = str(env)
-        result, examples = evaluate(
-            net=net,
-            env=env,
-            reward_fn=val_config.reward_fn,
-            state_to_str=val_config.state_to_str,
-            tokenizer=val_config.tokenizer,
-            eos_token_id=val_config.eos_token_id,
-            pad_token_id=val_config.pad_token_id,
-            extractor=val_config.extractor,
-            max_tokens_generated=val_config.max_tokens_generated,
-            max_episodes=val_config.max_episodes,
-            batch_size=val_config.batch_size,
-            group_size=1,
-            temperature=0.0,
-            use_bf16=val_config.use_bf16,
-            n_examples=val_config.max_episodes,
-        )
+        if val_config.internal_reasoning:
+            result, examples = evaluate_internal_reasoning(
+                net=net,
+                env=env,
+                reward_fn=val_config.reward_fn,
+                state_to_str=val_config.state_to_str,
+                tokenizer=val_config.tokenizer,
+                eos_token_id=val_config.eos_token_id,
+                pad_token_id=val_config.pad_token_id,
+                extractor=val_config.extractor,
+                move_id_to_name=val_config.move_id_to_name,
+                valid_hard_token_ids=val_config.valid_hard_token_ids,
+                soft_block_size=val_config.soft_block_size,
+                max_cycles=val_config.max_cycles,
+                max_episodes=val_config.max_episodes,
+                batch_size=val_config.batch_size,
+                group_size=1,
+                temperature=0.0,
+                use_bf16=val_config.use_bf16,
+                n_examples=val_config.max_episodes,
+            )
+        else:
+            result, examples = evaluate(
+                net=net,
+                env=env,
+                reward_fn=val_config.reward_fn,
+                state_to_str=val_config.state_to_str,
+                tokenizer=val_config.tokenizer,
+                eos_token_id=val_config.eos_token_id,
+                pad_token_id=val_config.pad_token_id,
+                extractor=val_config.extractor,
+                max_tokens_generated=val_config.max_tokens_generated,
+                max_episodes=val_config.max_episodes,
+                batch_size=val_config.batch_size,
+                group_size=1,
+                temperature=0.0,
+                use_bf16=val_config.use_bf16,
+                n_examples=val_config.max_episodes,
+            )
 
         metrics[f"val/{label}/reward_mean"] = result.reward_mean
         metrics[f"val/{label}/reward_std"] = result.reward_std
@@ -715,6 +742,10 @@ def _grpo_train_loop(
                 metrics["train/logprob_recompute_max_diff"] = max(
                     logprob_recompute_max_diffs
                 )
+            if net.soft_projection_alpha is not None:
+                metrics["train/soft_projection_alpha"] = (
+                    net.soft_projection_alpha.item()
+                )
             extty.log(metrics, step=step)
 
             if step % save_ckpt_freq == 0:
@@ -1317,6 +1348,7 @@ def compute_internal_reasoning_log_probs(
     soft_block_size: int,
     pad_token_id: int,
     use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
     cycle_callback: Callable[
         [Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]
     ]
@@ -1349,6 +1381,11 @@ def compute_internal_reasoning_log_probs(
         Padding token ID.
     use_bf16
         Whether to use bf16 autocast.
+    soft_bptt_window
+        Number of soft tokens at the end of each cycle's soft block to
+        backpropagate through. Earlier soft tokens are run with no_grad and
+        their hidden states are detached. None means full BPTT through all
+        soft tokens (equivalent to soft_bptt_window=soft_block_size).
     cycle_callback
         Optional callback invoked after each cycle's log_probs are computed.
         Receives (log_probs [BG], cycle_index) and returns log_probs to store.
@@ -1361,6 +1398,9 @@ def compute_internal_reasoning_log_probs(
     tuple[torch.Tensor, torch.Tensor]
         (log_probs [B, G, C], completion_mask [B, G, C])
     """
+    if soft_bptt_window is None:
+        soft_bptt_window = soft_block_size
+    n_no_grad_soft = soft_block_size - soft_bptt_window
     B, G, C = hard_token_ids.shape
     BG = B * G
     device = prompt_token_ids.device
@@ -1412,7 +1452,26 @@ def compute_internal_reasoning_log_probs(
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
-            for _ in range(soft_block_size):
+            if n_no_grad_soft > 0:
+                with torch.no_grad():
+                    for _ in range(n_no_grad_soft):
+                        attn_mask = torch.cat(
+                            [
+                                attn_mask,
+                                torch.ones(BG, 1, dtype=torch.bool, device=device),
+                            ],
+                            dim=1,
+                        )
+                        h = net(
+                            h,
+                            kv_caches=grad_kv_caches,
+                            attention_mask=attn_mask,
+                            return_hidden_states=True,
+                        )
+                        h = net.apply_soft_projection(h)
+                h = h.detach()
+
+            for _ in range(soft_bptt_window):
                 attn_mask = torch.cat(
                     [attn_mask, torch.ones(BG, 1, dtype=torch.bool, device=device)],
                     dim=1,
@@ -1423,8 +1482,7 @@ def compute_internal_reasoning_log_probs(
                     attention_mask=attn_mask,
                     return_hidden_states=True,
                 )
-                if net.soft_projection is not None:
-                    h = net.soft_projection(h)
+                h = net.apply_soft_projection(h)
 
             attn_mask = torch.cat(
                 [attn_mask, torch.ones(BG, 1, dtype=torch.bool, device=device)],
@@ -1442,6 +1500,12 @@ def compute_internal_reasoning_log_probs(
         masked_logits = logits_squeezed + valid_logit_mask.unsqueeze(0)
         lp_all = torch.log_softmax(masked_logits, dim=-1)  # [BG, V]
         lp = lp_all[torch.arange(BG, device=device), flat_hard[:, cycle]]  # [BG]
+
+        # Finished sequences have pad_token_id as hard token, which is not in
+        # valid_hard_token_ids, giving -inf log_prob. Zero these out to prevent
+        # NaN from inf * 0 in masked loss computation (IEEE 754: inf * 0 = NaN).
+        finished_mask = cycle >= flat_n_cycles
+        lp = torch.where(finished_mask, torch.zeros_like(lp), lp)
 
         if cycle_callback is not None:
             lp = cycle_callback(lp, cycle)
@@ -1553,6 +1617,7 @@ def collect_internal_reasoning_micro_batch(
     max_cycles: int,
     collect_old_log_probs: bool,
     use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
 ) -> dict:
     rollout = generate_internal_reasoning_rollout_batch(
         net=net,
@@ -1609,6 +1674,7 @@ def collect_internal_reasoning_micro_batch(
                 soft_block_size=soft_block_size,
                 pad_token_id=pad_token_id,
                 use_bf16=use_bf16,
+                soft_bptt_window=soft_bptt_window,
             )
         else:
             old_log_probs = None
@@ -1652,6 +1718,7 @@ def train_internal_reasoning_grpo(
     move_id_to_name: dict[int, str],
     valid_hard_token_ids: list[int],
     soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
     max_cycles: int = 30,
     beta: float = 0.04,
     eps: float | None = None,
@@ -1697,6 +1764,7 @@ def train_internal_reasoning_grpo(
             max_cycles=max_cycles,
             collect_old_log_probs=collect_old_log_probs,
             use_bf16=use_bf16,
+            soft_bptt_window=soft_bptt_window,
         )
 
     def recompute_fn(
@@ -1727,6 +1795,7 @@ def train_internal_reasoning_grpo(
             soft_block_size=soft_block_size,
             pad_token_id=pad_token_id,
             use_bf16=use_bf16,
+            soft_bptt_window=soft_bptt_window,
             cycle_callback=callback,
         )
         if callback is not None:
