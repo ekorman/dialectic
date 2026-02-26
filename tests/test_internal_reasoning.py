@@ -10,8 +10,10 @@ from dialectic.rl.train import (
     compute_internal_reasoning_log_probs,
     grpo_advantage,
     make_per_cycle_backward_callback,
+    make_sft_per_cycle_backward_callback,
     stack_and_pad_internal_reasoning,
     train_internal_reasoning_grpo,
+    train_internal_reasoning_sft,
 )
 
 DIRECTION_TOKENS = [100, 200, 300, 400]
@@ -936,3 +938,90 @@ class TestSoftBpttWindow:
             for p in tiny_model.parameters()
         )
         assert has_grad, "Should still have gradients from the hard token forward pass"
+
+
+class TestSFT:
+    def _get_move_mappings(self, tokenizer):
+        direction_words = ["up", "down", "left", "right"]
+        valid_ids: list[int] = []
+        move_id_to_name: dict[int, str] = {}
+        move_name_to_id: dict[str, int] = {}
+        for word in direction_words:
+            ids = tokenizer.encode(word, add_special_tokens=False).ids
+            assert len(ids) == 1
+            tid = ids[0]
+            valid_ids.append(tid)
+            move_id_to_name[tid] = word
+            move_name_to_id[word] = tid
+        valid_ids.append(EOS_TOKEN_ID)
+        return valid_ids, move_id_to_name, move_name_to_id
+
+    def test_sft_callback_loss_finite(self):
+        B, C = 2, 4
+        completion_mask = torch.zeros(B, 1, C, dtype=torch.bool)
+        completion_mask[0, 0, :3] = True
+        completion_mask[1, 0, :2] = True
+
+        lp_param = torch.randn(B, requires_grad=True)
+
+        callback = make_sft_per_cycle_backward_callback(
+            B=B,
+            completion_mask=completion_mask,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+
+        result = callback(lp_param, 0)
+        assert result.requires_grad is False
+        assert lp_param.grad is not None
+        assert torch.isfinite(lp_param.grad).all()
+
+    def test_sft_eos_appended(self, tokenizer):
+        valid_ids, move_id_to_name, move_name_to_id = self._get_move_mappings(tokenizer)
+
+        solution = ["right", "down", "right"]
+        move_ids = [move_name_to_id[m] for m in solution]
+        move_ids.append(EOS_TOKEN_ID)
+
+        assert len(move_ids) == 4
+        assert move_ids[-1] == EOS_TOKEN_ID
+        for m_id in move_ids[:-1]:
+            assert m_id in move_name_to_id.values()
+
+    def test_sft_step_runs(self, tiny_model, tokenizer):
+        torch.manual_seed(42)
+        valid_ids, move_id_to_name, move_name_to_id = self._get_move_mappings(tokenizer)
+        env = MazeEnv(config=MazeConfig(height=3, width=3), seed=42)
+        opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+
+        params_before = {
+            name: param.clone() for name, param in tiny_model.named_parameters()
+        }
+
+        train_internal_reasoning_sft(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            state_to_str=maze_state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=PAD_TOKEN_ID,
+            eos_token_id=EOS_TOKEN_ID,
+            move_name_to_id=move_name_to_id,
+            valid_hard_token_ids=valid_ids,
+            move_id_to_name=move_id_to_name,
+            soft_block_size=2,
+            max_cycles=10,
+            max_episodes=4,
+            batch_size=2,
+            accumulation_steps=1,
+            max_grad_norm=1.0,
+            normalize_by_sequence_length=True,
+            use_bf16=False,
+        )
+
+        params_changed = False
+        for name, param in tiny_model.named_parameters():
+            if not torch.allclose(params_before[name], param, atol=1e-8):
+                params_changed = True
+                break
+        assert params_changed, "No parameters changed during SFT training"
