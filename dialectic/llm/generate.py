@@ -842,6 +842,7 @@ def generate_internal_reasoning_tokens(
     temperature: float = 1.0,
     attention_mask: Bool[Tensor, "B L"] | None = None,
     use_bf16: bool = False,
+    think_token_id: int | None = None,
 ) -> InternalReasoningGeneratorOutput:
     """Generate with fixed interleaving: soft_block_size hidden-state passes then 1 hard token per cycle.
 
@@ -906,13 +907,22 @@ def generate_internal_reasoning_tokens(
         )
     h = h[:, -1:]  # [B, 1, D]
 
+    if think_token_id is not None:
+        think_embed = net.embed_tokens(
+            torch.full((B, 1), think_token_id, dtype=torch.long, device=device)
+        )
+
     for cycle in range(max_cycles):
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
-            for _ in range(soft_block_size):
-                h = net(h, kv_caches=kv_caches, return_hidden_states=True)
-                h = net.apply_soft_projection(h)
+            if think_token_id is not None:
+                for _ in range(soft_block_size):
+                    h = net(think_embed, kv_caches=kv_caches, return_hidden_states=True)
+            else:
+                for _ in range(soft_block_size):
+                    h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+                    h = net.apply_soft_projection(h)
 
             h = net(h, kv_caches=kv_caches, return_hidden_states=True)
             logits = net.lm_head(h)  # [B, 1, V]

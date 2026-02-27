@@ -1025,3 +1025,133 @@ class TestSFT:
                 params_changed = True
                 break
         assert params_changed, "No parameters changed during SFT training"
+
+
+class TestThinkTokens:
+    def test_think_token_generation_shape(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 10
+        token_ids = torch.randint(0, 100, (B, L))
+        think_id = 50
+
+        out = generate_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+            think_token_id=think_id,
+        )
+
+        assert out.hard_token_ids.shape == (B, MAX_CYCLES)
+        assert out.hard_log_probs.shape == (B, MAX_CYCLES)
+        assert out.n_cycles.shape == (B,)
+        assert (out.n_cycles <= MAX_CYCLES).all()
+
+        valid_set = set(VALID_HARD_TOKEN_IDS + [PAD_TOKEN_ID])
+        for b in range(B):
+            for c in range(MAX_CYCLES):
+                assert out.hard_token_ids[b, c].item() in valid_set
+
+    def test_think_token_log_probs_shape(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 2, 2, 4
+        L = 6
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        assert log_probs.shape == (B, G, C)
+        assert mask.shape == (B, G, C)
+        assert (log_probs[mask] <= 0).all()
+
+    def test_think_token_grad_flows(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 2
+        L = 4
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in tiny_model.parameters()
+        )
+        assert has_grad, "No gradients flowed through think token path"
+
+    def test_think_token_differs_from_soft(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        lp_soft, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        lp_think, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        assert not torch.allclose(lp_soft, lp_think, atol=1e-5), (
+            "Think token and soft token log probs should differ"
+        )
