@@ -317,6 +317,7 @@ def generate_internal_reasoning_rollout_batch(
     soft_block_size: int = 4,
     max_cycles: int = 30,
     use_bf16: bool = False,
+    think_token_id: int | None = None,
 ) -> InternalReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -347,6 +348,7 @@ def generate_internal_reasoning_rollout_batch(
         temperature=temperature if temperature > 0 else 1.0,
         attention_mask=expanded_attention_mask,
         use_bf16=use_bf16,
+        think_token_id=think_token_id,
     )
     t_generation = time.perf_counter() - t_gen_start
     if was_training:

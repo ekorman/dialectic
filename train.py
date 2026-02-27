@@ -53,6 +53,7 @@ from dialectic.rl.train import (
     rloo_advantage,
     train_grpo,
     train_internal_reasoning_grpo,
+    train_internal_reasoning_sft,
     train_soft_grpo,
 )
 
@@ -281,7 +282,7 @@ def get_maze_reward_fn(
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
-@extty.experiment(project="grpo")
+@extty.experiment(project="hybrid-reasoning")
 def train(
     *,
     env_type: Literal["countdown", "maze"] = "countdown",
@@ -339,6 +340,8 @@ def train(
     soft_bptt_window: int | None = None,
     max_cycles: int = 30,
     soft_projection: bool = False,
+    sft: bool = False,
+    think_token: str | None = None,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -445,6 +448,16 @@ def train(
             move_id_to_name[tid] = word
         valid_hard_token_ids.append(model_info.eos_token_id)
 
+        move_name_to_id: dict[str, int] = {v: k for k, v in move_id_to_name.items()}
+
+        think_token_id: int | None = None
+        if think_token:
+            ids = tokenizer.encode(think_token, add_special_tokens=False).ids
+            assert len(ids) == 1, (
+                f"'{think_token}' must be a single token, got {len(ids)}"
+            )
+            think_token_id = ids[0]
+
         ir_reward_fn = get_maze_reward_fn(
             answer_tags_weight=0.0,
             validity_weight=maze_validity_weight,
@@ -497,6 +510,7 @@ def train(
                 move_id_to_name=move_id_to_name,
                 soft_block_size=soft_block_size,
                 max_cycles=max_cycles,
+                think_token_id=think_token_id,
             )
         else:
             val_config = ValidationConfig(
@@ -514,7 +528,36 @@ def train(
             )
 
     try:
-        if internal_reasoning:
+        if sft:
+            assert internal_reasoning and env_type == "maze", (
+                "--sft requires --internal-reasoning and --env maze"
+            )
+            train_internal_reasoning_sft(
+                net=net,
+                opt=opt,
+                env=env,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                pad_token_id=model_info.pad_token_id,
+                eos_token_id=model_info.eos_token_id,
+                move_name_to_id=move_name_to_id,
+                valid_hard_token_ids=valid_hard_token_ids,
+                move_id_to_name=move_id_to_name,
+                soft_block_size=soft_block_size,
+                soft_bptt_window=soft_bptt_window,
+                max_cycles=max_cycles,
+                max_episodes=max_episodes,
+                batch_size=batch_size,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+                val_config=val_config,
+                val_freq=val_freq,
+                think_token_id=think_token_id,
+            )
+        elif internal_reasoning:
             train_internal_reasoning_grpo(
                 net=net,
                 opt=opt,
@@ -546,6 +589,7 @@ def train(
                 normalize_by_sequence_length=normalize_by_sequence_length,
                 val_config=val_config,
                 val_freq=val_freq,
+                think_token_id=think_token_id,
             )
         elif soft_tokens:
             train_soft_grpo(
@@ -818,6 +862,19 @@ def main():
         help="Add a learnable D->D projection for soft token hidden states (identity-initialized)",
     )
     parser.add_argument(
+        "--sft",
+        action="store_true",
+        default=False,
+        help="Supervised fine-tuning with BFS ground-truth (requires --internal-reasoning --env maze)",
+    )
+    parser.add_argument(
+        "--think-token",
+        type=str,
+        default=None,
+        help="Use discrete think tokens instead of soft tokens (e.g., 'wait'). "
+        "Requires --internal-reasoning.",
+    )
+    parser.add_argument(
         "--soft-tokens",
         action="store_true",
         default=False,
@@ -969,6 +1026,8 @@ def main():
         soft_bptt_window=args.soft_bptt_window,
         max_cycles=args.max_cycles,
         soft_projection=args.soft_projection,
+        sft=args.sft,
+        think_token=args.think_token,
     )
 
 

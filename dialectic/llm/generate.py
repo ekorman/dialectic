@@ -416,17 +416,6 @@ class _SoftGenerator(_BaseTokenGenerator):
         if self.attention_mask is not None:
             new_attn = new_hard_mask
             self.attention_mask = torch.cat([self.attention_mask, new_attn], 1)
-            # TODO: think this is dead code that should never be reached, commenting out
-            # for now to test live
-            # if self.attention_mask.shape[1] < self.all_tokens.shape[1]:
-            #     pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
-            #     pad = torch.zeros(
-            #         self.attention_mask.shape[0],
-            #         pad_len,
-            #         dtype=self.attention_mask.dtype,
-            #         device=self.attention_mask.device,
-            #     )
-            #     self.attention_mask = torch.cat([self.attention_mask, pad], 1)
 
         self._switched_to_hard = self._switched_to_hard | need_prefill
         self._max_tokens_prefilled = True
@@ -544,20 +533,6 @@ class _SoftGenerator(_BaseTokenGenerator):
         if self.attention_mask is not None:
             new_mask = ~self._finished.unsqueeze(-1)
             self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
-
-        # TODO: think this is dead code that should never be reached, commenting out
-        # for now to test live
-        # if self.attention_mask is not None and (
-        #     self.attention_mask.shape[1] < self.all_tokens.shape[1]
-        # ):
-        #     pad_len = self.all_tokens.shape[1] - self.attention_mask.shape[1]
-        #     pad = torch.zeros(
-        #         self.attention_mask.shape[0],
-        #         pad_len,
-        #         dtype=self.attention_mask.dtype,
-        #         device=self.attention_mask.device,
-        #     )
-        #     self.attention_mask = torch.cat([self.attention_mask, pad], 1)
 
         if self.prefill:
             self.shadow_seq, self.attention_mask = check_and_apply_prefill(
@@ -842,6 +817,7 @@ def generate_internal_reasoning_tokens(
     temperature: float = 1.0,
     attention_mask: Bool[Tensor, "B L"] | None = None,
     use_bf16: bool = False,
+    think_token_id: int | None = None,
 ) -> InternalReasoningGeneratorOutput:
     """Generate with fixed interleaving: soft_block_size hidden-state passes then 1 hard token per cycle.
 
@@ -906,13 +882,22 @@ def generate_internal_reasoning_tokens(
         )
     h = h[:, -1:]  # [B, 1, D]
 
+    if think_token_id is not None:
+        think_embed = net.embed_tokens(
+            torch.full((B, 1), think_token_id, dtype=torch.long, device=device)
+        )
+
     for cycle in range(max_cycles):
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
-            for _ in range(soft_block_size):
-                h = net(h, kv_caches=kv_caches, return_hidden_states=True)
-                h = net.apply_soft_projection(h)
+            if think_token_id is not None:
+                for _ in range(soft_block_size):
+                    h = net(think_embed, kv_caches=kv_caches, return_hidden_states=True)
+            else:
+                for _ in range(soft_block_size):
+                    h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+                    h = net.apply_soft_projection(h)
 
             h = net(h, kv_caches=kv_caches, return_hidden_states=True)
             logits = net.lm_head(h)  # [B, 1, V]

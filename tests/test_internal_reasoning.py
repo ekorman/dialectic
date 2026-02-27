@@ -10,8 +10,10 @@ from dialectic.rl.train import (
     compute_internal_reasoning_log_probs,
     grpo_advantage,
     make_per_cycle_backward_callback,
+    make_sft_per_cycle_backward_callback,
     stack_and_pad_internal_reasoning,
     train_internal_reasoning_grpo,
+    train_internal_reasoning_sft,
 )
 
 DIRECTION_TOKENS = [100, 200, 300, 400]
@@ -936,3 +938,271 @@ class TestSoftBpttWindow:
             for p in tiny_model.parameters()
         )
         assert has_grad, "Should still have gradients from the hard token forward pass"
+
+
+class TestSFT:
+    def _get_move_mappings(self, tokenizer):
+        direction_words = ["up", "down", "left", "right"]
+        valid_ids: list[int] = []
+        move_id_to_name: dict[int, str] = {}
+        move_name_to_id: dict[str, int] = {}
+        for word in direction_words:
+            ids = tokenizer.encode(word, add_special_tokens=False).ids
+            assert len(ids) == 1
+            tid = ids[0]
+            valid_ids.append(tid)
+            move_id_to_name[tid] = word
+            move_name_to_id[word] = tid
+        valid_ids.append(EOS_TOKEN_ID)
+        return valid_ids, move_id_to_name, move_name_to_id
+
+    def test_sft_callback_loss_finite(self):
+        B, C = 2, 4
+        completion_mask = torch.zeros(B, 1, C, dtype=torch.bool)
+        completion_mask[0, 0, :3] = True
+        completion_mask[1, 0, :2] = True
+
+        lp_param = torch.randn(B, requires_grad=True)
+
+        callback = make_sft_per_cycle_backward_callback(
+            B=B,
+            completion_mask=completion_mask,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+
+        result = callback(lp_param, 0)
+        assert result.requires_grad is False
+        assert lp_param.grad is not None
+        assert torch.isfinite(lp_param.grad).all()
+
+    def test_sft_eos_appended(self, tokenizer):
+        valid_ids, move_id_to_name, move_name_to_id = self._get_move_mappings(tokenizer)
+
+        solution = ["right", "down", "right"]
+        move_ids = [move_name_to_id[m] for m in solution]
+        move_ids.append(EOS_TOKEN_ID)
+
+        assert len(move_ids) == 4
+        assert move_ids[-1] == EOS_TOKEN_ID
+        for m_id in move_ids[:-1]:
+            assert m_id in move_name_to_id.values()
+
+    def test_sft_step_runs(self, tiny_model, tokenizer):
+        torch.manual_seed(42)
+        valid_ids, move_id_to_name, move_name_to_id = self._get_move_mappings(tokenizer)
+        env = MazeEnv(config=MazeConfig(height=3, width=3), seed=42)
+        opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
+
+        params_before = {
+            name: param.clone() for name, param in tiny_model.named_parameters()
+        }
+
+        train_internal_reasoning_sft(
+            net=tiny_model,
+            opt=opt,
+            env=env,
+            state_to_str=maze_state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=PAD_TOKEN_ID,
+            eos_token_id=EOS_TOKEN_ID,
+            move_name_to_id=move_name_to_id,
+            valid_hard_token_ids=valid_ids,
+            move_id_to_name=move_id_to_name,
+            soft_block_size=2,
+            max_cycles=10,
+            max_episodes=4,
+            batch_size=2,
+            accumulation_steps=1,
+            max_grad_norm=1.0,
+            normalize_by_sequence_length=True,
+            use_bf16=False,
+        )
+
+        params_changed = False
+        for name, param in tiny_model.named_parameters():
+            if not torch.allclose(params_before[name], param, atol=1e-8):
+                params_changed = True
+                break
+        assert params_changed, "No parameters changed during SFT training"
+
+
+class TestThinkTokens:
+    def test_think_token_generation_shape(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 10
+        token_ids = torch.randint(0, 100, (B, L))
+        think_id = 50
+
+        out = generate_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+            think_token_id=think_id,
+        )
+
+        assert out.hard_token_ids.shape == (B, MAX_CYCLES)
+        assert out.hard_log_probs.shape == (B, MAX_CYCLES)
+        assert out.n_cycles.shape == (B,)
+        assert (out.n_cycles <= MAX_CYCLES).all()
+
+        valid_set = set(VALID_HARD_TOKEN_IDS + [PAD_TOKEN_ID])
+        for b in range(B):
+            for c in range(MAX_CYCLES):
+                assert out.hard_token_ids[b, c].item() in valid_set
+
+    def test_think_token_log_probs_shape(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 2, 2, 4
+        L = 6
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        assert log_probs.shape == (B, G, C)
+        assert mask.shape == (B, G, C)
+        assert (log_probs[mask] <= 0).all()
+
+    def test_think_token_grad_flows(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 2
+        L = 4
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in tiny_model.parameters()
+        )
+        assert has_grad, "No gradients flowed through think token path"
+
+    def test_think_token_differs_from_soft(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        think_id = 50
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        lp_soft, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        lp_think, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            think_token_id=think_id,
+        )
+
+        assert not torch.allclose(lp_soft, lp_think, atol=1e-5), (
+            "Think token and soft token log probs should differ"
+        )
+
+
+class TestSoftTokenRegeneration:
+    def test_log_probs_change_after_param_update(self, tiny_model):
+        """Soft tokens are regenerated with current params, so log probs should
+        change after a parameter update."""
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        lp_before, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (lp_before * mask).sum()
+        loss.backward()
+        lp_before = lp_before.detach().clone()
+        with torch.no_grad():
+            for p in tiny_model.parameters():
+                if p.grad is not None:
+                    p.add_(p.grad * 0.1)
+        tiny_model.zero_grad()
+
+        lp_after, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        assert not torch.allclose(lp_before, lp_after.detach(), atol=1e-6), (
+            "Log probs should change after parameter update since soft tokens "
+            "are regenerated with current params"
+        )

@@ -177,6 +177,7 @@ def evaluate_internal_reasoning(
     temperature: float = 0.0,
     n_examples: int = 10,
     use_bf16: bool = False,
+    think_token_id: int | None = None,
 ) -> tuple[EvaluationResult, list[extty.Example]]:
     all_rewards: list[float] = []
     all_reward_results: list[list[dict[str, float]]] = []
@@ -204,6 +205,7 @@ def evaluate_internal_reasoning(
             soft_block_size=soft_block_size,
             max_cycles=max_cycles,
             use_bf16=use_bf16,
+            think_token_id=think_token_id,
         )
 
         for g in range(group_size):
