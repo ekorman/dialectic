@@ -1794,6 +1794,13 @@ def train_internal_reasoning_grpo(
     def recompute_fn(
         net: BaseTransformer, mb: dict
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # When a per-cycle callback is active, gradients are accumulated during
+        # compute_internal_reasoning_log_probs (the callback calls .backward()
+        # per cycle to free each cycle's graph immediately). The returned
+        # log_probs are detached and given requires_grad_(True) so the outer
+        # _grpo_train_loop's compute_grpo_loss + backward() still runs for loss
+        # reporting, but is a no-op on model parameters since the log_probs
+        # leaf has no connection to the model graph.
         callback = None
         advs = mb.get("_advs_for_loss")
         if advs is not None:

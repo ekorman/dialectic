@@ -1155,3 +1155,54 @@ class TestThinkTokens:
         assert not torch.allclose(lp_soft, lp_think, atol=1e-5), (
             "Think token and soft token log probs should differ"
         )
+
+
+class TestSoftTokenRegeneration:
+    def test_log_probs_change_after_param_update(self, tiny_model):
+        """Soft tokens are regenerated with current params, so log probs should
+        change after a parameter update."""
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        lp_before, mask = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (lp_before * mask).sum()
+        loss.backward()
+        lp_before = lp_before.detach().clone()
+        with torch.no_grad():
+            for p in tiny_model.parameters():
+                if p.grad is not None:
+                    p.add_(p.grad * 0.1)
+        tiny_model.zero_grad()
+
+        lp_after, _ = compute_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        assert not torch.allclose(lp_before, lp_after.detach(), atol=1e-6), (
+            "Log probs should change after parameter update since soft tokens "
+            "are regenerated with current params"
+        )
