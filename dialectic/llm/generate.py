@@ -18,6 +18,13 @@ from dialectic.llm.templates import (
 
 
 @dataclass
+class InternalReasoningGeneratorOutput:
+    hard_token_ids: Int[torch.Tensor, "B C"]
+    hard_log_probs: Float[torch.Tensor, "B C"]
+    n_cycles: Int[torch.Tensor, " B"]
+
+
+@dataclass
 class PreFill:
     condition: Int[torch.Tensor, " N"]  # (space necessary to avoid F821)
     filling: Int[torch.Tensor, " M"]
@@ -820,4 +827,126 @@ def llama_generate_from_chat(
         max_tokens_generated=max_tokens_generated,
         device=device,
         temperature=temperature,
+    )
+
+
+@torch.inference_mode()
+def generate_internal_reasoning_tokens(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    soft_block_size: int = 4,
+    max_cycles: int = 30,
+    valid_hard_token_ids: list[int] | None = None,
+    done_token_id: int = 151645,
+    pad_token_id: int = 151643,
+    temperature: float = 1.0,
+    attention_mask: Bool[Tensor, "B L"] | None = None,
+    use_bf16: bool = False,
+) -> InternalReasoningGeneratorOutput:
+    """Generate with fixed interleaving: soft_block_size hidden-state passes then 1 hard token per cycle.
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    token_ids
+        Prompt token IDs [B, L].
+    soft_block_size
+        Number of soft (hidden-state passthrough) forward passes per cycle.
+    max_cycles
+        Maximum number of cycles (each cycle produces one hard token).
+    valid_hard_token_ids
+        Token IDs that can be sampled at hard positions. If None, full vocabulary is used.
+    done_token_id
+        Token ID that signals generation is complete.
+    pad_token_id
+        Token ID for padding finished sequences.
+    temperature
+        Sampling temperature for hard tokens.
+    attention_mask
+        Left-padded attention mask for prompt [B, L].
+    use_bf16
+        Whether to use bf16 autocast.
+    """
+    device = token_ids.device
+    B = token_ids.shape[0]
+    L_prompt = token_ids.shape[1]
+
+    max_seq_len = L_prompt + max_cycles * (soft_block_size + 1)
+    kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    hard_token_ids = torch.full(
+        (B, max_cycles), pad_token_id, dtype=torch.long, device=device
+    )
+    hard_log_probs = torch.zeros(B, max_cycles, device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    n_cycles = torch.full((B,), max_cycles, dtype=torch.long, device=device)
+
+    valid_mask: Tensor | None = None
+    if valid_hard_token_ids is not None:
+        valid_mask = torch.full((net.vocab_size,), float("-inf"), device=device)
+        valid_mask[valid_hard_token_ids] = 0.0
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        h: Float[Tensor, "B L D"] = net(
+            token_ids,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+            return_hidden_states=True,
+        )
+    h = h[:, -1:]  # [B, 1, D]
+
+    for cycle in range(max_cycles):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            for _ in range(soft_block_size):
+                h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+                h = net.apply_soft_projection(h)
+
+            h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+            logits = net.lm_head(h)  # [B, 1, V]
+
+        logits_squeezed = logits.squeeze(1).float()  # [B, V]
+        if valid_mask is not None:
+            logits_squeezed = logits_squeezed + valid_mask.unsqueeze(0)
+
+        log_probs_all = torch.log_softmax(logits_squeezed / temperature, dim=-1)
+        probs = torch.softmax(logits_squeezed / temperature, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)  # [B, 1]
+        log_prob = log_probs_all.gather(1, token).squeeze(1)  # [B]
+
+        token = token.squeeze(1)  # [B]
+        token = torch.where(finished, torch.full_like(token, pad_token_id), token)
+        log_prob = torch.where(finished, torch.zeros_like(log_prob), log_prob)
+
+        just_finished = ~finished & (token == done_token_id)
+        n_cycles[just_finished] = cycle + 1
+        finished = finished | (token == done_token_id)
+
+        hard_token_ids[:, cycle] = token
+        hard_log_probs[:, cycle] = log_prob
+
+        if finished.all():
+            break
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net.embed_tokens(token.unsqueeze(1))  # [B, 1, D]
+
+    return InternalReasoningGeneratorOutput(
+        hard_token_ids=hard_token_ids,
+        hard_log_probs=hard_log_probs,
+        n_cycles=n_cycles,
     )

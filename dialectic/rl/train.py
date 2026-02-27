@@ -11,11 +11,16 @@ from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
+from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
-from dialectic.rl.evaluate import evaluate
+from dialectic.rl.evaluate import evaluate, evaluate_internal_reasoning
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
+from dialectic.rl.rollout import (
+    generate_internal_reasoning_rollout_batch,
+    generate_rollout_batch,
+    generate_soft_rollout_batch,
+)
 from dialectic.rl.types import A, E, RewardResult, T
 
 
@@ -44,6 +49,11 @@ class ValidationConfig:
     batch_size: int
     max_tokens_generated: int
     use_bf16: bool
+    internal_reasoning: bool = False
+    valid_hard_token_ids: list[int] | None = None
+    move_id_to_name: dict[int, str] | None = None
+    soft_block_size: int = 4
+    max_cycles: int = 30
 
 
 @torch.no_grad()
@@ -61,23 +71,45 @@ def run_validation(
     for env in val_config.envs:
         env.reseed()
         label = str(env)
-        result, examples = evaluate(
-            net=net,
-            env=env,
-            reward_fn=val_config.reward_fn,
-            state_to_str=val_config.state_to_str,
-            tokenizer=val_config.tokenizer,
-            eos_token_id=val_config.eos_token_id,
-            pad_token_id=val_config.pad_token_id,
-            extractor=val_config.extractor,
-            max_tokens_generated=val_config.max_tokens_generated,
-            max_episodes=val_config.max_episodes,
-            batch_size=val_config.batch_size,
-            group_size=1,
-            temperature=0.0,
-            use_bf16=val_config.use_bf16,
-            n_examples=val_config.max_episodes,
-        )
+        if val_config.internal_reasoning:
+            result, examples = evaluate_internal_reasoning(
+                net=net,
+                env=env,
+                reward_fn=val_config.reward_fn,
+                state_to_str=val_config.state_to_str,
+                tokenizer=val_config.tokenizer,
+                eos_token_id=val_config.eos_token_id,
+                pad_token_id=val_config.pad_token_id,
+                extractor=val_config.extractor,
+                move_id_to_name=val_config.move_id_to_name,
+                valid_hard_token_ids=val_config.valid_hard_token_ids,
+                soft_block_size=val_config.soft_block_size,
+                max_cycles=val_config.max_cycles,
+                max_episodes=val_config.max_episodes,
+                batch_size=val_config.batch_size,
+                group_size=1,
+                temperature=0.0,
+                use_bf16=val_config.use_bf16,
+                n_examples=val_config.max_episodes,
+            )
+        else:
+            result, examples = evaluate(
+                net=net,
+                env=env,
+                reward_fn=val_config.reward_fn,
+                state_to_str=val_config.state_to_str,
+                tokenizer=val_config.tokenizer,
+                eos_token_id=val_config.eos_token_id,
+                pad_token_id=val_config.pad_token_id,
+                extractor=val_config.extractor,
+                max_tokens_generated=val_config.max_tokens_generated,
+                max_episodes=val_config.max_episodes,
+                batch_size=val_config.batch_size,
+                group_size=1,
+                temperature=0.0,
+                use_bf16=val_config.use_bf16,
+                n_examples=val_config.max_episodes,
+            )
 
         metrics[f"val/{label}/reward_mean"] = result.reward_mean
         metrics[f"val/{label}/reward_std"] = result.reward_std
@@ -557,6 +589,9 @@ def _grpo_train_loop(
                 ]
                 advs_for_loss: Float[torch.Tensor, "B G 1"] = advs_slice.T.unsqueeze(-1)
 
+                micro_batch["_advs_for_loss"] = advs_for_loss
+                micro_batch["_loss_scale"] = 1.0 / accumulation_steps
+
                 with torch.autocast(
                     device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
                 ):
@@ -706,6 +741,10 @@ def _grpo_train_loop(
             if logprob_recompute_max_diffs:
                 metrics["train/logprob_recompute_max_diff"] = max(
                     logprob_recompute_max_diffs
+                )
+            if net.soft_projection_alpha is not None:
+                metrics["train/soft_projection_alpha"] = (
+                    net.soft_projection_alpha.item()
                 )
             extty.log(metrics, step=step)
 
@@ -1265,6 +1304,517 @@ def train_soft_grpo(
         update_ref_net_batch_cadence=update_ref_net_batch_cadence,
         batch_size=batch_size,
         group_size=group_size,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        use_bf16=use_bf16,
+        save_ckpt_freq=save_ckpt_freq,
+        val_config=val_config,
+        val_freq=val_freq,
+    )
+
+
+def stack_and_pad_internal_reasoning(
+    hard_token_ids: list[Integer[torch.Tensor, "B C"]],
+    n_cycles: list[Integer[torch.Tensor, " B"]],
+    pad_token_id: int,
+) -> tuple[Integer[torch.Tensor, "B G C"], Integer[torch.Tensor, "B G"]]:
+    max_c = max(t.shape[1] for t in hard_token_ids)
+    B = hard_token_ids[0].shape[0]
+    G = len(hard_token_ids)
+    device = hard_token_ids[0].device
+
+    stacked_ids = torch.full(
+        (B, G, max_c), pad_token_id, dtype=torch.long, device=device
+    )
+    stacked_n = torch.zeros(B, G, dtype=torch.long, device=device)
+
+    for g, (ids, nc) in enumerate(zip(hard_token_ids, n_cycles)):
+        C = ids.shape[1]
+        stacked_ids[:, g, :C] = ids
+        stacked_n[:, g] = nc
+
+    return stacked_ids, stacked_n
+
+
+def compute_internal_reasoning_log_probs(
+    *,
+    net: BaseTransformer,
+    prompt_token_ids: Integer[torch.Tensor, "B L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+    hard_token_ids: Integer[torch.Tensor, "B G C"],
+    n_cycles: Integer[torch.Tensor, "B G"],
+    valid_hard_token_ids: list[int],
+    soft_block_size: int,
+    pad_token_id: int,
+    use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
+    cycle_callback: Callable[
+        [Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]
+    ]
+    | None = None,
+) -> tuple[Float[torch.Tensor, "B G C"], Bool[torch.Tensor, "B G C"]]:
+    """Compute log probs for internal reasoning trajectories.
+
+    Regenerates soft tokens with current parameters (they cannot be teacher-forced).
+    Uses GradSafeKVCache (list-based concat) instead of standard KVCache to avoid
+    in-place buffer writes that break autograd. Gradients flow through soft tokens
+    within each cycle and are truncated at cycle boundaries via h.detach().
+
+    Parameters
+    ----------
+    net
+        The transformer model.
+    prompt_token_ids
+        Prompt token IDs [B, L].
+    attention_mask
+        Attention mask for prompt [B, L].
+    hard_token_ids
+        Known hard tokens per cycle [B, G, C].
+    n_cycles
+        Actual number of cycles per sample [B, G].
+    valid_hard_token_ids
+        Token IDs that can be sampled at hard positions.
+    soft_block_size
+        Number of soft forward passes per cycle.
+    pad_token_id
+        Padding token ID.
+    use_bf16
+        Whether to use bf16 autocast.
+    soft_bptt_window
+        Number of soft tokens at the end of each cycle's soft block to
+        backpropagate through. Earlier soft tokens are run with no_grad and
+        their hidden states are detached. None means full BPTT through all
+        soft tokens (equivalent to soft_bptt_window=soft_block_size).
+    cycle_callback
+        Optional callback invoked after each cycle's log_probs are computed.
+        Receives (log_probs [BG], cycle_index) and returns log_probs to store.
+        Use this for per-cycle backward: the callback computes the cycle's loss
+        contribution, calls backward() to free the cycle's autograd graph
+        immediately, and returns detached log_probs.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (log_probs [B, G, C], completion_mask [B, G, C])
+    """
+    if soft_bptt_window is None:
+        soft_bptt_window = soft_block_size
+    n_no_grad_soft = soft_block_size - soft_bptt_window
+    B, G, C = hard_token_ids.shape
+    BG = B * G
+    device = prompt_token_ids.device
+
+    flat_prompt = prompt_token_ids.repeat_interleave(G, dim=0)  # [BG, L]
+    flat_mask = attention_mask.repeat_interleave(G, dim=0)  # [BG, L]
+    flat_hard = hard_token_ids.view(BG, C)  # [BG, C]
+    flat_n_cycles = n_cycles.view(BG)  # [BG]
+
+    L_prompt = flat_prompt.shape[1]
+    max_actual_cycles = int(flat_n_cycles.max().item())
+    max_seq_len = L_prompt + max_actual_cycles * (soft_block_size + 1)
+
+    std_kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    valid_logit_mask = torch.full((net.vocab_size,), float("-inf"), device=device)
+    valid_logit_mask[valid_hard_token_ids] = 0.0
+
+    with torch.no_grad():
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                flat_prompt,
+                kv_caches=std_kv_caches,
+                attention_mask=flat_mask,
+                return_hidden_states=True,
+            )
+    h = h[:, -1:]  # [BG, 1, D]
+
+    grad_kv_caches: list[GradSafeKVCache | KVCache] = [
+        GradSafeKVCache.from_standard(c) for c in std_kv_caches
+    ]
+
+    attn_mask = flat_mask
+
+    all_log_probs = []
+    for cycle in range(max_actual_cycles):
+        h = h.detach()
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            if n_no_grad_soft > 0:
+                with torch.no_grad():
+                    for _ in range(n_no_grad_soft):
+                        attn_mask = torch.cat(
+                            [
+                                attn_mask,
+                                torch.ones(BG, 1, dtype=torch.bool, device=device),
+                            ],
+                            dim=1,
+                        )
+                        h = net(
+                            h,
+                            kv_caches=grad_kv_caches,
+                            attention_mask=attn_mask,
+                            return_hidden_states=True,
+                        )
+                        h = net.apply_soft_projection(h)
+                h = h.detach()
+
+            for _ in range(soft_bptt_window):
+                attn_mask = torch.cat(
+                    [attn_mask, torch.ones(BG, 1, dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+                h = net(
+                    h,
+                    kv_caches=grad_kv_caches,
+                    attention_mask=attn_mask,
+                    return_hidden_states=True,
+                )
+                h = net.apply_soft_projection(h)
+
+            attn_mask = torch.cat(
+                [attn_mask, torch.ones(BG, 1, dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            h_hard = net(
+                h,
+                kv_caches=grad_kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
+            logits = net.lm_head(h_hard)  # [BG, 1, V]
+
+        logits_squeezed = logits.squeeze(1).float()  # [BG, V]
+        masked_logits = logits_squeezed + valid_logit_mask.unsqueeze(0)
+        lp_all = torch.log_softmax(masked_logits, dim=-1)  # [BG, V]
+        lp = lp_all[torch.arange(BG, device=device), flat_hard[:, cycle]]  # [BG]
+
+        # Finished sequences have pad_token_id as hard token, which is not in
+        # valid_hard_token_ids, giving -inf log_prob. Zero these out to prevent
+        # NaN from inf * 0 in masked loss computation (IEEE 754: inf * 0 = NaN).
+        finished_mask = cycle >= flat_n_cycles
+        lp = torch.where(finished_mask, torch.zeros_like(lp), lp)
+
+        if cycle_callback is not None:
+            lp = cycle_callback(lp, cycle)
+
+        all_log_probs.append(lp)
+
+        for gc in grad_kv_caches:
+            assert isinstance(gc, GradSafeKVCache)
+            gc.freeze()
+
+        if cycle < max_actual_cycles - 1:
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+                ):
+                    h = net.embed_tokens(flat_hard[:, cycle].unsqueeze(1))
+
+    log_probs = torch.stack(all_log_probs, dim=1)  # [BG, max_actual_cycles]
+
+    if max_actual_cycles < C:
+        pad_lp = torch.zeros(BG, C - max_actual_cycles, device=device)
+        log_probs = torch.cat([log_probs, pad_lp], dim=1)
+
+    log_probs = log_probs.view(B, G, C)
+
+    cycle_indices = (
+        torch.arange(C, device=device).unsqueeze(0).unsqueeze(0).expand(B, G, C)
+    )
+    completion_mask = cycle_indices < n_cycles.unsqueeze(-1)
+
+    return log_probs, completion_mask
+
+
+def make_per_cycle_backward_callback(
+    *,
+    B: int,
+    G: int,
+    advs: Float[torch.Tensor, "B G 1"],
+    completion_mask: Bool[torch.Tensor, "B G C"],
+    old_log_probs: Float[torch.Tensor, "B G C"] | None,
+    ref_log_probs: Float[torch.Tensor, "B G C"] | None,
+    beta: float,
+    eps: float | None,
+    normalize_by_sequence_length: bool,
+    loss_scale: float,
+) -> Callable[[Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]]:
+    """Build a cycle_callback that computes per-cycle GRPO loss and calls backward.
+
+    This frees each cycle's autograd graph immediately, reducing peak memory
+    from O(C) cycles to O(1).
+    """
+    advs_bg = advs.squeeze(-1)  # [B, G]
+    if normalize_by_sequence_length:
+        seq_lengths = completion_mask.sum(dim=-1).clamp(min=1).float()  # [B, G]
+    else:
+        seq_lengths = torch.ones(B, G, device=advs.device)
+
+    def callback(
+        lp: Float[torch.Tensor, "B G"], cycle_idx: int
+    ) -> Float[torch.Tensor, "B G"]:
+        lp_bg = lp.view(B, G)
+        mask_c = completion_mask[:, :, cycle_idx]
+
+        if eps is not None and old_log_probs is not None:
+            ratio = (lp_bg - old_log_probs[:, :, cycle_idx]).exp()
+            unclipped = ratio * advs_bg
+            clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs_bg
+            main_obj = torch.min(unclipped, clipped)
+            dual_clip_obj = 3.0 * advs_bg
+            main_obj = torch.where(
+                advs_bg < 0, torch.max(main_obj, dual_clip_obj), main_obj
+            )
+        else:
+            main_obj = lp_bg * advs_bg
+
+        cycle_loss = -(main_obj * mask_c / seq_lengths).mean()
+
+        if beta != 0 and ref_log_probs is not None:
+            kl_diff = torch.clamp(
+                ref_log_probs[:, :, cycle_idx] - lp_bg, min=-20, max=20
+            )
+            kl = torch.clamp(torch.exp(kl_diff) - kl_diff - 1, min=-10, max=10)
+            cycle_loss = cycle_loss + beta * (kl * mask_c / seq_lengths).mean()
+
+        (cycle_loss * loss_scale).backward()
+        return lp.detach()
+
+    return callback
+
+
+@torch.no_grad()
+def collect_internal_reasoning_micro_batch(
+    *,
+    net: BaseTransformer,
+    ref_net: BaseTransformer | None,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[list[str]], E],
+    move_id_to_name: dict[int, str],
+    valid_hard_token_ids: list[int],
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    soft_block_size: int,
+    max_cycles: int,
+    collect_old_log_probs: bool,
+    use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
+) -> dict:
+    rollout = generate_internal_reasoning_rollout_batch(
+        net=net,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        extractor=extractor,
+        move_id_to_name=move_id_to_name,
+        valid_hard_token_ids=valid_hard_token_ids,
+        batch_size=batch_size,
+        group_size=group_size,
+        temperature=temperature,
+        soft_block_size=soft_block_size,
+        max_cycles=max_cycles,
+        use_bf16=use_bf16,
+    )
+
+    stacked_hard_ids, stacked_n_cycles = stack_and_pad_internal_reasoning(
+        rollout.hard_token_ids, rollout.n_cycles, pad_token_id
+    )
+
+    device = next(net.parameters()).device
+    t_logprobs_start = time.perf_counter()
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        if ref_net is not None:
+            ref_log_probs, _ = compute_internal_reasoning_log_probs(
+                net=ref_net,
+                prompt_token_ids=rollout.prompt_token_ids,
+                attention_mask=rollout.attention_mask,
+                hard_token_ids=stacked_hard_ids,
+                n_cycles=stacked_n_cycles,
+                valid_hard_token_ids=valid_hard_token_ids,
+                soft_block_size=soft_block_size,
+                pad_token_id=pad_token_id,
+                use_bf16=use_bf16,
+            )
+        else:
+            ref_log_probs = None
+
+        if collect_old_log_probs:
+            old_log_probs, completion_mask = compute_internal_reasoning_log_probs(
+                net=net,
+                prompt_token_ids=rollout.prompt_token_ids,
+                attention_mask=rollout.attention_mask,
+                hard_token_ids=stacked_hard_ids,
+                n_cycles=stacked_n_cycles,
+                valid_hard_token_ids=valid_hard_token_ids,
+                soft_block_size=soft_block_size,
+                pad_token_id=pad_token_id,
+                use_bf16=use_bf16,
+                soft_bptt_window=soft_bptt_window,
+            )
+        else:
+            old_log_probs = None
+            cycle_indices = torch.arange(stacked_hard_ids.shape[2], device=device)
+            cycle_indices = (
+                cycle_indices.unsqueeze(0).unsqueeze(0).expand_as(stacked_hard_ids)
+            )
+            completion_mask = cycle_indices < stacked_n_cycles.unsqueeze(-1)
+
+    t_logprobs = time.perf_counter() - t_logprobs_start
+
+    return {
+        "prompts": rollout.prompts,
+        "env_responses": rollout.env_responses,
+        "prompt_token_ids": rollout.prompt_token_ids,
+        "attention_mask": rollout.attention_mask,
+        "hard_token_ids": stacked_hard_ids,
+        "n_cycles": stacked_n_cycles,
+        "output_strs": rollout.output_strs,
+        "reward_results": rollout.reward_results,
+        "rewards": rollout.rewards,
+        "ref_log_probs": ref_log_probs,
+        "old_log_probs": old_log_probs,
+        "completion_mask": completion_mask,
+        "t_gen": rollout.t_generation,
+        "t_logprobs": t_logprobs,
+    }
+
+
+def train_internal_reasoning_grpo(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[list[str]], E],
+    move_id_to_name: dict[int, str],
+    valid_hard_token_ids: list[int],
+    soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
+    max_cycles: int = 30,
+    beta: float = 0.04,
+    eps: float | None = None,
+    mu: int = 1,
+    max_episodes: int = 1000,
+    update_ref_net_batch_cadence: int = 100,
+    batch_size: int = 2,
+    group_size: int = 8,
+    temperature: float = 0.7,
+    advantage_fn: Callable[
+        [Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]
+    ] = grpo_advantage,
+    normalize_by_sequence_length: bool = True,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
+    val_config: ValidationConfig | None = None,
+    val_freq: int = 0,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    collect_old_log_probs = eps is not None
+
+    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
+        return collect_internal_reasoning_micro_batch(
+            net=net,
+            ref_net=ref_net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            move_id_to_name=move_id_to_name,
+            valid_hard_token_ids=valid_hard_token_ids,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            collect_old_log_probs=collect_old_log_probs,
+            use_bf16=use_bf16,
+            soft_bptt_window=soft_bptt_window,
+        )
+
+    def recompute_fn(
+        net: BaseTransformer, mb: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        callback = None
+        advs = mb.get("_advs_for_loss")
+        if advs is not None:
+            callback = make_per_cycle_backward_callback(
+                B=mb["hard_token_ids"].shape[0],
+                G=mb["hard_token_ids"].shape[1],
+                advs=advs,
+                completion_mask=mb["completion_mask"],
+                old_log_probs=mb["old_log_probs"],
+                ref_log_probs=mb["ref_log_probs"],
+                beta=beta,
+                eps=eps,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+                loss_scale=mb.get("_loss_scale", 1.0),
+            )
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=net,
+            prompt_token_ids=mb["prompt_token_ids"],
+            attention_mask=mb["attention_mask"],
+            hard_token_ids=mb["hard_token_ids"],
+            n_cycles=mb["n_cycles"],
+            valid_hard_token_ids=valid_hard_token_ids,
+            soft_block_size=soft_block_size,
+            pad_token_id=pad_token_id,
+            use_bf16=use_bf16,
+            soft_bptt_window=soft_bptt_window,
+            cycle_callback=callback,
+        )
+        if callback is not None:
+            log_probs = log_probs.detach().requires_grad_(True)
+        return log_probs, mask
+
+    _grpo_train_loop(
+        net=net,
+        opt=opt,
+        collect_fn=collect_fn,
+        recompute_log_probs_fn=recompute_fn,
+        beta=beta,
+        eps=eps,
+        mu=mu,
+        max_episodes=max_episodes,
+        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+        batch_size=batch_size,
+        group_size=group_size,
+        advantage_fn=advantage_fn,
         normalize_by_sequence_length=normalize_by_sequence_length,
         accumulation_steps=accumulation_steps,
         max_grad_norm=max_grad_norm,
