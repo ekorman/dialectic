@@ -282,7 +282,7 @@ def get_maze_reward_fn(
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
-@extty.experiment(project="grpo")
+@extty.experiment(project="hybrid-reasoning")
 def train(
     *,
     env_type: Literal["countdown", "maze"] = "countdown",
