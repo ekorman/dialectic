@@ -38,19 +38,28 @@ def MockGenerateModel():
     return _MockGenerateModel
 
 
+TINY_QWEN_KWARGS = dict(
+    d=32,
+    vocab_size=151936,
+    n_decoder_layers=2,
+    attn_head_d=16,
+    attn_num_heads=4,
+    attn_num_kv_heads=2,
+    mlp_hidden_d=64,
+    tie_weights=True,
+)
+
+
 @pytest.fixture
 def tiny_model():
     torch.manual_seed(1000)
-    return create_qwen(
-        d=32,
-        vocab_size=151936,
-        n_decoder_layers=2,
-        attn_head_d=16,
-        attn_num_heads=4,
-        attn_num_kv_heads=2,
-        mlp_hidden_d=64,
-        tie_weights=True,
-    )
+    return create_qwen(**TINY_QWEN_KWARGS)
+
+
+@pytest.fixture
+def tiny_model_with_soft_projection():
+    torch.manual_seed(1000)
+    return create_qwen(**TINY_QWEN_KWARGS, soft_projection=True)
 
 
 @pytest.fixture

@@ -1,4 +1,3 @@
-import random
 from dataclasses import dataclass
 from typing import Callable
 
@@ -9,7 +8,10 @@ from tokenizers import Tokenizer
 from dialectic.llm.base import BaseTransformer
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import generate_rollout_batch
+from dialectic.rl.rollout import (
+    generate_internal_reasoning_rollout_batch,
+    generate_rollout_batch,
+)
 from dialectic.rl.types import A, E, T
 
 
@@ -135,10 +137,108 @@ def evaluate(
             name: sum(vals) / len(vals) for name, vals in all_components.items()
         }
 
-    sample_idxs = random.sample(
-        range(len(all_prompts)), min(n_examples, len(all_prompts))
-    )
+    sample_idxs = range(min(n_examples, len(all_prompts)))
 
+    examples = [
+        extty.Example(
+            prompt=all_prompts[i],
+            responses=all_output_strs_nested[i],
+            rewards=all_reward_results[i],
+        )
+        for i in sample_idxs
+    ]
+
+    return EvaluationResult(
+        n_episodes=n_episodes,
+        reward_mean=reward_mean,
+        reward_std=reward_std,
+        component_means=component_means,
+    ), examples
+
+
+@torch.no_grad()
+def evaluate_internal_reasoning(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    extractor: Callable[[list[str]], E],
+    move_id_to_name: dict[int, str],
+    valid_hard_token_ids: list[int],
+    soft_block_size: int,
+    max_cycles: int,
+    max_episodes: int,
+    batch_size: int = 1,
+    group_size: int = 1,
+    temperature: float = 0.0,
+    n_examples: int = 10,
+    use_bf16: bool = False,
+    think_token_id: int | None = None,
+) -> tuple[EvaluationResult, list[extty.Example]]:
+    all_rewards: list[float] = []
+    all_reward_results: list[list[dict[str, float]]] = []
+    all_prompts: list[str] = []
+    all_output_strs_nested: list[list[str]] = []
+
+    n_episodes = 0
+    while n_episodes < max_episodes:
+        current_batch_size = min(batch_size, max_episodes - n_episodes)
+
+        rollout = generate_internal_reasoning_rollout_batch(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            move_id_to_name=move_id_to_name,
+            valid_hard_token_ids=valid_hard_token_ids,
+            batch_size=current_batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            use_bf16=use_bf16,
+            think_token_id=think_token_id,
+        )
+
+        for g in range(group_size):
+            for b in range(current_batch_size):
+                all_rewards.append(rollout.reward_results[g][b].total)
+
+        for b in range(current_batch_size):
+            all_prompts.append(rollout.prompts[b])
+            all_output_strs_nested.append(
+                [rollout.output_strs[g][b] for g in range(group_size)]
+            )
+            all_reward_results.append(
+                [rollout.reward_results[g][b].components for g in range(group_size)]
+            )
+
+        n_episodes += current_batch_size
+
+    reward_tensor = torch.tensor(all_rewards)
+    reward_mean = reward_tensor.mean().item()
+    reward_std = reward_tensor.std().item()
+
+    flat_reward_results = [r for row in all_reward_results for r in row]
+    component_means: dict[str, float] = {}
+    if flat_reward_results:
+        all_components: dict[str, list[float]] = {}
+        for r in flat_reward_results:
+            for name, value in r.items():
+                all_components.setdefault(name, []).append(value)
+        component_means = {
+            name: sum(vals) / len(vals) for name, vals in all_components.items()
+        }
+
+    sample_idxs = range(min(n_examples, len(all_prompts)))
     examples = [
         extty.Example(
             prompt=all_prompts[i],

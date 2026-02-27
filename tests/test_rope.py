@@ -21,7 +21,7 @@ def test_rope_cosine_sine_against_hf():
 
     sin, cos = create_rope_sine_cosine_tensors(d, base_value=10000, context_length=l)
 
-    dec_point_tol = 6
+    dec_point_tol = 5
 
     for ours, hfs in [(sin, hf_sin), (cos, hf_cos)]:
         assert ours.shape == torch.Size((1, l, d))

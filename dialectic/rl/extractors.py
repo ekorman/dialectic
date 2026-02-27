@@ -19,3 +19,41 @@ def extract_from_answer_tags(text: str) -> str | None:
     if match:
         return match.group(1).strip()
     return None
+
+
+_MOVE_ALIASES: dict[str, str] = {
+    "u": "up",
+    "d": "down",
+    "l": "left",
+    "r": "right",
+    "up": "up",
+    "down": "down",
+    "left": "left",
+    "right": "right",
+}
+
+
+def extract_maze_moves(text: str) -> list[str] | None:
+    """
+    Extract maze move sequence from <answer> tags.
+
+    Parses comma/space/newline separated directional tokens
+    (up/down/left/right or U/D/L/R, case-insensitive).
+
+    Parameters
+    ----------
+    text : str
+        Raw model output.
+
+    Returns
+    -------
+    list[str] or None
+        List of normalized moves, or None if no answer tags or no valid tokens.
+    """
+    inner = extract_from_answer_tags(text)
+    if inner is None:
+        return None
+
+    tokens = re.split(r"[,\s]+", inner.lower())
+    moves = [_MOVE_ALIASES[t] for t in tokens if t in _MOVE_ALIASES]
+    return moves if moves else None

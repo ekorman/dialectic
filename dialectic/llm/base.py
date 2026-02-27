@@ -21,6 +21,8 @@ class BaseTransformer(nn.Module):
         rope_base_value: float,
         decoder_layer_factory: Callable,
         tie_weights: bool = False,
+        soft_projection: bool = False,
+        soft_projection_alpha_init: float = 0.0,
     ):
         super().__init__()
         self.d = d
@@ -45,12 +47,32 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
+        if soft_projection:
+            proj = nn.Linear(d, d, bias=False)
+            nn.init.kaiming_uniform_(proj.weight)
+            self.soft_projection: nn.Linear | None = proj
+            self.soft_projection_alpha: nn.Parameter | None = nn.Parameter(
+                torch.tensor(soft_projection_alpha_init)
+            )
+        else:
+            self.soft_projection = None
+            self.soft_projection_alpha = None
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
 
+    def apply_soft_projection(
+        self, h: Float[torch.Tensor, "B 1 D"]
+    ) -> Float[torch.Tensor, "B 1 D"]:
+        """Apply residual soft projection: h + alpha * proj(h)."""
+        if self.soft_projection is None:
+            return h
+        return h + self.soft_projection_alpha * self.soft_projection(h)
+
     def forward(
         self,
-        x: Int[torch.Tensor, "B L"] | Float[torch.Tensor, "B L V"],
+        x: Int[torch.Tensor, "B L"]
+        | Float[torch.Tensor, "B L V"]
+        | Float[torch.Tensor, "B L D"],
         kv_caches: list[KVCache] | None = None,
         attention_mask: torch.Tensor | None = None,
         return_all_logits: bool = False,
@@ -59,10 +81,12 @@ class BaseTransformer(nn.Module):
     ):
         if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
-        else:
+        elif x.shape[-1] == self.vocab_size:
             x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
             if soft_token_noise is not None:
                 x += soft_token_noise
+        else:
+            pass  # D-dim embeddings (noise already folded in)
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
