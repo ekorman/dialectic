@@ -720,10 +720,11 @@ class TestSoftProjection:
         )
         assert (out_with_proj.hard_token_ids == out_no_proj.hard_token_ids).all()
 
-    def test_alpha_receives_gradients_at_zero(self, tiny_model_with_soft_projection):
-        """With alpha=0, alpha gets gradients so it can grow."""
+    def test_alpha_receives_gradients(self, tiny_model_with_soft_projection):
+        """Alpha gets gradients when nonzero (at zero, |alpha| has zero gradient)."""
         torch.manual_seed(42)
         model = tiny_model_with_soft_projection
+        model.soft_projection_alpha.data.fill_(0.01)
         model.train()
 
         B, G, C = 1, 1, 3

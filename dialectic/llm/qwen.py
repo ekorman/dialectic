@@ -50,6 +50,8 @@ def create_qwen(
     tie_weights: bool,
     rope_base_value: int = 1000000,
     soft_projection: bool = False,
+    soft_projection_alpha_init: float = 0.0,
+    soft_projection_rank: int | None = None,
 ):
     return BaseTransformer(
         d=d,
@@ -64,6 +66,8 @@ def create_qwen(
         decoder_layer_factory=create_qwen_decoder_layer,
         tie_weights=tie_weights,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
 
 
@@ -92,7 +96,10 @@ QWEN3_4B_WEIGHTS = Artifact(
 
 
 def load_qwen3_06b(
-    pretrained_weights: bool = False, soft_projection: bool = False
+    pretrained_weights: bool = False,
+    soft_projection: bool = False,
+    soft_projection_alpha_init: float = 0.0,
+    soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(
         d=1024,
@@ -105,6 +112,8 @@ def load_qwen3_06b(
         rope_base_value=1000000,
         tie_weights=True,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
     if pretrained_weights:
         sd = load_state_dict_from_artifact(
@@ -116,7 +125,10 @@ def load_qwen3_06b(
 
 
 def load_qwen3_17b(
-    pretrained_weights: bool = False, soft_projection: bool = False
+    pretrained_weights: bool = False,
+    soft_projection: bool = False,
+    soft_projection_alpha_init: float = 0.0,
+    soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(
         d=2048,
@@ -129,6 +141,8 @@ def load_qwen3_17b(
         rope_base_value=1000000,
         tie_weights=True,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
     if pretrained_weights:
         sd = load_state_dict_from_artifact(
@@ -140,7 +154,10 @@ def load_qwen3_17b(
 
 
 def load_qwen3_4b(
-    pretrained_weights: bool = False, soft_projection: bool = False
+    pretrained_weights: bool = False,
+    soft_projection: bool = False,
+    soft_projection_alpha_init: float = 0.0,
+    soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(
         d=2560,
@@ -153,6 +170,8 @@ def load_qwen3_4b(
         rope_base_value=1000000,
         tie_weights=True,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
     if pretrained_weights:
         sd = load_state_dict_from_artifact(

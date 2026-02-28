@@ -340,6 +340,8 @@ def train(
     soft_bptt_window: int | None = None,
     max_cycles: int = 30,
     soft_projection: bool = False,
+    soft_projection_alpha_init: float = 0.0,
+    soft_projection_rank: int | None = None,
     sft: bool = False,
     think_token: str | None = None,
 ):
@@ -347,7 +349,11 @@ def train(
     torch.manual_seed(seed)
 
     model_info = MODEL_REGISTRY[model_name]
-    net = model_info.load_net(soft_projection=soft_projection)
+    net = model_info.load_net(
+        soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
+    )
     tokenizer = model_info.load_tokenizer()
 
     if compile_model:
@@ -862,6 +868,18 @@ def main():
         help="Add a learnable D->D projection for soft token hidden states (identity-initialized)",
     )
     parser.add_argument(
+        "--soft-projection-alpha-init",
+        type=float,
+        default=0.0,
+        help="Initial value for soft projection alpha parameter (default: 0.0)",
+    )
+    parser.add_argument(
+        "--soft-projection-rank",
+        type=int,
+        default=None,
+        help="Low-rank factorization for soft projection (D->r->D). Requires --soft-projection.",
+    )
+    parser.add_argument(
         "--sft",
         action="store_true",
         default=False,
@@ -1026,6 +1044,8 @@ def main():
         soft_bptt_window=args.soft_bptt_window,
         max_cycles=args.max_cycles,
         soft_projection=args.soft_projection,
+        soft_projection_alpha_init=args.soft_projection_alpha_init,
+        soft_projection_rank=args.soft_projection_rank,
         sft=args.sft,
         think_token=args.think_token,
     )
