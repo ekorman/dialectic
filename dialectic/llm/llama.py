@@ -55,6 +55,8 @@ def create_llama(
     tie_weights: bool,
     rope_base_value: int = 500000,
     soft_projection: bool = False,
+    soft_projection_alpha_init: float = 1e-3,
+    soft_projection_rank: int | None = None,
 ):
     return BaseTransformer(
         d=d,
@@ -69,6 +71,8 @@ def create_llama(
         tie_weights=tie_weights,
         decoder_layer_factory=create_llama_decoder_layer,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
 
 
@@ -99,7 +103,10 @@ LLAMA_32_TOKENIZER = Artifact(
 
 
 def load_llama_32_1b_instruct(
-    pretrained_weights: bool = False, soft_projection: bool = False
+    pretrained_weights: bool = False,
+    soft_projection: bool = False,
+    soft_projection_alpha_init: float = 1e-3,
+    soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_llama(
         d=2048,
@@ -112,6 +119,8 @@ def load_llama_32_1b_instruct(
         rope_base_value=500000,
         tie_weights=True,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
 
     if pretrained_weights:
@@ -124,7 +133,10 @@ def load_llama_32_1b_instruct(
 
 
 def load_llama_32_3b_instruct(
-    pretrained_weights: bool = False, soft_projection: bool = False
+    pretrained_weights: bool = False,
+    soft_projection: bool = False,
+    soft_projection_alpha_init: float = 1e-3,
+    soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_llama(
         d=3072,
@@ -137,6 +149,8 @@ def load_llama_32_3b_instruct(
         rope_base_value=500000,
         tie_weights=True,
         soft_projection=soft_projection,
+        soft_projection_alpha_init=soft_projection_alpha_init,
+        soft_projection_rank=soft_projection_rank,
     )
 
     if pretrained_weights:

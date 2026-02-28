@@ -22,7 +22,8 @@ class BaseTransformer(nn.Module):
         decoder_layer_factory: Callable,
         tie_weights: bool = False,
         soft_projection: bool = False,
-        soft_projection_alpha_init: float = 0.0,
+        soft_projection_alpha_init: float = 1e-3,
+        soft_projection_rank: int | None = None,
     ):
         super().__init__()
         self.d = d
@@ -47,10 +48,23 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
+        if soft_projection_rank is not None and not soft_projection:
+            raise ValueError("soft_projection_rank requires soft_projection=True")
+        if soft_projection_rank is not None and soft_projection_rank <= 0:
+            raise ValueError(
+                f"soft_projection_rank must be positive, got {soft_projection_rank}"
+            )
         if soft_projection:
-            proj = nn.Linear(d, d, bias=False)
-            nn.init.kaiming_uniform_(proj.weight)
-            self.soft_projection: nn.Linear | None = proj
+            if soft_projection_rank is not None:
+                down = nn.Linear(d, soft_projection_rank, bias=False)
+                up = nn.Linear(soft_projection_rank, d, bias=False)
+                nn.init.kaiming_uniform_(down.weight)
+                nn.init.zeros_(up.weight)
+                proj: nn.Module = nn.Sequential(down, up)
+            else:
+                proj = nn.Linear(d, d, bias=False)
+                nn.init.kaiming_uniform_(proj.weight)
+            self.soft_projection: nn.Module | None = proj
             self.soft_projection_alpha: nn.Parameter | None = nn.Parameter(
                 torch.tensor(soft_projection_alpha_init)
             )
@@ -66,7 +80,7 @@ class BaseTransformer(nn.Module):
         """Apply residual soft projection: h + alpha * proj(h)."""
         if self.soft_projection is None:
             return h
-        return h + self.soft_projection_alpha * self.soft_projection(h)
+        return h + self.soft_projection_alpha.abs() * self.soft_projection(h)
 
     def forward(
         self,
