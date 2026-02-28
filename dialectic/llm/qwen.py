@@ -50,7 +50,7 @@ def create_qwen(
     tie_weights: bool,
     rope_base_value: int = 1000000,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ):
     return BaseTransformer(
@@ -98,7 +98,7 @@ QWEN3_4B_WEIGHTS = Artifact(
 def load_qwen3_06b(
     pretrained_weights: bool = False,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(
@@ -127,7 +127,7 @@ def load_qwen3_06b(
 def load_qwen3_17b(
     pretrained_weights: bool = False,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(
@@ -156,7 +156,7 @@ def load_qwen3_17b(
 def load_qwen3_4b(
     pretrained_weights: bool = False,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_qwen(

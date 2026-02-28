@@ -55,7 +55,7 @@ def create_llama(
     tie_weights: bool,
     rope_base_value: int = 500000,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ):
     return BaseTransformer(
@@ -105,7 +105,7 @@ LLAMA_32_TOKENIZER = Artifact(
 def load_llama_32_1b_instruct(
     pretrained_weights: bool = False,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_llama(
@@ -135,7 +135,7 @@ def load_llama_32_1b_instruct(
 def load_llama_32_3b_instruct(
     pretrained_weights: bool = False,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
 ) -> BaseTransformer:
     net = create_llama(

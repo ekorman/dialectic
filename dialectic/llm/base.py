@@ -48,6 +48,12 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
+        if soft_projection_rank is not None and not soft_projection:
+            raise ValueError("soft_projection_rank requires soft_projection=True")
+        if soft_projection_rank is not None and soft_projection_rank <= 0:
+            raise ValueError(
+                f"soft_projection_rank must be positive, got {soft_projection_rank}"
+            )
         if soft_projection:
             if soft_projection_rank is not None:
                 down = nn.Linear(d, soft_projection_rank, bias=False)

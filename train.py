@@ -340,7 +340,7 @@ def train(
     soft_bptt_window: int | None = None,
     max_cycles: int = 30,
     soft_projection: bool = False,
-    soft_projection_alpha_init: float = 0.0,
+    soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
     sft: bool = False,
     think_token: str | None = None,
@@ -865,13 +865,13 @@ def main():
         "--soft-projection",
         action="store_true",
         default=False,
-        help="Add a learnable D->D projection for soft token hidden states (identity-initialized)",
+        help="Add a learnable projection for soft token hidden states",
     )
     parser.add_argument(
         "--soft-projection-alpha-init",
         type=float,
-        default=0.0,
-        help="Initial value for soft projection alpha parameter (default: 0.0)",
+        default=1e-3,
+        help="Initial value for soft projection alpha parameter (default: 1e-3)",
     )
     parser.add_argument(
         "--soft-projection-rank",

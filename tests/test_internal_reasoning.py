@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from dialectic.llm.components import GradSafeKVCache
 from dialectic.llm.generate import generate_internal_reasoning_tokens
@@ -724,7 +725,8 @@ class TestSoftProjection:
         """Alpha gets gradients when nonzero (at zero, |alpha| has zero gradient)."""
         torch.manual_seed(42)
         model = tiny_model_with_soft_projection
-        model.soft_projection_alpha.data.fill_(0.01)
+        with torch.no_grad():
+            model.soft_projection_alpha.fill_(0.01)
         model.train()
 
         B, G, C = 1, 1, 3
@@ -758,7 +760,8 @@ class TestSoftProjection:
         """With alpha != 0, projection weights also receive gradients."""
         torch.manual_seed(42)
         model = tiny_model_with_soft_projection
-        model.soft_projection_alpha.data.fill_(1.0)
+        with torch.no_grad():
+            model.soft_projection_alpha.fill_(1.0)
         model.train()
 
         B, G, C = 1, 1, 3
@@ -785,6 +788,48 @@ class TestSoftProjection:
         assert model.soft_projection is not None
         assert model.soft_projection.weight.grad is not None
         assert model.soft_projection.weight.grad.abs().sum() > 0
+
+    def test_low_rank_projection_forward_and_grads(
+        self, tiny_model_with_low_rank_projection
+    ):
+        """Low-rank projection receives gradients on down/up weights and alpha."""
+        torch.manual_seed(42)
+        model = tiny_model_with_low_rank_projection
+        with torch.no_grad():
+            model.soft_projection_alpha.fill_(1.0)
+            # initialize up projection to nonzero so alpha gets gradient
+            nn.init.kaiming_uniform_(model.soft_projection[1].weight)
+        model.train()
+
+        B, G, C = 1, 1, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.full((B, G, C), VALID_HARD_TOKEN_IDS[0], dtype=torch.long)
+        n_cycles = torch.full((B, G), C, dtype=torch.long)
+
+        log_probs, mask = compute_internal_reasoning_log_probs(
+            net=model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            n_cycles=n_cycles,
+            valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        assert model.soft_projection_alpha is not None
+        assert model.soft_projection_alpha.grad is not None
+        assert model.soft_projection_alpha.grad.abs().item() > 0
+        down, up = model.soft_projection[0], model.soft_projection[1]
+        assert down.weight.grad is not None
+        assert down.weight.grad.abs().sum() > 0
+        assert up.weight.grad is not None
+        assert up.weight.grad.abs().sum() > 0
 
 
 class TestSoftBpttWindow:
