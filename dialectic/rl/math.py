@@ -11,6 +11,7 @@ All problems have verified ground truth answers.
 All answers are integers (no fractions/decimals) to keep output simple.
 """
 
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -523,7 +524,6 @@ def generate_number_properties(
     else:  # gcd
         a = rng.randint(6, 100)
         b = rng.randint(6, 100)
-        import math
 
         answer = math.gcd(a, b)
         question = f"What is the greatest common divisor of {a} and {b}?"

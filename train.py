@@ -427,6 +427,8 @@ def train(
         )
         extractor = extract_maze_moves
     elif env_type == "math":
+        if not sft:
+            raise ValueError("--env math requires --sft")
         math_config = MathDatasetConfig(difficulty=math_difficulty)
         env = MathEnv(config=math_config, seed=seed)
         reward_fn = None

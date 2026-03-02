@@ -877,18 +877,33 @@ def generate_with_soft_prefill(
         )
     h = h[:, -1:]  # [B, 1, D]
 
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+    attn_mask = attention_mask
+
     for _ in range(soft_block_size):
+        attn_mask = torch.cat([attn_mask, ones], dim=1)
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
-            h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+            h = net(
+                h,
+                kv_caches=kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
             h = net.apply_soft_projection(h)
 
+    attn_mask = torch.cat([attn_mask, ones], dim=1)
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
         logits = net.lm_head(
-            net(h, kv_caches=kv_caches, return_hidden_states=True)
+            net(
+                h,
+                kv_caches=kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
         )  # [B, 1, V]
 
     generated = torch.full(
@@ -916,10 +931,15 @@ def generate_with_soft_prefill(
             break
 
         if t < max_new_tokens - 1:
+            attn_mask = torch.cat([attn_mask, ones], dim=1)
             with torch.autocast(
                 device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
             ):
-                logits = net(token.unsqueeze(1), kv_caches=kv_caches)  # [B, 1, V]
+                logits = net(
+                    token.unsqueeze(1),
+                    kv_caches=kv_caches,
+                    attention_mask=attn_mask,
+                )  # [B, 1, V]
 
     return SoftPrefillGeneratorOutput(token_ids=generated, lengths=lengths)
 
