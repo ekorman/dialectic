@@ -34,6 +34,7 @@ class ModelInfo:
         return Tokenizer.from_file(str(get_artifact(self.tokenizer)[0]))
 
 
+# TODO: add the "thinking" versions
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
         net_factory=lambda **kw: load_qwen3_06b(True, **kw),
