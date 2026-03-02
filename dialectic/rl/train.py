@@ -15,7 +15,11 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
-from dialectic.rl.evaluate import evaluate, evaluate_internal_reasoning
+from dialectic.rl.evaluate import (
+    evaluate,
+    evaluate_internal_reasoning,
+    evaluate_soft_prefill,
+)
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
     generate_internal_reasoning_rollout_batch,
@@ -51,6 +55,9 @@ class ValidationConfig:
     max_tokens_generated: int
     use_bf16: bool
     internal_reasoning: bool = False
+    soft_prefill: bool = False
+    answer_extractor: Callable | None = None
+    max_new_tokens: int = 32
     valid_hard_token_ids: list[int] | None = None
     move_id_to_name: dict[int, str] | None = None
     soft_block_size: int = 4
@@ -73,7 +80,23 @@ def run_validation(
     for env in val_config.envs:
         env.reseed()
         label = str(env)
-        if val_config.internal_reasoning:
+        if val_config.soft_prefill:
+            result, examples = evaluate_soft_prefill(
+                net=net,
+                env=env,
+                state_to_str=val_config.state_to_str,
+                answer_extractor=val_config.answer_extractor,
+                tokenizer=val_config.tokenizer,
+                eos_token_id=val_config.eos_token_id,
+                pad_token_id=val_config.pad_token_id,
+                soft_block_size=val_config.soft_block_size,
+                max_new_tokens=val_config.max_new_tokens,
+                max_episodes=val_config.max_episodes,
+                batch_size=val_config.batch_size,
+                use_bf16=val_config.use_bf16,
+                n_examples=val_config.max_episodes,
+            )
+        elif val_config.internal_reasoning:
             result, examples = evaluate_internal_reasoning(
                 net=net,
                 env=env,
@@ -1557,6 +1580,143 @@ def compute_internal_reasoning_log_probs(
     return log_probs, completion_mask
 
 
+def compute_soft_prefill_log_probs(
+    *,
+    net: BaseTransformer,
+    prompt_token_ids: Integer[torch.Tensor, "B L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+    answer_token_ids: Integer[torch.Tensor, "B A"],
+    answer_lengths: Integer[torch.Tensor, " B"],
+    soft_block_size: int,
+    pad_token_id: int,
+    use_bf16: bool = True,
+    soft_bptt_window: int | None = None,
+) -> tuple[Float[torch.Tensor, "B A"], Bool[torch.Tensor, "B A"]]:
+    """Compute log probs for soft-prefill + teacher-forced answer.
+
+    Parameters
+    ----------
+    net
+        The transformer model.
+    prompt_token_ids
+        Prompt token IDs [B, L], left-padded.
+    attention_mask
+        Attention mask for prompt [B, L].
+    answer_token_ids
+        Answer token IDs [B, A], right-padded with pad_token_id.
+    answer_lengths
+        Actual answer length per sample [B].
+    soft_block_size
+        Number of hidden-state passes in the soft block.
+    pad_token_id
+        Padding token ID.
+    use_bf16
+        Whether to use bf16 autocast.
+    soft_bptt_window
+        Number of soft passes at the end to backprop through.
+        None means full BPTT (all soft passes).
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (log_probs [B, A], completion_mask [B, A])
+    """
+    if soft_bptt_window is None:
+        soft_bptt_window = soft_block_size
+    n_no_grad_soft = soft_block_size - soft_bptt_window
+
+    B, L = prompt_token_ids.shape
+    A = answer_token_ids.shape[1]
+    device = prompt_token_ids.device
+
+    max_seq_len = L + soft_block_size + A
+    std_kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    with torch.no_grad():
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                prompt_token_ids,
+                kv_caches=std_kv_caches,
+                attention_mask=attention_mask,
+                return_hidden_states=True,
+            )
+    h = h[:, -1:]  # [B, 1, D]
+
+    grad_kv_caches: list[GradSafeKVCache | KVCache] = [
+        GradSafeKVCache.from_standard(c) for c in std_kv_caches
+    ]
+
+    attn_mask = attention_mask
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        if n_no_grad_soft > 0:
+            with torch.no_grad():
+                for _ in range(n_no_grad_soft):
+                    attn_mask = torch.cat([attn_mask, ones], dim=1)
+                    h = net(
+                        h,
+                        kv_caches=grad_kv_caches,
+                        attention_mask=attn_mask,
+                        return_hidden_states=True,
+                    )
+                    h = net.apply_soft_projection(h)
+            h = h.detach()
+
+        for _ in range(soft_bptt_window):
+            attn_mask = torch.cat([attn_mask, ones], dim=1)
+            h = net(
+                h,
+                kv_caches=grad_kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
+            h = net.apply_soft_projection(h)
+
+        attn_mask = torch.cat([attn_mask, ones], dim=1)
+        logits_0 = net(
+            h,
+            kv_caches=grad_kv_caches,
+            attention_mask=attn_mask,
+        )  # [B, 1, V]
+
+        logits_list = [logits_0]
+        for i in range(A - 1):
+            attn_mask = torch.cat([attn_mask, ones], dim=1)
+            logits_i = net(
+                answer_token_ids[:, i : i + 1],
+                kv_caches=grad_kv_caches,
+                attention_mask=attn_mask,
+            )  # [B, 1, V]
+            logits_list.append(logits_i)
+
+        all_logits = torch.cat(logits_list, dim=1)  # [B, A, V]
+
+    V = all_logits.shape[-1]
+    log_probs_all = -torch.nn.functional.cross_entropy(
+        all_logits.reshape(B * A, V).float(),
+        answer_token_ids.reshape(B * A),
+        reduction="none",
+    ).reshape(B, A)
+
+    answer_indices = torch.arange(A, device=device).unsqueeze(0).expand(B, A)
+    completion_mask = answer_indices < answer_lengths.unsqueeze(1)
+
+    return log_probs_all, completion_mask
+
+
 def make_per_cycle_backward_callback(
     *,
     B: int,
@@ -2019,6 +2179,190 @@ def train_internal_reasoning_sft(
                 "sft/nll_loss": step_nll_sum,
                 "sft/mean_solution_length": (
                     sum(step_solution_lengths) / len(step_solution_lengths)
+                ),
+            }
+            if grad_norm_val is not None:
+                metrics["sft/grad_norm"] = grad_norm_val
+            if net.soft_projection_alpha is not None:
+                metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
+            extty.log(metrics, step=step)
+
+            if step % save_ckpt_freq == 0:
+                extty.save_checkpoint(
+                    step=step,
+                    state_dict=net.state_dict(),
+                    optimizer_state_dict=opt.state_dict(),
+                )
+
+        if val_config is not None and val_freq > 0 and step % val_freq == 0:
+            val_metrics = run_validation(net=net, val_config=val_config)
+            extty.log(val_metrics, step=step)
+
+    if step % save_ckpt_freq != 0 and extty._active_run is not None:
+        extty.save_checkpoint(
+            step=step,
+            state_dict=net.state_dict(),
+            optimizer_state_dict=opt.state_dict(),
+        )
+
+
+def train_math_sft(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
+    max_answer_tokens: int = 16,
+    max_episodes: int = 1000,
+    batch_size: int = 4,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    normalize_by_sequence_length: bool = True,
+    use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
+    val_config: ValidationConfig | None = None,
+    val_freq: int = 0,
+) -> None:
+    """SFT training loop for math with soft prefill.
+
+    Parameters
+    ----------
+    net
+        The transformer model.
+    opt
+        Optimizer.
+    env
+        Math environment (MathEnv).
+    state_to_str
+        Converts env state to prompt string.
+    tokenizer
+        Tokenizer for encoding prompts and answers.
+    pad_token_id
+        Padding token ID.
+    eos_token_id
+        EOS token ID.
+    soft_block_size
+        Number of hidden-state passes in the soft block.
+    soft_bptt_window
+        Number of soft passes at the end to backprop through.
+    max_answer_tokens
+        Maximum answer tokens (including EOS).
+    max_episodes
+        Total training episodes.
+    batch_size
+        Batch size per accumulation step.
+    accumulation_steps
+        Gradient accumulation steps.
+    max_grad_norm
+        Max gradient norm for clipping.
+    normalize_by_sequence_length
+        Whether to normalize NLL by answer length.
+    use_bf16
+        Whether to use bf16 autocast.
+    save_ckpt_freq
+        Checkpoint frequency.
+    val_config
+        Validation configuration.
+    val_freq
+        Validation frequency in steps.
+    """
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    device = next(net.parameters()).device
+    n_episodes = 0
+    step = 0
+
+    while n_episodes < max_episodes:
+        opt.zero_grad()
+        step_nll_sum = 0.0
+        step_answer_lengths: list[int] = []
+
+        for _ in range(accumulation_steps):
+            env_responses = [env.reset() for _ in range(batch_size)]
+
+            prompts = [state_to_str(er.data) for er in env_responses]
+            encoded = tokenizer.encode_batch(prompts)
+            max_prompt_len = max(len(e.ids) for e in encoded)
+            prompt_token_ids = torch.full(
+                (batch_size, max_prompt_len),
+                pad_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask_t = torch.zeros(
+                batch_size, max_prompt_len, dtype=torch.bool, device=device
+            )
+            for b, enc in enumerate(encoded):
+                ids = torch.tensor(enc.ids, device=device)
+                prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
+                attention_mask_t[b, max_prompt_len - len(ids) :] = True
+
+            answer_ids_list: list[list[int]] = []
+            for er in env_responses:
+                ans_enc = tokenizer.encode(er.data.answer, add_special_tokens=False)
+                ans_ids = ans_enc.ids + [eos_token_id]
+                if len(ans_ids) > max_answer_tokens:
+                    ans_ids = ans_ids[:max_answer_tokens]
+                answer_ids_list.append(ans_ids)
+                step_answer_lengths.append(len(ans_ids))
+
+            max_a = max(len(a) for a in answer_ids_list)
+            answer_token_ids = torch.full(
+                (batch_size, max_a), pad_token_id, dtype=torch.long, device=device
+            )
+            answer_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+            for b, aids in enumerate(answer_ids_list):
+                answer_token_ids[b, : len(aids)] = torch.tensor(aids, device=device)
+                answer_lengths[b] = len(aids)
+
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                log_probs, completion_mask = compute_soft_prefill_log_probs(
+                    net=net,
+                    prompt_token_ids=prompt_token_ids,
+                    attention_mask=attention_mask_t,
+                    answer_token_ids=answer_token_ids,
+                    answer_lengths=answer_lengths,
+                    soft_block_size=soft_block_size,
+                    pad_token_id=pad_token_id,
+                    use_bf16=use_bf16,
+                    soft_bptt_window=soft_bptt_window,
+                )
+
+            masked_lp = log_probs * completion_mask
+            if normalize_by_sequence_length:
+                seq_lens = completion_mask.sum(dim=-1).clamp(min=1).float()
+                per_seq_nll = -(masked_lp.sum(dim=-1) / seq_lens)
+            else:
+                per_seq_nll = -masked_lp.sum(dim=-1)
+
+            loss = per_seq_nll.mean() / accumulation_steps
+            loss.backward()
+            step_nll_sum += per_seq_nll.mean().item() / accumulation_steps
+
+        grad_norm_val: float | None = None
+        if max_grad_norm > 0:
+            params = [p for group in opt.param_groups for p in group["params"]]
+            grad_norm_val = torch.nn.utils.clip_grad_norm_(
+                params, max_norm=max_grad_norm
+            ).item()
+        opt.step()
+
+        step += 1
+        n_episodes += batch_size * accumulation_steps
+
+        if extty._active_run is not None:
+            metrics: dict[str, Any] = {
+                "sft/nll_loss": step_nll_sum,
+                "sft/mean_answer_length": (
+                    sum(step_answer_lengths) / len(step_answer_lengths)
                 ),
             }
             if grad_norm_val is not None:

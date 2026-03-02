@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic
 
+from dialectic.rl.math import MathDatasetConfig, generate_problem
 from dialectic.rl.maze import Maze, MazeConfig, generate_maze, tokenize_maze
 from dialectic.rl.types import QA, A, EnvResponse, T
 
@@ -276,6 +277,56 @@ class CountdownEnv(Env[Countdown, None]):
         return EnvResponse(
             is_done=True,
             data=Countdown(prompt=prompt, numbers=numbers, target=target),
+        )
+
+    def step(self, action: None):
+        raise EpisodeIsDoneError
+
+
+@dataclass
+class MathState:
+    prompt: str
+    answer: str
+    problem_type: str
+
+
+class MathEnv(Env[MathState, None]):
+    """
+    Math problem environment.
+
+    Generates random math problems using MathDatasetConfig.
+    Single-step episodes.
+
+    Parameters
+    ----------
+    config : MathDatasetConfig
+        Problem mix and difficulty configuration.
+    seed : int or None
+        Random seed for reproducibility.
+    """
+
+    def __init__(self, *, config: MathDatasetConfig, seed: int | None = None):
+        self.config = config
+        self._seed = seed
+        self.rng = random.Random(seed)
+
+    def reseed(self) -> None:
+        self.rng = random.Random(self._seed)
+
+    def __str__(self) -> str:
+        return f"math_{self.config.difficulty}"
+
+    def reset(self, seed: int | None = None) -> EnvResponse[MathState]:
+        if seed is not None:
+            self.rng.seed(seed)
+        problem = generate_problem(self.config, self.rng)
+        return EnvResponse(
+            is_done=True,
+            data=MathState(
+                prompt=problem.question,
+                answer=str(problem.answer),
+                problem_type=problem.problem_type,
+            ),
         )
 
     def step(self, action: None):

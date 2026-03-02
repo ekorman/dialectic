@@ -805,6 +805,145 @@ def llama_generate_from_chat(
     )
 
 
+@dataclass
+class SoftPrefillGeneratorOutput:
+    token_ids: Int[torch.Tensor, "B T"]
+    lengths: Int[torch.Tensor, " B"]
+
+
+@torch.inference_mode()
+def generate_with_soft_prefill(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    attention_mask: Bool[Tensor, "B L"],
+    soft_block_size: int,
+    max_new_tokens: int = 32,
+    eos_token_id: int = 151645,
+    pad_token_id: int = 151643,
+    temperature: float = 0.0,
+    use_bf16: bool = False,
+) -> SoftPrefillGeneratorOutput:
+    """Generate with soft prefill: run soft block then autoregressive hard tokens.
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    token_ids
+        Prompt token IDs [B, L], left-padded.
+    attention_mask
+        Attention mask for prompt [B, L].
+    soft_block_size
+        Number of hidden-state passes in the soft block.
+    max_new_tokens
+        Maximum tokens to generate after the soft block.
+    eos_token_id
+        Token ID that signals generation is complete.
+    pad_token_id
+        Token ID for padding finished sequences.
+    temperature
+        Sampling temperature (0.0 = greedy).
+    use_bf16
+        Whether to use bf16 autocast.
+
+    Returns
+    -------
+    SoftPrefillGeneratorOutput
+        Generated token IDs [B, max_new_tokens] and lengths [B].
+    """
+    device = token_ids.device
+    B = token_ids.shape[0]
+    L = token_ids.shape[1]
+
+    max_seq_len = L + soft_block_size + max_new_tokens + 1
+    kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        h = net(
+            token_ids,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+            return_hidden_states=True,
+        )
+    h = h[:, -1:]  # [B, 1, D]
+
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+    attn_mask = attention_mask
+
+    for _ in range(soft_block_size):
+        attn_mask = torch.cat([attn_mask, ones], dim=1)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                h,
+                kv_caches=kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
+            h = net.apply_soft_projection(h)
+
+    attn_mask = torch.cat([attn_mask, ones], dim=1)
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        logits = net.lm_head(
+            net(
+                h,
+                kv_caches=kv_caches,
+                attention_mask=attn_mask,
+                return_hidden_states=True,
+            )
+        )  # [B, 1, V]
+
+    generated = torch.full(
+        (B, max_new_tokens), pad_token_id, dtype=torch.long, device=device
+    )
+    lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for t in range(max_new_tokens):
+        logits_squeezed = logits.squeeze(1).float()  # [B, V]
+        if temperature <= 0:
+            token = logits_squeezed.argmax(dim=-1)  # [B]
+        else:
+            probs = torch.softmax(logits_squeezed / temperature, dim=-1)
+            token = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+
+        token = torch.where(finished, torch.full_like(token, pad_token_id), token)
+        generated[:, t] = token
+
+        just_finished = ~finished & (token == eos_token_id)
+        lengths[just_finished] = t + 1
+        finished = finished | (token == eos_token_id)
+
+        if finished.all():
+            break
+
+        if t < max_new_tokens - 1:
+            attn_mask = torch.cat([attn_mask, ones], dim=1)
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                logits = net(
+                    token.unsqueeze(1),
+                    kv_caches=kv_caches,
+                    attention_mask=attn_mask,
+                )  # [B, 1, V]
+
+    return SoftPrefillGeneratorOutput(token_ids=generated, lengths=lengths)
+
+
 @torch.inference_mode()
 def generate_internal_reasoning_tokens(
     net: BaseTransformer,

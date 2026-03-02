@@ -35,8 +35,16 @@ from dialectic.llm.templates import (
     get_qwen_input_text_from_messages,
 )
 from dialectic.llm.utils import get_default_device
-from dialectic.rl.env import Countdown, CountdownEnv, MazeEnv, MazeState
+from dialectic.rl.env import (
+    Countdown,
+    CountdownEnv,
+    MathEnv,
+    MathState,
+    MazeEnv,
+    MazeState,
+)
 from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
+from dialectic.rl.math import MathDatasetConfig
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import (
     answer_tags,
@@ -54,6 +62,7 @@ from dialectic.rl.train import (
     train_grpo,
     train_internal_reasoning_grpo,
     train_internal_reasoning_sft,
+    train_math_sft,
     train_soft_grpo,
 )
 
@@ -210,6 +219,13 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
             assistant_prefill="Let me solve this step by step.",
         ),
     ],
+    "math": [
+        PromptCollection(
+            system_prompt="Solve the math problem. Respond with only the numerical answer.",
+            env_prompt="",
+            assistant_prefill=None,
+        ),
+    ],
 }
 
 
@@ -223,7 +239,7 @@ def get_state_to_str(
     system_prompt: str | None = None,
     assistant_prefill: str | None = None,
 ):
-    def _state_to_str(data: Countdown | MazeState) -> str:
+    def _state_to_str(data: Countdown | MazeState | MathState) -> str:
         msgs = []
         if system_prompt:
             msgs.append(Message(role="system", content=system_prompt))
@@ -285,7 +301,7 @@ MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 @extty.experiment(project="hybrid-reasoning")
 def train(
     *,
-    env_type: Literal["countdown", "maze"] = "countdown",
+    env_type: Literal["countdown", "maze", "math"] = "countdown",
     model_name: str = "qwen3-0.6b",
     device: str | None = None,
     max_episodes: int = 1000,
@@ -309,6 +325,9 @@ def train(
     maze_goal_pos: str = "bottom_right",
     maze_validity_weight: float = 0.0,
     maze_distance_weight: float = 0.5,
+    # math params
+    math_difficulty: str = "easy",
+    max_answer_tokens: int = 16,
     seed: int,
     advantage_fn_type: Literal["grpo", "rloo"],
     compile_model: bool = False,
@@ -407,6 +426,13 @@ def train(
             think_tags_weight=think_tags_weight,
         )
         extractor = extract_maze_moves
+    elif env_type == "math":
+        if not sft:
+            raise ValueError("--env math requires --sft")
+        math_config = MathDatasetConfig(difficulty=math_difficulty)
+        env = MathEnv(config=math_config, seed=seed)
+        reward_fn = None
+        extractor = None
     else:
         raise ValueError(f"Unknown env_type: {env_type}")
 
@@ -489,7 +515,7 @@ def train(
                         prompt_template=env_prompt_template,
                     )
                 )
-        else:
+        elif env_type == "maze":
             val_maze_prompt = (
                 MAZE_INTERNAL_REASONING_PROMPT.env_prompt
                 if internal_reasoning
@@ -498,7 +524,29 @@ def train(
             val_envs = [
                 MazeEnv(config=maze_config, prompt_template=val_maze_prompt, seed=2026)
             ]
-        if internal_reasoning:
+        elif env_type == "math":
+            val_envs = [MathEnv(config=math_config, seed=2026)]
+        else:
+            raise ValueError(f"Unknown env_type for validation: {env_type}")
+        if env_type == "math":
+            val_config = ValidationConfig(
+                envs=val_envs,
+                reward_fn=reward_fn,
+                state_to_str=state_to_str,
+                extractor=lambda x: x,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                max_episodes=val_episodes,
+                batch_size=val_batch_size,
+                max_tokens_generated=max_tokens,
+                use_bf16=use_bf16,
+                soft_prefill=True,
+                answer_extractor=lambda state: state.answer,
+                max_new_tokens=max_answer_tokens,
+                soft_block_size=soft_block_size,
+            )
+        elif internal_reasoning:
             val_config = ValidationConfig(
                 envs=val_envs,
                 reward_fn=ir_reward_fn,
@@ -534,7 +582,29 @@ def train(
             )
 
     try:
-        if sft:
+        if sft and env_type == "math":
+            train_math_sft(
+                net=net,
+                opt=opt,
+                env=env,
+                state_to_str=state_to_str,
+                tokenizer=tokenizer,
+                pad_token_id=model_info.pad_token_id,
+                eos_token_id=model_info.eos_token_id,
+                soft_block_size=soft_block_size,
+                soft_bptt_window=soft_bptt_window,
+                max_answer_tokens=max_answer_tokens,
+                max_episodes=max_episodes,
+                batch_size=batch_size,
+                accumulation_steps=accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+                use_bf16=use_bf16,
+                save_ckpt_freq=save_ckpt_freq,
+                val_config=val_config,
+                val_freq=val_freq,
+            )
+        elif sft:
             assert internal_reasoning and env_type == "maze", (
                 "--sft requires --internal-reasoning and --env maze"
             )
@@ -707,7 +777,7 @@ def main():
         "--env",
         type=str,
         default="countdown",
-        choices=["countdown", "maze"],
+        choices=["countdown", "maze", "math"],
         help="Environment to train on",
     )
     parser.add_argument("--model", type=str, default="qwen3-0.6b")
@@ -768,6 +838,20 @@ def main():
         type=float,
         default=0.5,
         help="Reward weight for proximity to goal",
+    )
+    # math params
+    parser.add_argument(
+        "--math-difficulty",
+        type=str,
+        default="easy",
+        choices=["trivial", "easy", "medium"],
+        help="Math problem difficulty",
+    )
+    parser.add_argument(
+        "--max-answer-tokens",
+        type=int,
+        default=16,
+        help="Maximum answer tokens for math SFT (including EOS)",
     )
 
     parser.add_argument(
@@ -1013,6 +1097,8 @@ def main():
         maze_goal_pos=args.maze_goal_pos,
         maze_validity_weight=args.maze_validity_weight,
         maze_distance_weight=args.maze_distance_weight,
+        math_difficulty=args.math_difficulty,
+        max_answer_tokens=args.max_answer_tokens,
         mu=args.mu,
         accumulation_steps=args.accumulation_steps,
         update_ref_net_batch_cadence=args.update_ref_net_batch_cadence,
