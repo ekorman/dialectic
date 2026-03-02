@@ -13,7 +13,6 @@ import importlib.util
 import os
 import random
 import sys
-from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal
 
@@ -22,7 +21,7 @@ import torch
 from dotenv import load_dotenv
 
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
+from dialectic.llm.templates import Message
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import (
     Countdown,
@@ -35,15 +34,6 @@ from dialectic.rl.env import (
 from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
 from dialectic.rl.math import MathDatasetConfig
 from dialectic.rl.maze import MazeConfig
-from dialectic.rl.reward import (
-    answer_tags,
-    countdown_correct,
-    maze_correct,
-    maze_distance,
-    maze_validity,
-    think_tags,
-    weighted_reward,
-)
 from dialectic.rl.train import (
     ValidationConfig,
     grpo_advantage,
@@ -56,114 +46,6 @@ from dialectic.rl.train import (
 )
 
 load_dotenv()
-
-REASONING_TAG = "reasoning"
-
-
-# system prompt from Soft Tokens Hard Truths paper (but using answer tags instead of boxed)
-STHT_SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves"
-    " it. The assistant first shows the complete reasoning process step by step, then provides the final"
-    " answer in <answer></answer> tags. The assistant must always follow the format: 'User: [question] Assistant:"
-    " [detailed reasoning] The final answer is: <answer>[answer]</answer>.'"
-)
-SIMPLE_SYSTEM_PROMPT = (
-    "You are a helpful assistant. When asked a question to solve you first show your complete "
-    "reasoning process step by step and then provide the user with the answer in the specified format."
-)
-
-ENV_PROMPT_WITH_REASONING_TAGS = (
-    "Using the numbers {numbers}, create an equation that equals {target}. "
-    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. "
-    f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags."
-    " Put your final equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>."
-)
-ENV_PROMPT_WITHOUT_REASONING_TAGS = (
-    "Using the numbers {numbers}, create an equation that equals {target}. "
-    "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. Put your final"
-    " equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>. "
-)
-
-
-@dataclass
-class PromptCollection:
-    system_prompt: str | None
-    env_prompt: str
-    assistant_prefill: str | None
-
-
-MAZE_INTERNAL_REASONING_PROMPT = PromptCollection(
-    system_prompt=None,
-    env_prompt=(
-        "Navigate the maze from Start to Goal. "
-        "Each line shows a cell and the directions you can move from it.\n\n"
-        "{maze}"
-    ),
-    assistant_prefill=None,
-)
-
-PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
-    "countdown": [
-        PromptCollection(
-            system_prompt=None,
-            env_prompt=ENV_PROMPT_WITH_REASONING_TAGS,
-            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
-        ),
-        PromptCollection(
-            system_prompt=STHT_SYSTEM_PROMPT,
-            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
-            assistant_prefill=None,
-        ),
-        PromptCollection(
-            system_prompt=SIMPLE_SYSTEM_PROMPT,
-            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
-            assistant_prefill="Let me solve this step by step.",
-        ),
-    ],
-    "maze": [
-        PromptCollection(
-            system_prompt=None,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
-        ),
-        PromptCollection(
-            system_prompt=STHT_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill=None,
-        ),
-        PromptCollection(
-            system_prompt=SIMPLE_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill="Let me solve this step by step.",
-        ),
-    ],
-    "math": [
-        PromptCollection(
-            system_prompt="Solve the math problem. Respond with only the numerical answer.",
-            env_prompt="",
-            assistant_prefill=None,
-        ),
-    ],
-}
 
 
 def _is_modal_installed():
@@ -187,49 +69,6 @@ def get_state_to_str(
         return ret
 
     return _state_to_str
-
-
-def get_reward_fn(answer_tags_weight: float, think_tags_weight: float):
-    components = [
-        ("correct", 1.0, countdown_correct),
-        ("answer_tags", answer_tags_weight, answer_tags),
-    ]
-    if think_tags_weight > 0:
-        components.append(
-            (
-                "think_tags",
-                think_tags_weight,
-                think_tags(REASONING_TAG, prefilled_open=True),
-            )
-        )
-    reward_fn = weighted_reward(components)
-    return reward_fn
-
-
-def get_maze_reward_fn(
-    answer_tags_weight: float,
-    validity_weight: float,
-    distance_weight: float,
-    think_tags_weight: float,
-):
-    components = [
-        ("correct", 1.0, maze_correct),
-        ("distance", distance_weight, maze_distance),
-        ("validity", validity_weight, maze_validity),
-        ("answer_tags", answer_tags_weight, answer_tags),
-    ]
-    if think_tags_weight > 0:
-        components.append(
-            (
-                "think_tags",
-                think_tags_weight,
-                think_tags(REASONING_TAG, prefilled_open=True),
-            )
-        )
-    return weighted_reward(components)
-
-
-# update prompt? especially for soft tokens using <reasoning> tags don't make sense
 
 
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
@@ -274,7 +113,6 @@ def train(
     max_grad_norm: float = 1.0,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
-    use_qwen_thinking: bool = False,
     save_ckpt_freq: int = sys.maxsize,
     soft_tokens: bool = False,
     noise_std: float = 0.33,
@@ -321,12 +159,7 @@ def train(
 
     opt = torch.optim.AdamW(net.parameters(), lr=lr)
 
-    if use_qwen_thinking:
-
-        def format_messages(msgs: list[Message], gen: bool) -> str:
-            return get_qwen_input_text_from_messages(msgs, gen, enable_thinking=True)
-    else:
-        format_messages = model_info.format_messages
+    format_messages = model_info.format_messages
 
     if env_type == "countdown":
         env = CountdownEnv(
@@ -833,18 +666,6 @@ def main():
     )
 
     parser.add_argument(
-        "--use-qwen-thinking",
-        action="store_true",
-        default=False,
-        help="Use Qwen's out-of-the-box thinking mode",
-    )
-    parser.add_argument(
-        "--no-qwen-thinking",
-        dest="use_qwen_thinking",
-        action="store_false",
-        help="Do not use Qwen's out-of-the-box thinking mode",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=random.choice(range(1000)),
@@ -1042,7 +863,6 @@ def main():
         max_grad_norm=args.max_grad_norm,
         logprob_chunk_size=args.logprob_chunk_size,
         use_bf16=args.use_bf16,
-        use_qwen_thinking=args.use_qwen_thinking,
         compile_model=args.compile_model,
         seed=args.seed,
         advantage_fn_type=args.advantage_fn_type,

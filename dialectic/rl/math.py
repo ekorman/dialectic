@@ -550,8 +550,7 @@ class MathDatasetConfig:
             "number_properties": 0.15,
         }
     )
-    difficulty: str = "easy"  # default difficulty for all types
-    seed: int = 42
+    difficulty: str = "easy"
 
 
 GENERATORS = {

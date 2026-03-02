@@ -44,7 +44,7 @@ def aggregate_reward_components(
 @dataclass
 class ValidationConfig:
     envs: list[Env]
-    reward_fn: RewardFn
+    # reward_fn: RewardFn
     state_to_str: Callable
     extractor: Callable[[str], Any]
     tokenizer: Tokenizer
@@ -55,7 +55,7 @@ class ValidationConfig:
     max_tokens_generated: int
     use_bf16: bool
     internal_reasoning: bool = False
-    soft_prefill: bool = False
+    # soft_prefill: bool = False
     answer_extractor: Callable | None = None
     max_new_tokens: int = 32
     valid_hard_token_ids: list[int] | None = None
