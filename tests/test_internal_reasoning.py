@@ -579,6 +579,9 @@ class TestTrainInternalReasoningGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
     def test_optimizer_step_changes_params(self, tiny_model, tokenizer):
@@ -635,6 +638,9 @@ class TestTrainInternalReasoningGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         params_changed = False
@@ -1062,6 +1068,11 @@ class TestSFT:
             max_grad_norm=1.0,
             normalize_by_sequence_length=True,
             use_bf16=False,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
+            val_reward_fn=lambda: 1,
+            think_token_id=1,
         )
 
         params_changed = False

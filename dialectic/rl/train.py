@@ -8,6 +8,7 @@ from typing import Any, Callable
 import extty
 import torch
 import torch.nn as nn
+from extty import Example
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
@@ -16,10 +17,12 @@ from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import (
+    EvaluationResult,
     evaluate,
     evaluate_internal_reasoning,
     evaluate_soft_prefill,
 )
+from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
     generate_internal_reasoning_rollout_batch,
@@ -41,101 +44,19 @@ def aggregate_reward_components(
     return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
 
 
-@dataclass
-class ValidationConfig:
-    envs: list[Env]
-    reward_fn: RewardFn
-    state_to_str: Callable
-    extractor: Callable[[str], Any]
-    tokenizer: Tokenizer
-    eos_token_id: int
-    pad_token_id: int
-    max_episodes: int
-    batch_size: int
-    max_tokens_generated: int
-    use_bf16: bool
-    internal_reasoning: bool = False
-    soft_prefill: bool = False
-    answer_extractor: Callable | None = None
-    max_new_tokens: int = 32
-    valid_hard_token_ids: list[int] | None = None
-    move_id_to_name: dict[int, str] | None = None
-    soft_block_size: int = 4
-    max_cycles: int = 30
-    think_token_id: int | None = None
-
-
 @torch.no_grad()
 def run_validation(
     *,
-    net: BaseTransformer,
-    val_config: ValidationConfig,
+    val_envs: list[Env],
+    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
     reward_means: list[float] = []
 
-    was_training = net.training
-    net.eval()
-
-    for env in val_config.envs:
+    for env in val_envs:
         env.reseed()
         label = str(env)
-        if val_config.soft_prefill:
-            result, examples = evaluate_soft_prefill(
-                net=net,
-                env=env,
-                state_to_str=val_config.state_to_str,
-                answer_extractor=val_config.answer_extractor,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                soft_block_size=val_config.soft_block_size,
-                max_new_tokens=val_config.max_new_tokens,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-            )
-        elif val_config.internal_reasoning:
-            result, examples = evaluate_internal_reasoning(
-                net=net,
-                env=env,
-                reward_fn=val_config.reward_fn,
-                state_to_str=val_config.state_to_str,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                extractor=val_config.extractor,
-                move_id_to_name=val_config.move_id_to_name,
-                valid_hard_token_ids=val_config.valid_hard_token_ids,
-                soft_block_size=val_config.soft_block_size,
-                max_cycles=val_config.max_cycles,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                group_size=1,
-                temperature=0.0,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-                think_token_id=val_config.think_token_id,
-            )
-        else:
-            result, examples = evaluate(
-                net=net,
-                env=env,
-                reward_fn=val_config.reward_fn,
-                state_to_str=val_config.state_to_str,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                extractor=val_config.extractor,
-                max_tokens_generated=val_config.max_tokens_generated,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                group_size=1,
-                temperature=0.0,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-            )
+        result, examples = val_fn(env)
 
         metrics[f"val/{label}/reward_mean"] = result.reward_mean
         metrics[f"val/{label}/reward_std"] = result.reward_std
@@ -151,9 +72,6 @@ def run_validation(
 
     if reward_means:
         metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
-
-    if was_training:
-        net.train()
 
     return metrics
 
@@ -559,7 +477,8 @@ def _train_loop(
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
     train_step: Callable[[int], StepFunctionReturn],
-    val_config,  # TODO: change to callable
+    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
+    val_envs: list[Env],
 ):
     n_episodes = 0
     step = 0
@@ -583,7 +502,11 @@ def _train_loop(
                     optimizer_state_dict=opt.state_dict(),
                 )
             if val_freq > 0 and step % val_freq == 0:
-                val_metrics = run_validation(net=net, val_config=val_config)
+                was_training = net.training
+                net.eval()
+                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
+                if was_training:
+                    net.train()
                 extty.log(val_metrics, step=step)
 
     if step % save_ckpt_freq != 0 and extty.has_active_run():
@@ -809,6 +732,41 @@ def create_grpo_step_fn(
     return _step
 
 
+def create_grpo_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+    reward_fn: RewardFn,
+    max_tokens_generated: int,
+):
+    def _val(env: Env):
+        return evaluate(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extract_from_answer_tags,
+            max_tokens_generated=max_tokens_generated,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            group_size=1,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+        )
+
+    return _val
+
+
 def _grpo_train_loop(
     *,
     net: BaseTransformer,
@@ -830,7 +788,8 @@ def _grpo_train_loop(
     use_bf16: bool,
     save_ckpt_freq: int,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
-    val_config: ValidationConfig | None = None,
+    val_fn,
+    val_envs: list[Env],
     val_freq: int = 0,
 ) -> None:
     device = next(net.parameters()).device
@@ -861,7 +820,8 @@ def _grpo_train_loop(
         net=net,
         opt=opt,
         train_step=train_step,
-        val_config=val_config,
+        val_envs=val_envs,
+        val_fn=val_fn,
     )
 
 
@@ -892,7 +852,9 @@ def train_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     val_freq: int = 0,
 ) -> None:
     if use_bf16:
@@ -931,6 +893,19 @@ def train_grpo(
             chunk_size=logprob_chunk_size,
         )
 
+    val_fn = create_grpo_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        reward_fn=reward_fn,
+        max_tokens_generated=max_tokens_generated,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -949,8 +924,9 @@ def train_grpo(
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
         normalize_by_sequence_length=normalize_by_sequence_length,
-        val_config=val_config,
         val_freq=val_freq,
+        val_envs=val_envs,
+        val_fn=val_fn,
     )
 
 
@@ -1338,7 +1314,9 @@ def train_soft_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     val_freq: int = 0,
 ) -> None:
     if use_bf16:
@@ -1389,6 +1367,19 @@ def train_soft_grpo(
             normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
         )
 
+    val_fn = create_grpo_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        reward_fn=reward_fn,
+        max_tokens_generated=max_tokens_generated,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -1407,8 +1398,9 @@ def train_soft_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
-        val_config=val_config,
         val_freq=val_freq,
+        val_fn=val_fn,
+        val_envs=val_envs,
     )
 
 
@@ -2013,8 +2005,10 @@ def train_internal_reasoning_grpo(
     max_grad_norm: float = 1.0,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
     val_freq: int = 0,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     think_token_id: int | None = None,
 ) -> None:
     if use_bf16:
@@ -2089,6 +2083,23 @@ def train_internal_reasoning_grpo(
             log_probs = log_probs.detach().requires_grad_(True)
         return log_probs, mask
 
+    val_fn = create_internal_reasoning_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        val_reward_fn=reward_fn,
+        think_token_id=think_token_id,
+        move_id_to_name=move_id_to_name,
+        valid_hard_token_ids=valid_hard_token_ids,
+        max_cycles=max_cycles,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -2107,8 +2118,9 @@ def train_internal_reasoning_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
-        val_config=val_config,
+        val_envs=val_envs,
         val_freq=val_freq,
+        val_fn=val_fn,
     )
 
 
@@ -2265,6 +2277,49 @@ def create_internal_reasoning_sft_step_fn(
     return _step
 
 
+def create_internal_reasoning_sft_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+    val_reward_fn: RewardFn,
+    think_token_id: int,
+    move_id_to_name: dict[int, str],
+    valid_hard_token_ids: list[int],
+    max_cycles: int,
+):
+    def _val(env: Env):
+        return evaluate_internal_reasoning(
+            net=net,
+            env=env,
+            reward_fn=val_reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=lambda moves: moves if moves else None,
+            move_id_to_name=move_id_to_name,
+            valid_hard_token_ids=valid_hard_token_ids,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            group_size=1,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+            think_token_id=think_token_id,
+        )
+
+    return _val
+
+
 def train_internal_reasoning_sft(
     *,
     net: BaseTransformer,
@@ -2286,10 +2341,15 @@ def train_internal_reasoning_sft(
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_reward_fn: RewardFn,
+    val_episodes: int,
+    val_batch_size: int,
     val_freq: int = 0,
-    think_token_id: int | None = None,
+    val_envs: list[Env],
+    think_token_id: int,
 ) -> None:
+    move_id_to_name = {v: k for k, v in move_name_to_id.items()}
+
     train_step = create_internal_reasoning_sft_step_fn(
         net=net,
         opt=opt,
@@ -2311,6 +2371,23 @@ def train_internal_reasoning_sft(
         think_token_id=think_token_id,
     )
 
+    val_fn = create_internal_reasoning_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        val_reward_fn=val_reward_fn,
+        think_token_id=think_token_id,
+        move_id_to_name=move_id_to_name,
+        valid_hard_token_ids=valid_hard_token_ids,
+        max_cycles=max_cycles,
+    )
+
     _train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
@@ -2318,7 +2395,8 @@ def train_internal_reasoning_sft(
         net=net,
         opt=opt,
         train_step=train_step,
-        val_config=val_config,
+        val_envs=val_envs,
+        val_fn=val_fn,
     )
 
 
@@ -2428,6 +2506,40 @@ def create_sft_step_fn(
     return _step
 
 
+def create_sft_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int,
+    max_answer_tokens: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+):
+    def _val(env: Env):
+        return evaluate_soft_prefill(
+            net=net,
+            env=env,
+            state_to_str=state_to_str,
+            answer_extractor=lambda state: state.answer,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            soft_block_size=soft_block_size,
+            max_new_tokens=max_answer_tokens,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            temperature=0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+        )
+
+    return _val
+
+
 def train_math_sft(
     *,
     net: BaseTransformer,
@@ -2447,7 +2559,9 @@ def train_math_sft(
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_envs: list[Env],
+    val_batch_size: int,
+    val_episodes: int,
     val_freq: int = 0,
 ) -> None:
     train_step = create_sft_step_fn(
@@ -2468,6 +2582,19 @@ def train_math_sft(
         use_bf16=use_bf16,
     )
 
+    val_fn = create_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        max_answer_tokens=max_answer_tokens,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+    )
+
     _train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
@@ -2475,5 +2602,6 @@ def train_math_sft(
         net=net,
         opt=opt,
         train_step=train_step,
-        val_config=val_config,
+        val_envs=val_envs,
+        val_fn=val_fn,
     )
