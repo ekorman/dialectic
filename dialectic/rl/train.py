@@ -2113,7 +2113,7 @@ def make_sft_per_cycle_backward_callback(
     return callback
 
 
-def create_sft_step_fn(
+def create_internal_reasoning_sft_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2280,7 +2280,7 @@ def train_internal_reasoning_sft(
     val_freq: int = 0,
     think_token_id: int | None = None,
 ) -> None:
-    train_step = create_sft_step_fn(
+    train_step = create_internal_reasoning_sft_step_fn(
         net=net,
         opt=opt,
         env=env,
@@ -2312,7 +2312,7 @@ def train_internal_reasoning_sft(
     )
 
 
-def create_train_math_sft_step_fn(
+def create_sft_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2453,7 +2453,7 @@ def train_math_sft(
     val_config: ValidationConfig | None = None,
     val_freq: int = 0,
 ) -> None:
-    train_step = create_train_math_sft_step_fn(
+    train_step = create_sft_step_fn(
         net=net,
         opt=opt,
         env=env,
