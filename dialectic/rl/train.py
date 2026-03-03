@@ -467,7 +467,7 @@ def collect_micro_batch(
 @dataclass
 class StepFunctionReturn:
     n_episodes_processed: int
-    metrics: dict
+    metrics: dict[str, float | int]
 
 
 def _train_loop(
