@@ -2169,9 +2169,6 @@ def create_internal_reasoning_sft_step_fn(
     use_bf16: bool,
     think_token_id: int | None,
 ):
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
     device = next(net.parameters()).device
 
     def _step(step: int):
@@ -2348,6 +2345,9 @@ def train_internal_reasoning_sft(
     val_envs: list[Env],
     think_token_id: int,
 ) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
     move_id_to_name = {v: k for k, v in move_name_to_id.items()}
 
     train_step = create_internal_reasoning_sft_step_fn(
@@ -2418,9 +2418,6 @@ def create_sft_step_fn(
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
 ):
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
     device = next(net.parameters()).device
 
     def _step(step: int):
@@ -2564,6 +2561,8 @@ def train_math_sft(
     val_episodes: int,
     val_freq: int = 0,
 ) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
     train_step = create_sft_step_fn(
         net=net,
         opt=opt,
