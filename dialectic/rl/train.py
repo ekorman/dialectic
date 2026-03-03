@@ -1958,6 +1958,29 @@ def collect_internal_reasoning_micro_batch(
     }
 
 
+def _encode_prompts(
+    env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
+):
+    prompts = [state_to_str(er.data) for er in env_responses]
+    encoded = tokenizer.encode_batch(prompts)
+    max_prompt_len = max(len(e.ids) for e in encoded)
+    prompt_token_ids = torch.full(
+        (batch_size, max_prompt_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros(
+        batch_size, max_prompt_len, dtype=torch.bool, device=device
+    )
+    for b, enc in enumerate(encoded):
+        ids = torch.tensor(enc.ids, device=device)
+        prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
+        attention_mask[b, max_prompt_len - len(ids) :] = True
+
+    return prompt_token_ids, attention_mask
+
+
 def train_internal_reasoning_grpo(
     *,
     net: BaseTransformer,
@@ -2171,22 +2194,9 @@ def create_internal_reasoning_sft_step_fn(
                 hard_token_ids[b, 0, : len(sol)] = torch.tensor(sol, device=device)
                 n_cycles[b, 0] = len(sol)
 
-            prompts = [state_to_str(er.data) for er in env_responses]
-            encoded = tokenizer.encode_batch(prompts)
-            max_prompt_len = max(len(e.ids) for e in encoded)
-            prompt_token_ids = torch.full(
-                (batch_size, max_prompt_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=device,
+            prompt_token_ids, attention_mask = _encode_prompts(
+                env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
             )
-            attention_mask = torch.zeros(
-                batch_size, max_prompt_len, dtype=torch.bool, device=device
-            )
-            for b, enc in enumerate(encoded):
-                ids = torch.tensor(enc.ids, device=device)
-                prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-                attention_mask[b, max_prompt_len - len(ids) :] = True
 
             cycle_indices = (
                 torch.arange(max_c, device=device)
@@ -2344,22 +2354,9 @@ def create_sft_step_fn(
         for _ in range(accumulation_steps):
             env_responses = [env.reset() for _ in range(batch_size)]
 
-            prompts = [state_to_str(er.data) for er in env_responses]
-            encoded = tokenizer.encode_batch(prompts)
-            max_prompt_len = max(len(e.ids) for e in encoded)
-            prompt_token_ids = torch.full(
-                (batch_size, max_prompt_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=device,
+            prompt_token_ids, attention_mask = _encode_prompts(
+                env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
             )
-            attention_mask_t = torch.zeros(
-                batch_size, max_prompt_len, dtype=torch.bool, device=device
-            )
-            for b, enc in enumerate(encoded):
-                ids = torch.tensor(enc.ids, device=device)
-                prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-                attention_mask_t[b, max_prompt_len - len(ids) :] = True
 
             answer_ids_list: list[list[int]] = []
             for er in env_responses:
@@ -2385,7 +2382,7 @@ def create_sft_step_fn(
                 log_probs, completion_mask = compute_soft_prefill_log_probs(
                     net=net,
                     prompt_token_ids=prompt_token_ids,
-                    attention_mask=attention_mask_t,
+                    attention_mask=attention_mask,
                     answer_token_ids=answer_token_ids,
                     answer_lengths=answer_lengths,
                     soft_block_size=soft_block_size,
