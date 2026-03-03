@@ -281,9 +281,6 @@ def get_maze_reward_fn(
     return weighted_reward(components)
 
 
-# update prompt? especially for soft tokens using <reasoning> tags don't make sense
-
-
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
