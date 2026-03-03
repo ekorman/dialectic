@@ -1054,7 +1054,6 @@ class TestSFT:
             eos_token_id=EOS_TOKEN_ID,
             move_name_to_id=move_name_to_id,
             valid_hard_token_ids=valid_ids,
-            move_id_to_name=move_id_to_name,
             soft_block_size=2,
             max_cycles=10,
             max_episodes=4,
