@@ -552,9 +552,6 @@ class StepFunctionReturn:
     metrics: dict
 
 
-StepFunction: Callable[[int], StepFunctionReturn]
-
-
 def _train_loop(
     max_episodes: int,
     save_ckpt_freq: int,
@@ -2327,7 +2324,6 @@ def create_train_math_sft_step_fn(
     soft_block_size: int = 4,
     soft_bptt_window: int | None = None,
     max_answer_tokens: int = 16,
-    max_episodes: int = 1000,
     batch_size: int = 4,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
@@ -2468,7 +2464,6 @@ def train_math_sft(
         soft_block_size=soft_block_size,
         soft_bptt_window=soft_bptt_window,
         max_answer_tokens=max_answer_tokens,
-        max_episodes=max_episodes,
         batch_size=batch_size,
         accumulation_steps=accumulation_steps,
         max_grad_norm=max_grad_norm,
