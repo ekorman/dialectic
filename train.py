@@ -1,13 +1,3 @@
-"""Verify GRPO can learn on the Countdown task with Qwen-0.6B.
-
-Based on TinyZero: https://github.com/Jiayi-Pan/TinyZero
-
-Usage:
-    uv run python benchmarks/verify_grpo_learning.py
-    uv run python benchmarks/verify_grpo_learning.py --device mps
-    uv run python benchmarks/verify_grpo_learning.py --max-episodes 100
-"""
-
 import argparse
 import importlib.util
 import os
@@ -56,7 +46,6 @@ from dialectic.rl.reward import (
     weighted_reward,
 )
 from dialectic.rl.train import (
-    ValidationConfig,
     grpo_advantage,
     rloo_advantage,
     train_grpo,
@@ -292,9 +281,6 @@ def get_maze_reward_fn(
     return weighted_reward(components)
 
 
-# update prompt? especially for soft tokens using <reasoning> tags don't make sense
-
-
 MODAL_TIMEOUT_HOURS = int(os.getenv("MODAL_TIMEOUT_HOURS", 1))
 
 
@@ -498,7 +484,6 @@ def train(
         )
         ir_extractor = lambda moves: moves if moves else None  # noqa: E731
 
-    val_config: ValidationConfig | None = None
     if val_freq > 0:
         if env_type == "countdown":
             n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
@@ -528,213 +513,171 @@ def train(
             val_envs = [MathEnv(config=math_config, seed=2026)]
         else:
             raise ValueError(f"Unknown env_type for validation: {env_type}")
-        if env_type == "math":
-            val_config = ValidationConfig(
-                envs=val_envs,
-                reward_fn=reward_fn,
-                state_to_str=state_to_str,
-                extractor=lambda x: x,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                max_episodes=val_episodes,
-                batch_size=val_batch_size,
-                max_tokens_generated=max_tokens,
-                use_bf16=use_bf16,
-                soft_prefill=True,
-                answer_extractor=lambda state: state.answer,
-                max_new_tokens=max_answer_tokens,
-                soft_block_size=soft_block_size,
-            )
-        elif internal_reasoning:
-            val_config = ValidationConfig(
-                envs=val_envs,
-                reward_fn=ir_reward_fn,
-                state_to_str=state_to_str,
-                extractor=ir_extractor,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                max_episodes=val_episodes,
-                batch_size=val_batch_size,
-                max_tokens_generated=max_tokens,
-                use_bf16=use_bf16,
-                internal_reasoning=True,
-                valid_hard_token_ids=valid_hard_token_ids,
-                move_id_to_name=move_id_to_name,
-                soft_block_size=soft_block_size,
-                max_cycles=max_cycles,
-                think_token_id=think_token_id,
-            )
-        else:
-            val_config = ValidationConfig(
-                envs=val_envs,
-                reward_fn=reward_fn,
-                state_to_str=state_to_str,
-                extractor=extractor,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                max_episodes=val_episodes,
-                batch_size=val_batch_size,
-                max_tokens_generated=max_tokens,
-                use_bf16=use_bf16,
-            )
 
-    try:
-        if sft and env_type == "math":
-            train_math_sft(
-                net=net,
-                opt=opt,
-                env=env,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                pad_token_id=model_info.pad_token_id,
-                eos_token_id=model_info.eos_token_id,
-                soft_block_size=soft_block_size,
-                soft_bptt_window=soft_bptt_window,
-                max_answer_tokens=max_answer_tokens,
-                max_episodes=max_episodes,
-                batch_size=batch_size,
-                accumulation_steps=accumulation_steps,
-                max_grad_norm=max_grad_norm,
-                normalize_by_sequence_length=normalize_by_sequence_length,
-                use_bf16=use_bf16,
-                save_ckpt_freq=save_ckpt_freq,
-                val_config=val_config,
-                val_freq=val_freq,
-            )
-        elif sft:
-            assert internal_reasoning and env_type == "maze", (
-                "--sft requires --internal-reasoning and --env maze"
-            )
-            train_internal_reasoning_sft(
-                net=net,
-                opt=opt,
-                env=env,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                pad_token_id=model_info.pad_token_id,
-                eos_token_id=model_info.eos_token_id,
-                move_name_to_id=move_name_to_id,
-                valid_hard_token_ids=valid_hard_token_ids,
-                move_id_to_name=move_id_to_name,
-                soft_block_size=soft_block_size,
-                soft_bptt_window=soft_bptt_window,
-                max_cycles=max_cycles,
-                max_episodes=max_episodes,
-                batch_size=batch_size,
-                accumulation_steps=accumulation_steps,
-                max_grad_norm=max_grad_norm,
-                normalize_by_sequence_length=normalize_by_sequence_length,
-                use_bf16=use_bf16,
-                save_ckpt_freq=save_ckpt_freq,
-                val_config=val_config,
-                val_freq=val_freq,
-                think_token_id=think_token_id,
-            )
-        elif internal_reasoning:
-            train_internal_reasoning_grpo(
-                net=net,
-                opt=opt,
-                env=env,
-                reward_fn=ir_reward_fn,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                extractor=ir_extractor,
-                move_id_to_name=move_id_to_name,
-                valid_hard_token_ids=valid_hard_token_ids,
-                soft_block_size=soft_block_size,
-                soft_bptt_window=soft_bptt_window,
-                max_cycles=max_cycles,
-                beta=beta,
-                eps=eps,
-                mu=mu,
-                max_episodes=max_episodes,
-                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-                batch_size=batch_size,
-                group_size=group_size,
-                temperature=temperature,
-                accumulation_steps=accumulation_steps,
-                max_grad_norm=max_grad_norm,
-                use_bf16=use_bf16,
-                save_ckpt_freq=save_ckpt_freq,
-                advantage_fn=advantage_fn,
-                normalize_by_sequence_length=normalize_by_sequence_length,
-                val_config=val_config,
-                val_freq=val_freq,
-                think_token_id=think_token_id,
-            )
-        elif soft_tokens:
-            train_soft_grpo(
-                net=net,
-                opt=opt,
-                env=env,
-                reward_fn=reward_fn,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                extractor=extractor,
-                beta=beta,
-                eps=eps,
-                mu=mu,
-                max_tokens_generated=max_tokens,
-                max_episodes=max_episodes,
-                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-                batch_size=batch_size,
-                group_size=group_size,
-                temperature=temperature,
-                noise_std=noise_std,
-                switch_to_hard_tokens_condition=switch_condition,
-                max_tokens_prefill=max_tokens_prefill,
-                max_tokens_prefill_steps_before_end=20,
-                min_soft_steps=min_soft_steps,
-                accumulation_steps=accumulation_steps,
-                max_grad_norm=max_grad_norm,
-                logprob_chunk_size=logprob_chunk_size,
-                use_bf16=use_bf16,
-                save_ckpt_freq=save_ckpt_freq,
-                advantage_fn=advantage_fn,
-                normalize_by_sequence_length=normalize_by_sequence_length,
-                val_config=val_config,
-                val_freq=val_freq,
-                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-            )
-        else:
-            train_grpo(
-                net=net,
-                opt=opt,
-                env=env,
-                reward_fn=reward_fn,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                extractor=extractor,
-                beta=beta,
-                eps=eps,
-                mu=mu,
-                max_tokens_generated=max_tokens,
-                max_episodes=max_episodes,
-                update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-                batch_size=batch_size,
-                group_size=group_size,
-                temperature=temperature,
-                accumulation_steps=accumulation_steps,
-                max_grad_norm=max_grad_norm,
-                logprob_chunk_size=logprob_chunk_size,
-                use_bf16=use_bf16,
-                save_ckpt_freq=save_ckpt_freq,
-                advantage_fn=advantage_fn,
-                normalize_by_sequence_length=normalize_by_sequence_length,
-                val_config=val_config,
-                val_freq=val_freq,
-            )
-    finally:
-        extty.finish()
+        if internal_reasoning:
+            reward_fn = ir_reward_fn
+
+    if sft and env_type == "math":
+        train_math_sft(
+            net=net,
+            opt=opt,
+            env=env,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=model_info.pad_token_id,
+            eos_token_id=model_info.eos_token_id,
+            soft_block_size=soft_block_size,
+            soft_bptt_window=soft_bptt_window,
+            max_answer_tokens=max_answer_tokens,
+            max_episodes=max_episodes,
+            batch_size=batch_size,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+            use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
+            val_freq=val_freq,
+            val_envs=val_envs,
+            val_batch_size=val_batch_size,
+            val_episodes=val_episodes,
+        )
+    elif sft:
+        assert internal_reasoning and env_type == "maze", (
+            "--sft requires --internal-reasoning and --env maze"
+        )
+        train_internal_reasoning_sft(
+            net=net,
+            opt=opt,
+            env=env,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=model_info.pad_token_id,
+            eos_token_id=model_info.eos_token_id,
+            move_name_to_id=move_name_to_id,
+            valid_hard_token_ids=valid_hard_token_ids,
+            soft_block_size=soft_block_size,
+            soft_bptt_window=soft_bptt_window,
+            max_cycles=max_cycles,
+            max_episodes=max_episodes,
+            batch_size=batch_size,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+            use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
+            val_freq=val_freq,
+            val_reward_fn=reward_fn,
+            val_batch_size=val_batch_size,
+            val_episodes=val_episodes,
+            val_envs=val_envs,
+            think_token_id=think_token_id,
+        )
+    elif internal_reasoning:
+        train_internal_reasoning_grpo(
+            net=net,
+            opt=opt,
+            env=env,
+            reward_fn=ir_reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            extractor=ir_extractor,
+            move_id_to_name=move_id_to_name,
+            valid_hard_token_ids=valid_hard_token_ids,
+            soft_block_size=soft_block_size,
+            soft_bptt_window=soft_bptt_window,
+            max_cycles=max_cycles,
+            beta=beta,
+            eps=eps,
+            mu=mu,
+            max_episodes=max_episodes,
+            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
+            advantage_fn=advantage_fn,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+            val_batch_size=val_batch_size,
+            val_episodes=val_episodes,
+            val_envs=val_envs,
+            val_freq=val_freq,
+            think_token_id=think_token_id,
+        )
+    elif soft_tokens:
+        train_soft_grpo(
+            net=net,
+            opt=opt,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            extractor=extractor,
+            beta=beta,
+            eps=eps,
+            mu=mu,
+            max_tokens_generated=max_tokens,
+            max_episodes=max_episodes,
+            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            noise_std=noise_std,
+            switch_to_hard_tokens_condition=switch_condition,
+            max_tokens_prefill=max_tokens_prefill,
+            max_tokens_prefill_steps_before_end=20,
+            min_soft_steps=min_soft_steps,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            logprob_chunk_size=logprob_chunk_size,
+            use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
+            advantage_fn=advantage_fn,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+            val_batch_size=val_batch_size,
+            val_episodes=val_episodes,
+            val_envs=val_envs,
+            val_freq=val_freq,
+            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
+        )
+    else:
+        train_grpo(
+            net=net,
+            opt=opt,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            extractor=extractor,
+            beta=beta,
+            eps=eps,
+            mu=mu,
+            max_tokens_generated=max_tokens,
+            max_episodes=max_episodes,
+            update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            accumulation_steps=accumulation_steps,
+            max_grad_norm=max_grad_norm,
+            logprob_chunk_size=logprob_chunk_size,
+            use_bf16=use_bf16,
+            save_ckpt_freq=save_ckpt_freq,
+            advantage_fn=advantage_fn,
+            normalize_by_sequence_length=normalize_by_sequence_length,
+            val_batch_size=val_batch_size,
+            val_episodes=val_episodes,
+            val_envs=val_envs,
+            val_freq=val_freq,
+        )
 
 
 if _is_modal_installed():

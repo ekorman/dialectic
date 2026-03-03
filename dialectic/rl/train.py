@@ -8,6 +8,7 @@ from typing import Any, Callable
 import extty
 import torch
 import torch.nn as nn
+from extty import Example
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
@@ -16,10 +17,12 @@ from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import (
+    EvaluationResult,
     evaluate,
     evaluate_internal_reasoning,
     evaluate_soft_prefill,
 )
+from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
     generate_internal_reasoning_rollout_batch,
@@ -41,101 +44,19 @@ def aggregate_reward_components(
     return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
 
 
-@dataclass
-class ValidationConfig:
-    envs: list[Env]
-    reward_fn: RewardFn
-    state_to_str: Callable
-    extractor: Callable[[str], Any]
-    tokenizer: Tokenizer
-    eos_token_id: int
-    pad_token_id: int
-    max_episodes: int
-    batch_size: int
-    max_tokens_generated: int
-    use_bf16: bool
-    internal_reasoning: bool = False
-    soft_prefill: bool = False
-    answer_extractor: Callable | None = None
-    max_new_tokens: int = 32
-    valid_hard_token_ids: list[int] | None = None
-    move_id_to_name: dict[int, str] | None = None
-    soft_block_size: int = 4
-    max_cycles: int = 30
-    think_token_id: int | None = None
-
-
 @torch.no_grad()
 def run_validation(
     *,
-    net: BaseTransformer,
-    val_config: ValidationConfig,
+    val_envs: list[Env],
+    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
     reward_means: list[float] = []
 
-    was_training = net.training
-    net.eval()
-
-    for env in val_config.envs:
+    for env in val_envs:
         env.reseed()
         label = str(env)
-        if val_config.soft_prefill:
-            result, examples = evaluate_soft_prefill(
-                net=net,
-                env=env,
-                state_to_str=val_config.state_to_str,
-                answer_extractor=val_config.answer_extractor,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                soft_block_size=val_config.soft_block_size,
-                max_new_tokens=val_config.max_new_tokens,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-            )
-        elif val_config.internal_reasoning:
-            result, examples = evaluate_internal_reasoning(
-                net=net,
-                env=env,
-                reward_fn=val_config.reward_fn,
-                state_to_str=val_config.state_to_str,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                extractor=val_config.extractor,
-                move_id_to_name=val_config.move_id_to_name,
-                valid_hard_token_ids=val_config.valid_hard_token_ids,
-                soft_block_size=val_config.soft_block_size,
-                max_cycles=val_config.max_cycles,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                group_size=1,
-                temperature=0.0,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-                think_token_id=val_config.think_token_id,
-            )
-        else:
-            result, examples = evaluate(
-                net=net,
-                env=env,
-                reward_fn=val_config.reward_fn,
-                state_to_str=val_config.state_to_str,
-                tokenizer=val_config.tokenizer,
-                eos_token_id=val_config.eos_token_id,
-                pad_token_id=val_config.pad_token_id,
-                extractor=val_config.extractor,
-                max_tokens_generated=val_config.max_tokens_generated,
-                max_episodes=val_config.max_episodes,
-                batch_size=val_config.batch_size,
-                group_size=1,
-                temperature=0.0,
-                use_bf16=val_config.use_bf16,
-                n_examples=val_config.max_episodes,
-            )
+        result, examples = val_fn(env)
 
         metrics[f"val/{label}/reward_mean"] = result.reward_mean
         metrics[f"val/{label}/reward_std"] = result.reward_std
@@ -151,9 +72,6 @@ def run_validation(
 
     if reward_means:
         metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
-
-    if was_training:
-        net.train()
 
     return metrics
 
@@ -546,7 +464,60 @@ def collect_micro_batch(
     }
 
 
-def _grpo_train_loop(
+@dataclass
+class StepFunctionReturn:
+    n_episodes_processed: int
+    metrics: dict[str, float | int]
+
+
+def _train_loop(
+    max_episodes: int,
+    save_ckpt_freq: int,
+    val_freq: int,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    train_step: Callable[[int], StepFunctionReturn],
+    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
+    val_envs: list[Env],
+):
+    n_episodes = 0
+    step = 0
+    while n_episodes < max_episodes:
+        start_time = time.perf_counter()
+        step_ret = train_step(step)
+        step_time = time.perf_counter() - start_time
+        step += 1
+
+        n_episodes += step_ret.n_episodes_processed
+
+        if extty.has_active_run():
+            metrics = step_ret.metrics
+            metrics.update({"step_time": step_time})
+            extty.log(metrics, step=step)
+
+            if step % save_ckpt_freq == 0:
+                extty.save_checkpoint(
+                    step=step,
+                    state_dict=net.state_dict(),
+                    optimizer_state_dict=opt.state_dict(),
+                )
+            if val_freq > 0 and step % val_freq == 0:
+                was_training = net.training
+                net.eval()
+                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
+                if was_training:
+                    net.train()
+                extty.log(val_metrics, step=step)
+
+    if step % save_ckpt_freq != 0 and extty.has_active_run():
+        extty.save_checkpoint(
+            step=step,
+            state_dict=net.state_dict(),
+            optimizer_state_dict=opt.state_dict(),
+        )
+
+
+def create_grpo_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -557,7 +528,6 @@ def _grpo_train_loop(
     beta: float,
     eps: float | None,
     mu: int,
-    max_episodes: int,
     update_ref_net_batch_cadence: int,
     batch_size: int,
     group_size: int,
@@ -565,22 +535,18 @@ def _grpo_train_loop(
     accumulation_steps: int,
     max_grad_norm: float,
     use_bf16: bool,
-    save_ckpt_freq: int,
+    device: torch.device,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
-    val_config: ValidationConfig | None = None,
-    val_freq: int = 0,
-) -> None:
-    device = next(net.parameters()).device
-    n_episodes = 0
-    step = 0
-
+):
     if mu > 1 and eps is None:
         raise RuntimeError(
             "Should not have `mu` > 1 when not doing PPO style training."
         )
 
     ref_net = None
-    while n_episodes < max_episodes:
+
+    def _step(step: int):
+        nonlocal ref_net, net
         if beta != 0 and (step % update_ref_net_batch_cadence == 0):
             ref_net = deepcopy(net)
 
@@ -660,9 +626,6 @@ def _grpo_train_loop(
 
         t_opt = time.perf_counter() - t_opt_start
 
-        step += 1
-        n_episodes += batch_size * accumulation_steps
-
         all_output_strs_nested: list[list[str]] = [
             [mb["output_strs"][g][b] for g in range(group_size)]
             for mb in micro_batches
@@ -699,98 +662,167 @@ def _grpo_train_loop(
         component_means = aggregate_reward_components(
             [[r] for r in flat_reward_results]
         )
+        metrics = {
+            "train/loss": total_loss / mu,
+            "train/main_loss": total_main_loss / mu,
+            "train/reward_mean": all_rewards.mean().item(),
+            "train/reward_std": all_rewards.std().item(),
+            "train/completion_token_len_mean": completion_token_len_mean,
+            "train/example": examples,
+            "train/generation_time": t_gen_total,
+            "train/logprobs_time": t_logprobs_total,
+            "train/optimization_time": t_opt,
+            **(
+                {
+                    "train/hard_completion_ratio": sum(
+                        mb["hard_completion_ratio"] for mb in micro_batches
+                    )
+                    / len(micro_batches)
+                }
+                if "hard_completion_ratio" in micro_batches[0]
+                else {}
+            ),
+            **(
+                {
+                    "train/hard_lp_mean": sum(
+                        mb["hard_lp_mean"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/hard_lp_std": sum(mb["hard_lp_std"] for mb in micro_batches)
+                    / len(micro_batches),
+                    "train/soft_lp_mean": sum(
+                        mb["soft_lp_mean"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/soft_lp_std": sum(mb["soft_lp_std"] for mb in micro_batches)
+                    / len(micro_batches),
+                    "train/gaussian_dist_mean": sum(
+                        mb["gaussian_dist_mean"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/soft_tokens_per_seq": sum(
+                        mb["soft_tokens_per_seq"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/hard_tokens_per_seq": sum(
+                        mb["hard_tokens_per_seq"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                }
+                if "hard_lp_mean" in micro_batches[0]
+                else {}
+            ),
+            **{f"train/reward/{name}": mean for name, mean in component_means.items()},
+        }
+        if total_kl_loss is not None:
+            metrics["train/kl_loss"] = total_kl_loss / mu
+        if grad_norm_val is not None:
+            metrics["train/grad_norm"] = grad_norm_val
+        if logprob_recompute_max_diffs:
+            metrics["train/logprob_recompute_max_diff"] = max(
+                logprob_recompute_max_diffs
+            )
+        if net.soft_projection_alpha is not None:
+            metrics["train/soft_projection_alpha"] = net.soft_projection_alpha.item()
 
-        if extty._active_run is not None:
-            metrics = {
-                "train/loss": total_loss / mu,
-                "train/main_loss": total_main_loss / mu,
-                "train/reward_mean": all_rewards.mean().item(),
-                "train/reward_std": all_rewards.std().item(),
-                "train/completion_token_len_mean": completion_token_len_mean,
-                "train/example": examples,
-                "train/generation_time": t_gen_total,
-                "train/logprobs_time": t_logprobs_total,
-                "train/optimization_time": t_opt,
-                **(
-                    {
-                        "train/hard_completion_ratio": sum(
-                            mb["hard_completion_ratio"] for mb in micro_batches
-                        )
-                        / len(micro_batches)
-                    }
-                    if "hard_completion_ratio" in micro_batches[0]
-                    else {}
-                ),
-                **(
-                    {
-                        "train/hard_lp_mean": sum(
-                            mb["hard_lp_mean"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/hard_lp_std": sum(
-                            mb["hard_lp_std"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/soft_lp_mean": sum(
-                            mb["soft_lp_mean"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/soft_lp_std": sum(
-                            mb["soft_lp_std"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/gaussian_dist_mean": sum(
-                            mb["gaussian_dist_mean"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/soft_tokens_per_seq": sum(
-                            mb["soft_tokens_per_seq"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                        "train/hard_tokens_per_seq": sum(
-                            mb["hard_tokens_per_seq"] for mb in micro_batches
-                        )
-                        / len(micro_batches),
-                    }
-                    if "hard_lp_mean" in micro_batches[0]
-                    else {}
-                ),
-                **{
-                    f"train/reward/{name}": mean
-                    for name, mean in component_means.items()
-                },
-            }
-            if total_kl_loss is not None:
-                metrics["train/kl_loss"] = total_kl_loss / mu
-            if grad_norm_val is not None:
-                metrics["train/grad_norm"] = grad_norm_val
-            if logprob_recompute_max_diffs:
-                metrics["train/logprob_recompute_max_diff"] = max(
-                    logprob_recompute_max_diffs
-                )
-            if net.soft_projection_alpha is not None:
-                metrics["train/soft_projection_alpha"] = (
-                    net.soft_projection_alpha.item()
-                )
-            extty.log(metrics, step=step)
-
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=net.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-
-        if val_config is not None and val_freq > 0 and step % val_freq == 0:
-            val_metrics = run_validation(net=net, val_config=val_config)
-            extty.log(val_metrics, step=step)
-
-    if step % save_ckpt_freq != 0 and extty._active_run is not None:
-        extty.save_checkpoint(
-            step=step,
-            state_dict=net.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
+        return StepFunctionReturn(
+            n_episodes_processed=all_rewards.shape[1], metrics=metrics
         )
+
+    return _step
+
+
+def create_grpo_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+    reward_fn: RewardFn,
+    max_tokens_generated: int,
+):
+    def _val(env: Env):
+        return evaluate(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extract_from_answer_tags,
+            max_tokens_generated=max_tokens_generated,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            group_size=1,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+        )
+
+    return _val
+
+
+def _grpo_train_loop(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    collect_fn: Callable[[BaseTransformer, BaseTransformer], dict],
+    recompute_log_probs_fn: Callable[
+        [BaseTransformer, dict], tuple[torch.Tensor, torch.Tensor]
+    ],
+    beta: float,
+    eps: float | None,
+    mu: int,
+    max_episodes: int,
+    update_ref_net_batch_cadence: int,
+    batch_size: int,
+    group_size: int,
+    normalize_by_sequence_length: bool,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    use_bf16: bool,
+    save_ckpt_freq: int,
+    advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
+    val_fn,
+    val_envs: list[Env],
+    val_freq: int = 0,
+) -> None:
+    device = next(net.parameters()).device
+
+    train_step = create_grpo_step_fn(
+        net=net,
+        opt=opt,
+        collect_fn=collect_fn,
+        recompute_log_probs_fn=recompute_log_probs_fn,
+        beta=beta,
+        eps=eps,
+        mu=mu,
+        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+        batch_size=batch_size,
+        group_size=group_size,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        use_bf16=use_bf16,
+        device=device,
+        advantage_fn=advantage_fn,
+    )
+
+    _train_loop(
+        max_episodes=max_episodes,
+        save_ckpt_freq=save_ckpt_freq,
+        val_freq=val_freq,
+        net=net,
+        opt=opt,
+        train_step=train_step,
+        val_envs=val_envs,
+        val_fn=val_fn,
+    )
 
 
 def train_grpo(
@@ -820,7 +852,9 @@ def train_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     val_freq: int = 0,
 ) -> None:
     if use_bf16:
@@ -859,6 +893,19 @@ def train_grpo(
             chunk_size=logprob_chunk_size,
         )
 
+    val_fn = create_grpo_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        reward_fn=reward_fn,
+        max_tokens_generated=max_tokens_generated,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -877,8 +924,9 @@ def train_grpo(
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
         normalize_by_sequence_length=normalize_by_sequence_length,
-        val_config=val_config,
         val_freq=val_freq,
+        val_envs=val_envs,
+        val_fn=val_fn,
     )
 
 
@@ -1266,7 +1314,9 @@ def train_soft_grpo(
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     val_freq: int = 0,
 ) -> None:
     if use_bf16:
@@ -1317,6 +1367,19 @@ def train_soft_grpo(
             normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
         )
 
+    val_fn = create_grpo_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        reward_fn=reward_fn,
+        max_tokens_generated=max_tokens_generated,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -1335,8 +1398,9 @@ def train_soft_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
-        val_config=val_config,
         val_freq=val_freq,
+        val_fn=val_fn,
+        val_envs=val_envs,
     )
 
 
@@ -1886,6 +1950,29 @@ def collect_internal_reasoning_micro_batch(
     }
 
 
+def _encode_prompts(
+    env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
+):
+    prompts = [state_to_str(er.data) for er in env_responses]
+    encoded = tokenizer.encode_batch(prompts)
+    max_prompt_len = max(len(e.ids) for e in encoded)
+    prompt_token_ids = torch.full(
+        (batch_size, max_prompt_len),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros(
+        batch_size, max_prompt_len, dtype=torch.bool, device=device
+    )
+    for b, enc in enumerate(encoded):
+        ids = torch.tensor(enc.ids, device=device)
+        prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
+        attention_mask[b, max_prompt_len - len(ids) :] = True
+
+    return prompt_token_ids, attention_mask
+
+
 def train_internal_reasoning_grpo(
     *,
     net: BaseTransformer,
@@ -1918,8 +2005,10 @@ def train_internal_reasoning_grpo(
     max_grad_norm: float = 1.0,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
     val_freq: int = 0,
+    val_episodes: int,
+    val_envs: list[Env],
+    val_batch_size: int,
     think_token_id: int | None = None,
 ) -> None:
     if use_bf16:
@@ -1994,6 +2083,23 @@ def train_internal_reasoning_grpo(
             log_probs = log_probs.detach().requires_grad_(True)
         return log_probs, mask
 
+    val_fn = create_internal_reasoning_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        val_reward_fn=reward_fn,
+        think_token_id=think_token_id,
+        move_id_to_name=move_id_to_name,
+        valid_hard_token_ids=valid_hard_token_ids,
+        max_cycles=max_cycles,
+    )
+
     _grpo_train_loop(
         net=net,
         opt=opt,
@@ -2012,8 +2118,9 @@ def train_internal_reasoning_grpo(
         max_grad_norm=max_grad_norm,
         use_bf16=use_bf16,
         save_ckpt_freq=save_ckpt_freq,
-        val_config=val_config,
+        val_envs=val_envs,
         val_freq=val_freq,
+        val_fn=val_fn,
     )
 
 
@@ -2041,7 +2148,7 @@ def make_sft_per_cycle_backward_callback(
     return callback
 
 
-def train_internal_reasoning_sft(
+def create_internal_reasoning_sft_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2052,29 +2159,20 @@ def train_internal_reasoning_sft(
     eos_token_id: int,
     move_name_to_id: dict[str, int],
     valid_hard_token_ids: list[int],
-    move_id_to_name: dict[int, str],
-    soft_block_size: int = 4,
-    soft_bptt_window: int | None = None,
-    max_cycles: int = 30,
-    max_episodes: int = 1000,
-    batch_size: int = 4,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    normalize_by_sequence_length: bool = True,
-    use_bf16: bool = True,
-    save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
-    val_freq: int = 0,
-    think_token_id: int | None = None,
-) -> None:
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
+    soft_block_size: int,
+    soft_bptt_window: int | None,
+    max_cycles: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    normalize_by_sequence_length: bool,
+    use_bf16: bool,
+    think_token_id: int | None,
+):
     device = next(net.parameters()).device
-    n_episodes = 0
-    step = 0
 
-    while n_episodes < max_episodes:
+    def _step(step: int):
+        nonlocal net
         opt.zero_grad()
         step_nll_sum = 0.0
         step_solution_lengths: list[int] = []
@@ -2105,22 +2203,9 @@ def train_internal_reasoning_sft(
                 hard_token_ids[b, 0, : len(sol)] = torch.tensor(sol, device=device)
                 n_cycles[b, 0] = len(sol)
 
-            prompts = [state_to_str(er.data) for er in env_responses]
-            encoded = tokenizer.encode_batch(prompts)
-            max_prompt_len = max(len(e.ids) for e in encoded)
-            prompt_token_ids = torch.full(
-                (batch_size, max_prompt_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=device,
+            prompt_token_ids, attention_mask = _encode_prompts(
+                env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
             )
-            attention_mask = torch.zeros(
-                batch_size, max_prompt_len, dtype=torch.bool, device=device
-            )
-            for b, enc in enumerate(encoded):
-                ids = torch.tensor(enc.ids, device=device)
-                prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-                attention_mask[b, max_prompt_len - len(ids) :] = True
 
             cycle_indices = (
                 torch.arange(max_c, device=device)
@@ -2171,42 +2256,151 @@ def train_internal_reasoning_sft(
             ).item()
         opt.step()
 
-        step += 1
-        n_episodes += batch_size * accumulation_steps
+        metrics: dict[str, Any] = {
+            "sft/nll_loss": step_nll_sum,
+            "sft/mean_solution_length": (
+                sum(step_solution_lengths) / len(step_solution_lengths)
+            ),
+        }
+        if grad_norm_val is not None:
+            metrics["sft/grad_norm"] = grad_norm_val
+        if net.soft_projection_alpha is not None:
+            metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
 
-        if extty._active_run is not None:
-            metrics: dict[str, Any] = {
-                "sft/nll_loss": step_nll_sum,
-                "sft/mean_solution_length": (
-                    sum(step_solution_lengths) / len(step_solution_lengths)
-                ),
-            }
-            if grad_norm_val is not None:
-                metrics["sft/grad_norm"] = grad_norm_val
-            if net.soft_projection_alpha is not None:
-                metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
-            extty.log(metrics, step=step)
-
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=net.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-
-        if val_config is not None and val_freq > 0 and step % val_freq == 0:
-            val_metrics = run_validation(net=net, val_config=val_config)
-            extty.log(val_metrics, step=step)
-
-    if step % save_ckpt_freq != 0 and extty._active_run is not None:
-        extty.save_checkpoint(
-            step=step,
-            state_dict=net.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
+        return StepFunctionReturn(
+            n_episodes_processed=batch_size * accumulation_steps, metrics=metrics
         )
 
+    return _step
 
-def train_math_sft(
+
+def create_internal_reasoning_sft_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+    val_reward_fn: RewardFn,
+    think_token_id: int,
+    move_id_to_name: dict[int, str],
+    valid_hard_token_ids: list[int],
+    max_cycles: int,
+):
+    def _val(env: Env):
+        return evaluate_internal_reasoning(
+            net=net,
+            env=env,
+            reward_fn=val_reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=lambda moves: moves if moves else None,
+            move_id_to_name=move_id_to_name,
+            valid_hard_token_ids=valid_hard_token_ids,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            group_size=1,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+            think_token_id=think_token_id,
+        )
+
+    return _val
+
+
+def train_internal_reasoning_sft(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    move_name_to_id: dict[str, int],
+    valid_hard_token_ids: list[int],
+    soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
+    max_cycles: int = 30,
+    max_episodes: int = 1000,
+    batch_size: int = 4,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    normalize_by_sequence_length: bool = True,
+    use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
+    val_reward_fn: RewardFn,
+    val_episodes: int,
+    val_batch_size: int,
+    val_freq: int = 0,
+    val_envs: list[Env],
+    think_token_id: int,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    move_id_to_name = {v: k for k, v in move_name_to_id.items()}
+
+    train_step = create_internal_reasoning_sft_step_fn(
+        net=net,
+        opt=opt,
+        env=env,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        move_name_to_id=move_name_to_id,
+        valid_hard_token_ids=valid_hard_token_ids,
+        soft_block_size=soft_block_size,
+        soft_bptt_window=soft_bptt_window,
+        max_cycles=max_cycles,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        use_bf16=use_bf16,
+        think_token_id=think_token_id,
+    )
+
+    val_fn = create_internal_reasoning_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        val_reward_fn=val_reward_fn,
+        think_token_id=think_token_id,
+        move_id_to_name=move_id_to_name,
+        valid_hard_token_ids=valid_hard_token_ids,
+        max_cycles=max_cycles,
+    )
+
+    _train_loop(
+        max_episodes=max_episodes,
+        save_ckpt_freq=save_ckpt_freq,
+        val_freq=val_freq,
+        net=net,
+        opt=opt,
+        train_step=train_step,
+        val_envs=val_envs,
+        val_fn=val_fn,
+    )
+
+
+def create_sft_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2218,67 +2412,16 @@ def train_math_sft(
     soft_block_size: int = 4,
     soft_bptt_window: int | None = None,
     max_answer_tokens: int = 16,
-    max_episodes: int = 1000,
     batch_size: int = 4,
     accumulation_steps: int = 1,
     max_grad_norm: float = 1.0,
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
-    save_ckpt_freq: int = sys.maxsize,
-    val_config: ValidationConfig | None = None,
-    val_freq: int = 0,
-) -> None:
-    """SFT training loop for math with soft prefill.
-
-    Parameters
-    ----------
-    net
-        The transformer model.
-    opt
-        Optimizer.
-    env
-        Math environment (MathEnv).
-    state_to_str
-        Converts env state to prompt string.
-    tokenizer
-        Tokenizer for encoding prompts and answers.
-    pad_token_id
-        Padding token ID.
-    eos_token_id
-        EOS token ID.
-    soft_block_size
-        Number of hidden-state passes in the soft block.
-    soft_bptt_window
-        Number of soft passes at the end to backprop through.
-    max_answer_tokens
-        Maximum answer tokens (including EOS).
-    max_episodes
-        Total training episodes.
-    batch_size
-        Batch size per accumulation step.
-    accumulation_steps
-        Gradient accumulation steps.
-    max_grad_norm
-        Max gradient norm for clipping.
-    normalize_by_sequence_length
-        Whether to normalize NLL by answer length.
-    use_bf16
-        Whether to use bf16 autocast.
-    save_ckpt_freq
-        Checkpoint frequency.
-    val_config
-        Validation configuration.
-    val_freq
-        Validation frequency in steps.
-    """
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
+):
     device = next(net.parameters()).device
-    n_episodes = 0
-    step = 0
 
-    while n_episodes < max_episodes:
+    def _step(step: int):
+        nonlocal net
         opt.zero_grad()
         step_nll_sum = 0.0
         step_answer_lengths: list[int] = []
@@ -2286,22 +2429,9 @@ def train_math_sft(
         for _ in range(accumulation_steps):
             env_responses = [env.reset() for _ in range(batch_size)]
 
-            prompts = [state_to_str(er.data) for er in env_responses]
-            encoded = tokenizer.encode_batch(prompts)
-            max_prompt_len = max(len(e.ids) for e in encoded)
-            prompt_token_ids = torch.full(
-                (batch_size, max_prompt_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=device,
+            prompt_token_ids, attention_mask = _encode_prompts(
+                env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
             )
-            attention_mask_t = torch.zeros(
-                batch_size, max_prompt_len, dtype=torch.bool, device=device
-            )
-            for b, enc in enumerate(encoded):
-                ids = torch.tensor(enc.ids, device=device)
-                prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-                attention_mask_t[b, max_prompt_len - len(ids) :] = True
 
             answer_ids_list: list[list[int]] = []
             for er in env_responses:
@@ -2327,7 +2457,7 @@ def train_math_sft(
                 log_probs, completion_mask = compute_soft_prefill_log_probs(
                     net=net,
                     prompt_token_ids=prompt_token_ids,
-                    attention_mask=attention_mask_t,
+                    attention_mask=attention_mask,
                     answer_token_ids=answer_token_ids,
                     answer_lengths=answer_lengths,
                     soft_block_size=soft_block_size,
@@ -2355,36 +2485,122 @@ def train_math_sft(
             ).item()
         opt.step()
 
-        step += 1
-        n_episodes += batch_size * accumulation_steps
+        metrics: dict[str, Any] = {
+            "sft/nll_loss": step_nll_sum,
+            "sft/mean_answer_length": (
+                sum(step_answer_lengths) / len(step_answer_lengths)
+            ),
+        }
+        if grad_norm_val is not None:
+            metrics["sft/grad_norm"] = grad_norm_val
+        if net.soft_projection_alpha is not None:
+            metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
 
-        if extty._active_run is not None:
-            metrics: dict[str, Any] = {
-                "sft/nll_loss": step_nll_sum,
-                "sft/mean_answer_length": (
-                    sum(step_answer_lengths) / len(step_answer_lengths)
-                ),
-            }
-            if grad_norm_val is not None:
-                metrics["sft/grad_norm"] = grad_norm_val
-            if net.soft_projection_alpha is not None:
-                metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
-            extty.log(metrics, step=step)
-
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=net.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-
-        if val_config is not None and val_freq > 0 and step % val_freq == 0:
-            val_metrics = run_validation(net=net, val_config=val_config)
-            extty.log(val_metrics, step=step)
-
-    if step % save_ckpt_freq != 0 and extty._active_run is not None:
-        extty.save_checkpoint(
-            step=step,
-            state_dict=net.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
+        return StepFunctionReturn(
+            n_episodes_processed=batch_size * accumulation_steps, metrics=metrics
         )
+
+    return _step
+
+
+def create_sft_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int,
+    max_answer_tokens: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+):
+    def _val(env: Env):
+        return evaluate_soft_prefill(
+            net=net,
+            env=env,
+            state_to_str=state_to_str,
+            answer_extractor=lambda state: state.answer,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            soft_block_size=soft_block_size,
+            max_new_tokens=max_answer_tokens,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            temperature=0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+        )
+
+    return _val
+
+
+def train_math_sft(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    soft_block_size: int = 4,
+    soft_bptt_window: int | None = None,
+    max_answer_tokens: int = 16,
+    max_episodes: int = 1000,
+    batch_size: int = 4,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    normalize_by_sequence_length: bool = True,
+    use_bf16: bool = True,
+    save_ckpt_freq: int = sys.maxsize,
+    val_envs: list[Env],
+    val_batch_size: int,
+    val_episodes: int,
+    val_freq: int = 0,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+    train_step = create_sft_step_fn(
+        net=net,
+        opt=opt,
+        env=env,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        soft_bptt_window=soft_bptt_window,
+        max_answer_tokens=max_answer_tokens,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        use_bf16=use_bf16,
+    )
+
+    val_fn = create_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        soft_block_size=soft_block_size,
+        max_answer_tokens=max_answer_tokens,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+    )
+
+    _train_loop(
+        max_episodes=max_episodes,
+        save_ckpt_freq=save_ckpt_freq,
+        val_freq=val_freq,
+        net=net,
+        opt=opt,
+        train_step=train_step,
+        val_envs=val_envs,
+        val_fn=val_fn,
+    )

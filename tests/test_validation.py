@@ -3,9 +3,8 @@
 import extty
 
 from dialectic.rl.env import Countdown, CountdownEnv
-from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import countdown_correct, weighted_reward
-from dialectic.rl.train import ValidationConfig, run_validation
+from dialectic.rl.train import create_grpo_val_fn, run_validation
 
 
 def countdown_state_to_str(data: Countdown) -> str:
@@ -27,29 +26,26 @@ class TestCountdownEnvStr:
 
 
 class TestRunValidation:
-    def _make_val_config(self, tokenizer, envs, **kwargs):
+    def _make_val_fn(self, tiny_model, tokenizer):
         reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
-        defaults = dict(
-            envs=envs,
-            reward_fn=reward_fn,
+        return create_grpo_val_fn(
+            net=tiny_model,
             state_to_str=countdown_state_to_str,
-            extractor=extract_from_answer_tags,
             tokenizer=tokenizer,
             eos_token_id=151643,
             pad_token_id=151643,
-            max_episodes=4,
-            batch_size=2,
-            max_tokens_generated=20,
             use_bf16=False,
+            val_episodes=4,
+            val_batch_size=2,
+            reward_fn=reward_fn,
+            max_tokens_generated=20,
         )
-        defaults.update(kwargs)
-        return ValidationConfig(**defaults)
 
     def test_single_env_returns_expected_keys(self, tiny_model, tokenizer):
         env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config = self._make_val_config(tokenizer, [env])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
-        metrics = run_validation(net=tiny_model, val_config=val_config)
+        metrics = run_validation(val_envs=[env], val_fn=val_fn)
 
         label = str(env)
         assert f"val/{label}/reward_mean" in metrics
@@ -60,9 +56,9 @@ class TestRunValidation:
     def test_multiple_envs_returns_per_env_metrics(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=100)
         env2 = CountdownEnv(n_ops=5, n_total=6, n_larges=2, seed=200)
-        val_config = self._make_val_config(tokenizer, [env1, env2])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
-        metrics = run_validation(net=tiny_model, val_config=val_config)
+        metrics = run_validation(val_envs=[env1, env2], val_fn=val_fn)
 
         for env in [env1, env2]:
             label = str(env)
@@ -74,42 +70,21 @@ class TestRunValidation:
     def test_aggregate_reward_is_mean_of_per_env(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=100)
         env2 = CountdownEnv(n_ops=5, n_total=6, n_larges=2, seed=200)
-        val_config = self._make_val_config(tokenizer, [env1, env2])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
-        metrics = run_validation(net=tiny_model, val_config=val_config)
+        metrics = run_validation(val_envs=[env1, env2], val_fn=val_fn)
 
         per_env_means = [metrics[f"val/{str(env)}/reward_mean"] for env in [env1, env2]]
         expected = sum(per_env_means) / len(per_env_means)
         assert metrics["val/reward_mean"] == expected
 
-    def test_restores_training_mode(self, tiny_model, tokenizer):
-        env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config = self._make_val_config(tokenizer, [env])
-
-        tiny_model.train()
-        assert tiny_model.training
-
-        run_validation(net=tiny_model, val_config=val_config)
-        assert tiny_model.training
-
-    def test_preserves_eval_mode(self, tiny_model, tokenizer):
-        env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config = self._make_val_config(tokenizer, [env])
-
-        tiny_model.eval()
-        assert not tiny_model.training
-
-        run_validation(net=tiny_model, val_config=val_config)
-        assert not tiny_model.training
-
     def test_deterministic_with_same_seeds(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
         env2 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config1 = self._make_val_config(tokenizer, [env1])
-        val_config2 = self._make_val_config(tokenizer, [env2])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
-        metrics1 = run_validation(net=tiny_model, val_config=val_config1)
-        metrics2 = run_validation(net=tiny_model, val_config=val_config2)
+        metrics1 = run_validation(val_envs=[env1], val_fn=val_fn)
+        metrics2 = run_validation(val_envs=[env2], val_fn=val_fn)
 
         label = str(env1)
         assert (
@@ -118,10 +93,10 @@ class TestRunValidation:
 
     def test_no_grad_during_validation(self, tiny_model, tokenizer):
         env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config = self._make_val_config(tokenizer, [env])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
         tiny_model.train()
-        run_validation(net=tiny_model, val_config=val_config)
+        run_validation(val_envs=[env], val_fn=val_fn)
 
         for param in tiny_model.parameters():
             assert param.grad is None
@@ -149,9 +124,9 @@ class TestRunValidation:
 
     def test_examples_have_rewards(self, tiny_model, tokenizer):
         env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
-        val_config = self._make_val_config(tokenizer, [env])
+        val_fn = self._make_val_fn(tiny_model, tokenizer)
 
-        metrics = run_validation(net=tiny_model, val_config=val_config)
+        metrics = run_validation(val_envs=[env], val_fn=val_fn)
 
         label = str(env)
         example = metrics[f"val/{label}/example"]
