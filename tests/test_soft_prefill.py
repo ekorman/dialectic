@@ -5,8 +5,8 @@ from dialectic.rl.env import MathEnv, MathState
 from dialectic.rl.evaluate import EvaluationResult, evaluate_soft_prefill
 from dialectic.rl.math import EASY_CONFIG, MathDatasetConfig
 from dialectic.rl.train import (
-    ValidationConfig,
     compute_soft_prefill_log_probs,
+    create_sft_val_fn,
     run_validation,
     train_math_sft,
 )
@@ -346,6 +346,9 @@ class TestTrainMathSft:
             max_grad_norm=1.0,
             normalize_by_sequence_length=True,
             use_bf16=False,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         params_changed = False
@@ -393,7 +396,7 @@ class TestEvaluateSoftPrefill:
             assert "correct" in ex.rewards[0]
 
     def test_run_validation_uses_soft_prefill(self, tiny_model, tokenizer):
-        """Verify run_validation with soft_prefill=True uses evaluate_soft_prefill,
+        """Verify run_validation with soft_prefill val_fn uses evaluate_soft_prefill,
         producing only 'correct' reward component (not 'answer_tags')."""
         torch.manual_seed(42)
 
@@ -403,25 +406,20 @@ class TestEvaluateSoftPrefill:
         )
         val_envs = [MathEnv(config=config, seed=2026)]
 
-        val_config = ValidationConfig(
-            envs=val_envs,
-            reward_fn=lambda *a, **kw: None,
+        val_fn = create_sft_val_fn(
+            net=tiny_model,
             state_to_str=math_state_to_str,
-            extractor=lambda x: x,
             tokenizer=tokenizer,
             eos_token_id=EOS_TOKEN_ID,
             pad_token_id=PAD_TOKEN_ID,
-            max_episodes=4,
-            batch_size=2,
-            max_tokens_generated=64,
-            use_bf16=False,
-            soft_prefill=True,
             soft_block_size=SOFT_BLOCK_SIZE,
-            max_new_tokens=8,
-            answer_extractor=lambda data: data.answer,
+            max_answer_tokens=8,
+            use_bf16=False,
+            val_episodes=4,
+            val_batch_size=2,
         )
 
-        metrics = run_validation(net=tiny_model, val_config=val_config)
+        metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
 
         assert "val/math_trivial/reward_mean" in metrics
         assert "val/math_trivial/reward/correct" in metrics

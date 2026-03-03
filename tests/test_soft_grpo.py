@@ -313,6 +313,9 @@ class TestTrainSoftGrpo:
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
             normalize_soft_pdf_by_dim=False,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
     def test_training_loop_completes_eps_not_none(self, tiny_model, tokenizer):
@@ -367,6 +370,9 @@ class TestTrainSoftGrpo:
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
             normalize_soft_pdf_by_dim=False,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         params_changed = False

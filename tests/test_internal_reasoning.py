@@ -579,6 +579,9 @@ class TestTrainInternalReasoningGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
     def test_optimizer_step_changes_params(self, tiny_model, tokenizer):
@@ -635,6 +638,9 @@ class TestTrainInternalReasoningGrpo:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         params_changed = False
@@ -1054,7 +1060,6 @@ class TestSFT:
             eos_token_id=EOS_TOKEN_ID,
             move_name_to_id=move_name_to_id,
             valid_hard_token_ids=valid_ids,
-            move_id_to_name=move_id_to_name,
             soft_block_size=2,
             max_cycles=10,
             max_episodes=4,
@@ -1063,6 +1068,11 @@ class TestSFT:
             max_grad_norm=1.0,
             normalize_by_sequence_length=True,
             use_bf16=False,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
+            val_reward_fn=lambda: 1,
+            think_token_id=1,
         )
 
         params_changed = False

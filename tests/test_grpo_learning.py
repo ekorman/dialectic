@@ -175,6 +175,9 @@ class TestGRPOMechanics:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=normalize_by_sequence_length,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
     def test_training_loop_completes_beta_zero(self, tiny_model, tokenizer, env):
@@ -221,6 +224,9 @@ class TestGRPOMechanics:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
     def test_gradients_flow(self, tiny_model, tokenizer, env):
@@ -267,6 +273,9 @@ class TestGRPOMechanics:
             use_bf16=False,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         params_changed = False
@@ -303,6 +312,9 @@ class TestGRPOMechanics:
             use_bf16=True,
             advantage_fn=grpo_advantage,
             normalize_by_sequence_length=True,
+            val_episodes=0,
+            val_envs=[],
+            val_batch_size=0,
         )
 
         for param in tiny_model.parameters():
@@ -401,6 +413,9 @@ class TestGRPOMechanics:
                 use_bf16=False,
                 advantage_fn=grpo_advantage,
                 normalize_by_sequence_length=True,
+                val_episodes=0,
+                val_envs=[],
+                val_batch_size=0,
             )
             return model
 
