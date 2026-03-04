@@ -6,19 +6,32 @@ from typing import Callable, Literal
 import extty
 import torch
 
-from dialectic.experiments.prompts import PromptCollection
-from dialectic.experiments.reward_fns import get_coutdown_reward_fn
+from dialectic.experiments.prompts import (
+    MAZE_INTERNAL_REASONING_PROMPT,
+    PromptCollection,
+)
+from dialectic.experiments.reward_fns import get_coutdown_reward_fn, get_maze_reward_fn
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.templates import Message
-from dialectic.rl.env import Countdown, CountdownEnv, Env, MathEnv, MathState, MazeState
+from dialectic.rl.env import (
+    Countdown,
+    CountdownEnv,
+    Env,
+    MathEnv,
+    MathState,
+    MazeEnv,
+    MazeState,
+)
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.math import MathDatasetConfig
+from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import (
     grpo_advantage,
     rloo_advantage,
     train_grpo,
+    train_internal_reasoning_sft,
     train_internal_reasoning_single_step_sft,
     train_soft_grpo,
 )
@@ -88,6 +101,12 @@ class RewardParams:
 
 
 @dataclass
+class MazeRewardParams:
+    validity_weight: float
+    distance_weight: float
+
+
+@dataclass
 class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
@@ -95,9 +114,17 @@ class CountdownParams:
 
 
 @dataclass
-class SFTParams:
+class SingleStepSFTParams:
     max_answer_tokens: int
     normalize_by_sequence_length: bool
+
+
+@dataclass
+class MultiStepSFTParams:
+    move_name_to_id: dict[str, int]
+    valid_hard_token_ids: list[int]
+    normalize_by_sequence_length: bool
+    think_token_id: int | None
 
 
 def load_model_and_opt(
@@ -266,7 +293,7 @@ def train_grpo_countdown(
 def _train_internal_reasoning_single_step_sft(
     train_params: TrainParams,
     soft_params: SoftParams,
-    sft_params: SFTParams,
+    sft_params: SingleStepSFTParams,
     env: Env,
     prompt_collection: PromptCollection,
     val_envs: list[Env],
@@ -311,7 +338,7 @@ def train_sft_math(
     *,
     train_params: TrainParams,
     soft_params: SoftParams,
-    sft_params: SFTParams,
+    sft_params: SingleStepSFTParams,
     math_config: MathDatasetConfig,
     prompt_collection: PromptCollection,
 ):
@@ -423,3 +450,96 @@ def train_soft_grpo_countdown(
         extractor=extractor,
         val_envs=val_envs,
     )
+
+
+def _train_internal_reasoning_sft(
+    train_params: TrainParams,
+    env: Env,
+    soft_params: SoftParams,
+    multistep_sft_params: MultiStepSFTParams,
+    prompt_collection: PromptCollection,
+    val_reward_fn: RewardFn,
+    val_envs: list[Env],
+):
+    model_info = MODEL_REGISTRY[train_params.model_name]
+    net, opt = load_model_and_opt(train_params=train_params)
+    tokenizer = model_info.load_tokenizer()
+
+    state_to_str = get_state_to_str(
+        format_messages=model_info.format_messages,
+        system_prompt=prompt_collection.system_prompt,
+        assistant_prefill=prompt_collection.assistant_prefill,
+    )
+
+    return train_internal_reasoning_sft(
+        net=net,
+        opt=opt,
+        env=env,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=model_info.pad_token_id,
+        eos_token_id=model_info.eos_token_id,
+        move_name_to_id=multistep_sft_params.move_name_to_id,
+        valid_hard_token_ids=multistep_sft_params.valid_hard_token_ids,
+        soft_block_size=soft_params.soft_block_size,
+        soft_bptt_window=soft_params.soft_bptt_window,
+        max_cycles=soft_params.max_cycles,
+        max_episodes=train_params.max_episodes,
+        batch_size=train_params.batch_size,
+        accumulation_steps=train_params.accumulation_steps,
+        max_grad_norm=train_params.max_grad_norm,
+        normalize_by_sequence_length=multistep_sft_params.normalize_by_sequence_length,
+        use_bf16=train_params.use_bf_16,
+        save_ckpt_freq=train_params.save_ckpt_freq,
+        val_reward_fn=val_reward_fn,
+        val_episodes=train_params.val_episodes,
+        val_batch_size=train_params.val_batch_size,
+        val_freq=train_params.val_freq,
+        val_envs=val_envs,
+        think_token_id=multistep_sft_params.think_token_id,
+    )
+
+
+# multistep
+@extty.experiment(project="sft-maze")
+def train_sft_maze(
+    train_params: TrainParams,
+    multistep_sft_params: MultiStepSFTParams,
+    soft_params: SoftParams,
+    reward_params: RewardParams,
+    maze_reward_params: MazeRewardParams,
+    maze_config: MazeConfig,  # TODO: move this with the other params
+):
+    prompt_collection = MAZE_INTERNAL_REASONING_PROMPT
+    env = MazeEnv(
+        config=maze_config,
+        prompt_template=prompt_collection.env_prompt,
+        seed=train_params.seed,
+    )
+    reward_fn = get_maze_reward_fn(
+        answer_tags_weight=reward_params.answer_tags_weight,
+        validity_weight=maze_reward_params.validity_weight,
+        distance_weight=maze_reward_params.distance_weight,
+        think_tags_weight=reward_params.think_tags_weight,
+    )
+
+    val_envs = [
+        MazeEnv(
+            config=maze_config,
+            prompt_template=MAZE_INTERNAL_REASONING_PROMPT.env_prompt,
+            seed=2026,
+        )
+    ]
+
+    return _train_internal_reasoning_sft(
+        train_params=train_params,
+        env=env,
+        soft_params=soft_params,
+        multistep_sft_params=multistep_sft_params,
+        prompt_collection=prompt_collection,
+        val_reward_fn=reward_fn,
+        val_envs=val_envs,
+    )
+
+
+# TODO: maze GRPO

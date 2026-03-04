@@ -2286,7 +2286,7 @@ def create_internal_reasoning_sft_val_fn(
     val_episodes: int,
     val_batch_size: int,
     val_reward_fn: RewardFn,
-    think_token_id: int,
+    think_token_id: int | None,
     move_id_to_name: dict[int, str],
     valid_hard_token_ids: list[int],
     max_cycles: int,
@@ -2317,6 +2317,7 @@ def create_internal_reasoning_sft_val_fn(
     return _val
 
 
+# multi-step
 def train_internal_reasoning_sft(
     *,
     net: BaseTransformer,
@@ -2343,7 +2344,7 @@ def train_internal_reasoning_sft(
     val_batch_size: int,
     val_freq: int = 0,
     val_envs: list[Env],
-    think_token_id: int,
+    think_token_id: int | None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2537,7 +2538,8 @@ def create_sft_val_fn(
     return _val
 
 
-def train_math_sft(
+# single step
+def train_internal_reasoning_single_step_sft(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
