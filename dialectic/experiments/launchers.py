@@ -16,10 +16,11 @@ from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.math import MathDatasetConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import (
-    ValidationConfig,
     grpo_advantage,
     rloo_advantage,
     train_grpo,
+    train_internal_reasoning_single_step_sft,
+    train_soft_grpo,
 )
 
 
@@ -40,6 +41,10 @@ class TrainParams:
     use_bf_16: bool
     temperature: float
     logprob_chunk_size: int
+    val_batch_size: int
+    val_episodes: int
+    val_envs: int
+    val_freq: int
     save_ckpt_freq: int = sys.maxsize
 
 
@@ -56,7 +61,13 @@ class GRPOParams:
 
 
 @dataclass
-class SoftRecurrentParams:
+class SoftGRPOParams:
+    noise_std: float
+    normalize_soft_pdf_by_dim: bool
+
+
+@dataclass
+class SoftParams:
     soft_block_size: int
     soft_bptt_window: int
     soft_projection: bool
@@ -81,6 +92,12 @@ class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
     n_ops: int | list
+
+
+@dataclass
+class SFTParams:
+    max_answer_tokens: int
+    normalize_by_sequence_length: bool
 
 
 def load_model_and_opt(
@@ -145,23 +162,6 @@ def _train_grpo(
     )
     tokenizer = model_info.load_tokenizer()
 
-    val_config = ValidationConfig(
-        envs=val_envs,
-        reward_fn=reward_fn,
-        state_to_str=state_to_str,
-        extractor=extractor,
-        tokenizer=tokenizer,
-        eos_token_id=model_info.eos_token_id,
-        pad_token_id=model_info.pad_token_id,
-        max_episodes=train_params.max_episodes,
-        batch_size=train_params.batch_size,
-        max_tokens_generated=train_params.max_tokens_generated,
-        use_bf16=train_params.use_bf_16,
-        internal_reasoning=False,
-        soft_prefill=False,
-        answer_extractor=None,
-    )
-
     train_grpo(
         net=net,
         opt=opt,
@@ -188,16 +188,15 @@ def _train_grpo(
         logprob_chunk_size=train_params.logprob_chunk_size,
         use_bf16=train_params.use_bf_16,
         save_ckpt_freq=train_params.save_ckpt_freq,
-        val_config=val_config,
+        val_batch_size=train_params.val_batch_size,
+        val_episodes=train_params.val_episodes,
         val_freq=train_params.val_freq,
+        val_envs=val_envs,
     )
 
 
-@extty.experiment(project="grpo-countdown")
-def train_grpo_countdown(
-    *,
+def _get_countdown_env_reward_fn_extractor_val_envs(
     train_params: TrainParams,
-    grpo_params: GRPOParams,
     reward_params: RewardParams,
     prompt_collection: PromptCollection,
     countdown_params: CountdownParams,
@@ -232,6 +231,26 @@ def train_grpo_countdown(
         )
         for i in range(len(n_ops_list))
     ]
+    return env, reward_fn, extractor, val_envs
+
+
+@extty.experiment(project="grpo-countdown")
+def train_grpo_countdown(
+    *,
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    reward_params: RewardParams,
+    prompt_collection: PromptCollection,
+    countdown_params: CountdownParams,
+):
+    env, reward_fn, extractor, val_envs = (
+        _get_countdown_env_reward_fn_extractor_val_envs(
+            train_params=train_params,
+            reward_params=reward_params,
+            prompt_collection=prompt_collection,
+            countdown_params=countdown_params,
+        )
+    )
 
     return _train_grpo(
         train_params=train_params,
@@ -244,23 +263,46 @@ def train_grpo_countdown(
     )
 
 
-def _train_sft():
-    val_config = ValidationConfig(
-        envs=val_envs,
-        reward_fn=reward_fn,
+def _train_internal_reasoning_single_step_sft(
+    train_params: TrainParams,
+    soft_params: SoftParams,
+    sft_params: SFTParams,
+    env: Env,
+    prompt_collection: PromptCollection,
+    val_envs: list[Env],
+):
+    model_info = MODEL_REGISTRY[train_params.model_name]
+    net, opt = load_model_and_opt(train_params=train_params)
+    tokenizer = model_info.load_tokenizer()
+
+    state_to_str = get_state_to_str(
+        format_messages=model_info.format_messages,
+        system_prompt=prompt_collection.system_prompt,
+        assistant_prefill=prompt_collection.assistant_prefill,
+    )
+
+    train_internal_reasoning_single_step_sft(
+        net=net,
+        opt=opt,
+        env=env,
         state_to_str=state_to_str,
-        extractor=lambda x: x,
         tokenizer=tokenizer,
-        eos_token_id=model_info.eos_token_id,
         pad_token_id=model_info.pad_token_id,
-        max_episodes=val_episodes,
-        batch_size=val_batch_size,
-        max_tokens_generated=max_tokens,
-        use_bf16=use_bf16,
-        soft_prefill=True,
-        answer_extractor=lambda state: state.answer,
-        max_new_tokens=max_answer_tokens,
-        soft_block_size=soft_block_size,
+        eos_token_id=model_info.eos_token_id,
+        soft_block_size=soft_params.soft_block_size,
+        soft_bptt_window=soft_params.soft_bptt_window,
+        max_answer_tokens=sft_params.max_answer_tokens,
+        max_episodes=train_params.max_episodes,
+        batch_size=train_params.batch_size,
+        accumulation_steps=train_params.accumulation_steps,
+        max_grad_norm=train_params.max_grad_norm,
+        normalize_by_sequence_length=sft_params.normalize_by_sequence_length,
+        use_bf16=train_params.use_bf_16,
+        save_ckpt_freq=train_params.save_ckpt_freq,
+        val_envs=val_envs,
+        val_batch_size=train_params.val_batch_size,
+        val_episodes=train_params.val_episodes,
+        val_freq=train_params.val_freq,
     )
 
 
@@ -268,8 +310,116 @@ def _train_sft():
 def train_sft_math(
     *,
     train_params: TrainParams,
+    soft_params: SoftParams,
+    sft_params: SFTParams,
     math_config: MathDatasetConfig,
     prompt_collection: PromptCollection,
 ):
     env = MathEnv(config=math_config)
     val_envs = [MathEnv(config=math_config, seed=2026)]
+    return _train_internal_reasoning_single_step_sft(
+        train_params=train_params,
+        soft_params=soft_params,
+        sft_params=sft_params,
+        env=env,
+        prompt_collection=prompt_collection,
+        val_envs=val_envs,
+    )
+
+
+def _train_soft_grpo(
+    *,
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    soft_grpo_params: SoftGRPOParams,
+    env: Env,
+    prompt_collection: PromptCollection,
+    reward_fn: RewardFn,
+    extractor: Callable[[str], str | None],
+    val_envs: list[Env],
+):
+    if grpo_params.advantage_fn_type == "grpo":
+        advantage_fn = partial(
+            grpo_advantage, normalize=grpo_params.normalize_advantages
+        )
+    elif grpo_params.advantage_fn_type == "rloo":
+        advantage_fn = rloo_advantage
+    else:
+        raise ValueError(
+            f"Got unknown advantage function type {grpo_params.advantage_fn_type}"
+        )
+
+    model_info = MODEL_REGISTRY[train_params.model_name]
+    net, opt = load_model_and_opt(train_params=train_params)
+    format_messages = model_info.format_messages
+
+    state_to_str = get_state_to_str(
+        format_messages=format_messages,
+        system_prompt=prompt_collection.system_prompt,
+        assistant_prefill=prompt_collection.assistant_prefill,
+    )
+    tokenizer = model_info.load_tokenizer()
+
+    train_soft_grpo(
+        net=net,
+        opt=opt,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        eos_token_id=model_info.eos_token_id,
+        pad_token_id=model_info.pad_token_id,
+        extractor=extractor,
+        beta=grpo_params.beta,
+        eps=grpo_params.eps,
+        mu=grpo_params.mu,
+        max_tokens_generated=train_params.max_tokens_generated,
+        max_episodes=train_params.max_episodes,
+        update_ref_net_batch_cadence=grpo_params.update_ref_net_batch_cadence,
+        batch_size=train_params.batch_size,
+        group_size=grpo_params.group_size,
+        temperature=train_params.temperature,
+        advantage_fn=advantage_fn,
+        normalize_by_sequence_length=grpo_params.normalize_by_sequence_length,
+        accumulation_steps=train_params.accumulation_steps,
+        max_grad_norm=train_params.max_grad_norm,
+        logprob_chunk_size=train_params.logprob_chunk_size,
+        use_bf16=train_params.use_bf_16,
+        save_ckpt_freq=train_params.save_ckpt_freq,
+        val_batch_size=train_params.val_batch_size,
+        val_episodes=train_params.val_episodes,
+        val_freq=train_params.val_freq,
+        val_envs=val_envs,
+        noise_std=soft_grpo_params.noise_std,
+        normalize_soft_pdf_by_dim=soft_grpo_params.normalize_soft_pdf_by_dim,
+    )
+
+
+@extty.experiment(project="soft-grpo-countdown")
+def train_soft_grpo_countdown(
+    *,
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    soft_grpo_params: SoftGRPOParams,
+    reward_params: RewardParams,
+    prompt_collection: PromptCollection,
+    countdown_params: CountdownParams,
+):
+    env, reward_fn, extractor, val_envs = (
+        _get_countdown_env_reward_fn_extractor_val_envs(
+            train_params=train_params,
+            reward_params=reward_params,
+            prompt_collection=prompt_collection,
+            countdown_params=countdown_params,
+        )
+    )
+    return _train_soft_grpo(
+        train_params=train_params,
+        grpo_params=grpo_params,
+        soft_grpo_params=soft_grpo_params,
+        env=env,
+        prompt_collection=prompt_collection,
+        reward_fn=reward_fn,
+        extractor=extractor,
+        val_envs=val_envs,
+    )
