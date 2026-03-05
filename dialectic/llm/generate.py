@@ -822,6 +822,7 @@ def generate_with_soft_prefill(
     pad_token_id: int = 151643,
     temperature: float = 0.0,
     use_bf16: bool = False,
+    num_soft_layers: int | None = None,
 ) -> SoftPrefillGeneratorOutput:
     """Generate with soft prefill: run soft block then autoregressive hard tokens.
 
@@ -854,6 +855,10 @@ def generate_with_soft_prefill(
     device = token_ids.device
     B = token_ids.shape[0]
     L = token_ids.shape[1]
+
+    start_layer = 0
+    if num_soft_layers is not None:
+        start_layer = len(net.layers) - num_soft_layers
 
     max_seq_len = L + soft_block_size + max_new_tokens + 1
     kv_caches = [
@@ -890,8 +895,13 @@ def generate_with_soft_prefill(
                 kv_caches=kv_caches,
                 attention_mask=attn_mask,
                 return_hidden_states=True,
+                start_layer=start_layer,
             )
             h = net.apply_soft_projection(h)
+
+    if start_layer > 0:
+        for cache in kv_caches[:start_layer]:
+            cache.pad(soft_block_size)
 
     attn_mask = torch.cat([attn_mask, ones], dim=1)
     with torch.autocast(

@@ -1,5 +1,6 @@
 import torch
 
+from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import generate_with_soft_prefill
 from dialectic.rl.env import MathEnv, MathState
 from dialectic.rl.evaluate import EvaluationResult, evaluate_soft_prefill
@@ -424,3 +425,143 @@ class TestEvaluateSoftPrefill:
         assert "val/math_trivial/reward_mean" in metrics
         assert "val/math_trivial/reward/correct" in metrics
         assert "answer_tags" not in str(metrics)
+
+
+class TestKVCachePad:
+    def test_kv_cache_pad_advances_seq_len(self):
+        cache = KVCache(max_seq_len=32, num_heads=2, head_dim=4, device="cpu")
+        k = torch.randn(1, 2, 3, 4)
+        v = torch.randn(1, 2, 3, 4)
+        cache.update_and_get_keys(k)
+        cache.update_and_get_values(v)
+        assert cache.get_position_offset() == 3
+
+        cache.pad(5)
+        assert cache.get_position_offset() == 8
+
+        k2 = torch.randn(1, 2, 1, 4)
+        v2 = torch.randn(1, 2, 1, 4)
+        keys = cache.update_and_get_keys(k2)
+        vals = cache.update_and_get_values(v2)
+        assert keys.shape[2] == 9
+        assert vals.shape[2] == 9
+        assert (keys[:, :, 3:8, :] == 0).all()
+        assert (vals[:, :, 3:8, :] == 0).all()
+
+    def test_grad_safe_kv_cache_pad(self):
+        gc = GradSafeKVCache()
+        k = torch.randn(1, 2, 3, 4)
+        v = torch.randn(1, 2, 3, 4)
+        gc.update_and_get_keys(k)
+        gc.update_and_get_values(v)
+        assert gc.get_position_offset() == 3
+
+        gc.pad(5)
+        assert gc.get_position_offset() == 8
+
+        k2 = torch.randn(1, 2, 1, 4)
+        v2 = torch.randn(1, 2, 1, 4)
+        keys = gc.update_and_get_keys(k2)
+        vals = gc.update_and_get_values(v2)
+        assert keys.shape[2] == 9
+        assert vals.shape[2] == 9
+        assert (keys[:, :, 3:8, :] == 0).all()
+        assert (vals[:, :, 3:8, :] == 0).all()
+
+
+class TestPartialDepthRouting:
+    def test_partial_depth_produces_valid_log_probs(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, L, A = 2, 6, 3
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        answer_ids = torch.randint(0, 100, (B, A))
+        answer_lengths = torch.tensor([3, 2])
+
+        log_probs, mask = compute_soft_prefill_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            answer_token_ids=answer_ids,
+            answer_lengths=answer_lengths,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            use_bf16=False,
+            num_soft_layers=1,
+        )
+
+        assert log_probs.shape == (B, A)
+        assert mask.shape == (B, A)
+        assert (log_probs[mask] <= 0).all()
+        assert torch.isfinite(log_probs).all()
+
+    def test_partial_depth_grad_flows(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, L, A = 1, 4, 2
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        answer_ids = torch.randint(0, 100, (B, A))
+        answer_lengths = torch.tensor([2])
+
+        log_probs, mask = compute_soft_prefill_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            answer_token_ids=answer_ids,
+            answer_lengths=answer_lengths,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            use_bf16=False,
+            num_soft_layers=1,
+        )
+
+        loss = -(log_probs * mask).sum()
+        loss.backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in tiny_model.parameters()
+        )
+        assert has_grad
+
+    def test_none_num_soft_layers_matches_full(self, tiny_model):
+        """num_soft_layers=None should produce identical results to full depth."""
+        torch.manual_seed(42)
+        tiny_model.eval()
+
+        B, L, A = 2, 6, 3
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        answer_ids = torch.randint(0, 100, (B, A))
+        answer_lengths = torch.tensor([3, 2])
+
+        with torch.no_grad():
+            lp_none, mask_none = compute_soft_prefill_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                answer_token_ids=answer_ids,
+                answer_lengths=answer_lengths,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                pad_token_id=PAD_TOKEN_ID,
+                use_bf16=False,
+                num_soft_layers=None,
+            )
+            lp_all, mask_all = compute_soft_prefill_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                answer_token_ids=answer_ids,
+                answer_lengths=answer_lengths,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                pad_token_id=PAD_TOKEN_ID,
+                use_bf16=False,
+                num_soft_layers=len(tiny_model.layers),
+            )
+
+        torch.testing.assert_close(lp_none, lp_all, atol=1e-5, rtol=1e-5)
+        assert (mask_none == mask_all).all()

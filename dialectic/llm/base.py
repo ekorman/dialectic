@@ -92,6 +92,7 @@ class BaseTransformer(nn.Module):
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
         soft_token_noise: Float[torch.Tensor, "B L D"] | None = None,
+        start_layer: int = 0,
     ):
         if x.ndim == 2:
             x = self.embed_tokens(x)  # [B, L, D]
@@ -102,7 +103,13 @@ class BaseTransformer(nn.Module):
         else:
             pass  # D-dim embeddings (noise already folded in)
 
-        for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
+        layers = self.layers[start_layer:]
+        if kv_caches is not None:
+            layer_caches = kv_caches[start_layer:]
+        else:
+            layer_caches = [None] * len(layers)
+
+        for layer, kv_cache in zip(layers, layer_caches):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
 
         x = self.norm(x)

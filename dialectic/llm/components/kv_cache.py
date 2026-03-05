@@ -48,6 +48,10 @@ class KVCache:
         self._seq_len += seq_len
         return self._values[:, :, : self._seq_len]
 
+    def pad(self, n: int) -> None:
+        """Advance seq_len by n positions (buffer is pre-allocated with zeros)."""
+        self._seq_len += n
+
     def get_position_offset(self) -> int:
         return self._seq_len
 
@@ -83,6 +87,17 @@ class GradSafeKVCache:
         self._values_list.append(v)
         self._seq_len += v.shape[2]
         return torch.cat(self._values_list, dim=2)
+
+    def pad(self, n: int) -> None:
+        """Append n zero positions to keys and values."""
+        if not self._keys_list:
+            return
+        ref = self._keys_list[0]
+        B, H, _, D = ref.shape
+        zeros = torch.zeros(B, H, n, D, device=ref.device, dtype=ref.dtype)
+        self._keys_list.append(zeros)
+        self._values_list.append(zeros)
+        self._seq_len += n
 
     def get_position_offset(self) -> int:
         return self._seq_len

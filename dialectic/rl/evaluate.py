@@ -274,6 +274,7 @@ def evaluate_soft_prefill(
     temperature: float = 0.0,
     use_bf16: bool = False,
     n_examples: int = 10,
+    num_soft_layers: int | None = None,
 ) -> tuple[EvaluationResult, list[extty.Example]]:
     """Evaluate soft-prefill generation via exact-match against ground truth.
 
@@ -348,6 +349,7 @@ def evaluate_soft_prefill(
             pad_token_id=pad_token_id,
             temperature=temperature,
             use_bf16=use_bf16,
+            num_soft_layers=num_soft_layers,
         )
 
         for b in range(current_batch_size):

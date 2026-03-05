@@ -1655,6 +1655,7 @@ def compute_soft_prefill_log_probs(
     pad_token_id: int,
     use_bf16: bool = True,
     soft_bptt_window: int | None = None,
+    num_soft_layers: int | None = None,
 ) -> tuple[Float[torch.Tensor, "B A"], Bool[torch.Tensor, "B A"]]:
     """Compute log probs for soft-prefill + teacher-forced answer.
 
@@ -1679,6 +1680,9 @@ def compute_soft_prefill_log_probs(
     soft_bptt_window
         Number of soft passes at the end to backprop through.
         None means full BPTT (all soft passes).
+    num_soft_layers
+        When set, only run the last K transformer layers during soft passes.
+        None means use all layers (full-depth).
 
     Returns
     -------
@@ -1688,6 +1692,10 @@ def compute_soft_prefill_log_probs(
     if soft_bptt_window is None:
         soft_bptt_window = soft_block_size
     n_no_grad_soft = soft_block_size - soft_bptt_window
+
+    start_layer = 0
+    if num_soft_layers is not None:
+        start_layer = len(net.layers) - num_soft_layers
 
     B, L = prompt_token_ids.shape
     A = answer_token_ids.shape[1]
@@ -1735,6 +1743,7 @@ def compute_soft_prefill_log_probs(
                         kv_caches=grad_kv_caches,
                         attention_mask=attn_mask,
                         return_hidden_states=True,
+                        start_layer=start_layer,
                     )
                     h = net.apply_soft_projection(h)
             h = h.detach()
@@ -1746,8 +1755,13 @@ def compute_soft_prefill_log_probs(
                 kv_caches=grad_kv_caches,
                 attention_mask=attn_mask,
                 return_hidden_states=True,
+                start_layer=start_layer,
             )
             h = net.apply_soft_projection(h)
+
+        if start_layer > 0:
+            for cache in grad_kv_caches[:start_layer]:
+                cache.pad(soft_block_size)
 
         attn_mask = torch.cat([attn_mask, ones], dim=1)
         logits_0 = net(
@@ -2417,6 +2431,7 @@ def create_sft_step_fn(
     max_grad_norm: float = 1.0,
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
+    num_soft_layers: int | None = None,
 ):
     device = next(net.parameters()).device
 
@@ -2464,6 +2479,7 @@ def create_sft_step_fn(
                     pad_token_id=pad_token_id,
                     use_bf16=use_bf16,
                     soft_bptt_window=soft_bptt_window,
+                    num_soft_layers=num_soft_layers,
                 )
 
             masked_lp = log_probs * completion_mask
@@ -2515,6 +2531,7 @@ def create_sft_val_fn(
     use_bf16: bool,
     val_episodes: int,
     val_batch_size: int,
+    num_soft_layers: int | None = None,
 ):
     def _val(env: Env):
         return evaluate_soft_prefill(
@@ -2532,6 +2549,7 @@ def create_sft_val_fn(
             temperature=0,
             use_bf16=use_bf16,
             n_examples=val_episodes,
+            num_soft_layers=num_soft_layers,
         )
 
     return _val
@@ -2560,6 +2578,7 @@ def train_math_sft(
     val_batch_size: int,
     val_episodes: int,
     val_freq: int = 0,
+    num_soft_layers: int | None = None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2579,6 +2598,7 @@ def train_math_sft(
         max_grad_norm=max_grad_norm,
         normalize_by_sequence_length=normalize_by_sequence_length,
         use_bf16=use_bf16,
+        num_soft_layers=num_soft_layers,
     )
 
     val_fn = create_sft_val_fn(
@@ -2592,6 +2612,7 @@ def train_math_sft(
         use_bf16=use_bf16,
         val_episodes=val_episodes,
         val_batch_size=val_batch_size,
+        num_soft_layers=num_soft_layers,
     )
 
     _train_loop(

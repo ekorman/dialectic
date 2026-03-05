@@ -349,6 +349,7 @@ def train(
     soft_projection_rank: int | None = None,
     sft: bool = False,
     think_token: str | None = None,
+    soft_layer_fraction: float | None = None,
 ):
     assert model_name in MODEL_REGISTRY
     torch.manual_seed(seed)
@@ -363,6 +364,14 @@ def train(
 
     if compile_model:
         net.compile()
+
+    num_soft_layers: int | None = None
+    if soft_layer_fraction is not None:
+        n_layers = len(net.layers)
+        num_soft_layers = max(1, round(soft_layer_fraction * n_layers))
+        print(
+            f"Soft layer fraction {soft_layer_fraction} -> {num_soft_layers}/{n_layers} layers"
+        )
 
     print(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
@@ -540,6 +549,7 @@ def train(
             val_envs=val_envs,
             val_batch_size=val_batch_size,
             val_episodes=val_episodes,
+            num_soft_layers=num_soft_layers,
         )
     elif sft:
         assert internal_reasoning and env_type == "maze", (
@@ -920,6 +930,12 @@ def main():
         "Requires --internal-reasoning.",
     )
     parser.add_argument(
+        "--soft-layer-fraction",
+        type=float,
+        default=None,
+        help="Fraction of top transformer layers to use during soft passes, e.g. 0.5 for the latter half (default: all layers)",
+    )
+    parser.add_argument(
         "--soft-tokens",
         action="store_true",
         default=False,
@@ -1077,6 +1093,7 @@ def main():
         soft_projection_rank=args.soft_projection_rank,
         sft=args.sft,
         think_token=args.think_token,
+        soft_layer_fraction=args.soft_layer_fraction,
     )
 
 
