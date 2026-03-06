@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from tokenizers import Tokenizer
 
 from dialectic.artifacts import Artifact, get_artifact
+from dialectic.llm.base import BaseTransformer
 from dialectic.llm.llama import (
     LLAMA_32_TOKENIZER,
     load_llama_32_1b_instruct,
@@ -68,7 +69,7 @@ class ModelInfo:
     pad_token_id: int
     format_messages: Callable[[list[Message], bool], str]
 
-    def load_net(self, **kwargs):
+    def load_net(self, **kwargs) -> BaseTransformer:
         return self.net_factory(**kwargs)
 
     def load_tokenizer(self) -> Tokenizer:
@@ -79,7 +80,7 @@ class ModelInfo:
 
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
-        net_factory=lambda **kw: load_qwen3_06b(True, **kw),
+        net_factory=load_qwen3_06b,
         tokenizer="Qwen/Qwen3-0.6B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -88,7 +89,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "qwen3-1.7b": ModelInfo(
-        net_factory=lambda **kw: load_qwen3_17b(True, **kw),
+        net_factory=load_qwen3_17b,
         tokenizer="Qwen/Qwen3-1.7B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -97,14 +98,14 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "llama-3.2-1b-instruct": ModelInfo(
-        net_factory=lambda **kw: load_llama_32_1b_instruct(True, **kw),
+        net_factory=load_llama_32_1b_instruct,
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
         format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
     ),
     "llama-3.2-3b-instruct": ModelInfo(
-        net_factory=lambda **kw: load_llama_32_3b_instruct(True, **kw),
+        net_factory=load_llama_32_3b_instruct,
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
@@ -348,6 +349,8 @@ def train(
     soft_projection_alpha_init: float = 1e-3,
     soft_projection_rank: int | None = None,
     sft: bool = False,
+    ckpt_run: str | None = None,
+    ckpt_step: int | None = None,
     think_token: str | None = None,
 ):
     assert model_name in MODEL_REGISTRY
@@ -358,7 +361,18 @@ def train(
         soft_projection=soft_projection,
         soft_projection_alpha_init=soft_projection_alpha_init,
         soft_projection_rank=soft_projection_rank,
+        pretrained_weights=ckpt_run is None,
     )
+    if ckpt_run is not None:
+        if ckpt_step is None:
+            raise ValueError("`ckpt_step` cannot be none if `ckpt_run` is not None")
+        print(f"Loading checkpoint from run {ckpt_run}, step {ckpt_step}")
+        project, run_name = ckpt_run.split("/")
+        net.load_state_dict(
+            extty.load_checkpoint_from(
+                project=project, run_name=run_name, step=ckpt_step
+            )["model_state_dict"]
+        )
     tokenizer = model_info.load_tokenizer()
 
     if compile_model:
@@ -724,6 +738,8 @@ def main():
         help="Environment to train on",
     )
     parser.add_argument("--model", type=str, default="qwen3-0.6b")
+    parser.add_argument("--ckpt-run", type=str)
+    parser.add_argument("--ckpt-step", type=int)
     parser.add_argument("--device", default=None, help="Device (default: auto-detect)")
     parser.add_argument(
         "--max-episodes", type=int, default=1000, help="Max training episodes"
@@ -1077,6 +1093,8 @@ def main():
         soft_projection_rank=args.soft_projection_rank,
         sft=args.sft,
         think_token=args.think_token,
+        ckpt_run=args.ckpt_run,
+        ckpt_step=args.ckpt_step,
     )
 
 
