@@ -481,7 +481,7 @@ def train_soft_grpo_countdown(
     )
 
 
-def _train_internal_reasoning_sft(
+def _train_internal_reasoning_multi_step_sft(
     train_params: TrainParams,
     env: Env,
     soft_params: SoftParams,
@@ -529,9 +529,8 @@ def _train_internal_reasoning_sft(
     )
 
 
-# multistep
 @extty.experiment(project="sft-maze")
-def train_sft_maze(
+def train_multi_step_sft_maze(
     train_params: TrainParams,
     multistep_sft_params: MultiStepSFTParams,
     soft_params: SoftParams,
@@ -549,7 +548,7 @@ def train_sft_maze(
         prompt_collection=prompt_collection,
     )
 
-    return _train_internal_reasoning_sft(
+    return _train_internal_reasoning_multi_step_sft(
         train_params=train_params,
         env=env,
         soft_params=soft_params,
