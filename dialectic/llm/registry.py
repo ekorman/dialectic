@@ -37,7 +37,7 @@ class ModelInfo:
 # TODO: add the "thinking" versions
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     "qwen3-0.6b": ModelInfo(
-        net_factory=lambda **kw: load_qwen3_06b(True, **kw),
+        net_factory=load_qwen3_06b,
         tokenizer="Qwen/Qwen3-0.6B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -46,7 +46,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "qwen3-1.7b": ModelInfo(
-        net_factory=lambda **kw: load_qwen3_17b(True, **kw),
+        net_factory=load_qwen3_17b,
         tokenizer="Qwen/Qwen3-1.7B",
         eos_token_id=151645,
         pad_token_id=151643,
@@ -55,14 +55,14 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         ),
     ),
     "llama-3.2-1b-instruct": ModelInfo(
-        net_factory=lambda **kw: load_llama_32_1b_instruct(True, **kw),
+        net_factory=load_llama_32_1b_instruct,
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
         format_messages=lambda msgs, gen: get_llama_input_text_from_messages(msgs, gen),
     ),
     "llama-3.2-3b-instruct": ModelInfo(
-        net_factory=lambda **kw: load_llama_32_3b_instruct(True, **kw),
+        net_factory=load_llama_32_3b_instruct,
         tokenizer=LLAMA_32_TOKENIZER,
         eos_token_id=128009,
         pad_token_id=128009,
