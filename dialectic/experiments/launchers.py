@@ -23,7 +23,7 @@ from dialectic.rl.env import (
     MazeEnv,
     MazeState,
 )
-from dialectic.rl.extractors import extract_from_answer_tags
+from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
 from dialectic.rl.math import MathDatasetConfig
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
@@ -259,6 +259,35 @@ def _get_countdown_env_reward_fn_extractor_val_envs(
         for i in range(len(n_ops_list))
     ]
     return env, reward_fn, extractor, val_envs
+
+
+def _get_maze_env_reward_fn_extractor_val_envs(
+    train_params: TrainParams,
+    reward_params: RewardParams,
+    maze_reward_params: MazeRewardParams,
+    maze_config: MazeConfig,
+    prompt_collection: PromptCollection,
+):
+    env = MazeEnv(
+        config=maze_config,
+        prompt_template=prompt_collection.env_prompt,
+        seed=train_params.seed,
+    )
+    reward_fn = get_maze_reward_fn(
+        answer_tags_weight=reward_params.answer_tags_weight,
+        validity_weight=maze_reward_params.validity_weight,
+        distance_weight=maze_reward_params.distance_weight,
+        think_tags_weight=reward_params.think_tags_weight,
+    )
+    val_envs = [
+        MazeEnv(
+            config=maze_config,
+            prompt_template=MAZE_INTERNAL_REASONING_PROMPT.env_prompt,
+            seed=2026,
+        )
+    ]
+
+    return env, reward_fn, extract_maze_moves, val_envs
 
 
 @extty.experiment(project="grpo-countdown")
@@ -511,25 +540,14 @@ def train_sft_maze(
     maze_config: MazeConfig,  # TODO: move this with the other params
 ):
     prompt_collection = MAZE_INTERNAL_REASONING_PROMPT
-    env = MazeEnv(
-        config=maze_config,
-        prompt_template=prompt_collection.env_prompt,
-        seed=train_params.seed,
-    )
-    reward_fn = get_maze_reward_fn(
-        answer_tags_weight=reward_params.answer_tags_weight,
-        validity_weight=maze_reward_params.validity_weight,
-        distance_weight=maze_reward_params.distance_weight,
-        think_tags_weight=reward_params.think_tags_weight,
-    )
 
-    val_envs = [
-        MazeEnv(
-            config=maze_config,
-            prompt_template=MAZE_INTERNAL_REASONING_PROMPT.env_prompt,
-            seed=2026,
-        )
-    ]
+    env, reward_fn, _, val_envs = _get_maze_env_reward_fn_extractor_val_envs(
+        train_params=train_params,
+        reward_params=reward_params,
+        maze_reward_params=maze_reward_params,
+        maze_config=maze_config,
+        prompt_collection=prompt_collection,
+    )
 
     return _train_internal_reasoning_sft(
         train_params=train_params,
@@ -542,4 +560,57 @@ def train_sft_maze(
     )
 
 
-# TODO: maze GRPO
+@extty.experiment(project="grpo-maze")
+def train_grpo_maze(
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    reward_params: RewardParams,
+    maze_reward_params: MazeRewardParams,
+    maze_config: MazeConfig,
+):
+    env, reward_fn, extractor, val_envs = _get_maze_env_reward_fn_extractor_val_envs(
+        train_params=train_params,
+        reward_params=reward_params,
+        maze_reward_params=maze_reward_params,
+        maze_config=maze_config,
+        prompt_collection=MAZE_INTERNAL_REASONING_PROMPT,
+    )
+
+    return _train_grpo(
+        train_params=train_params,
+        grpo_params=grpo_params,
+        env=env,
+        prompt_collection=MAZE_INTERNAL_REASONING_PROMPT,
+        reward_fn=reward_fn,
+        extractor=extractor,
+        val_envs=val_envs,
+    )
+
+
+@extty.experiment(project="soft-grpo-maze")
+def train_soft_grpo_maze(
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    soft_grpo_params: SoftGRPOParams,
+    reward_params: RewardParams,
+    maze_reward_params: MazeRewardParams,
+    maze_config: MazeConfig,
+):
+    env, reward_fn, extractor, val_envs = _get_maze_env_reward_fn_extractor_val_envs(
+        train_params=train_params,
+        reward_params=reward_params,
+        maze_reward_params=maze_reward_params,
+        maze_config=maze_config,
+        prompt_collection=MAZE_INTERNAL_REASONING_PROMPT,
+    )
+
+    return _train_soft_grpo(
+        train_params=train_params,
+        grpo_params=grpo_params,
+        env=env,
+        prompt_collection=MAZE_INTERNAL_REASONING_PROMPT,
+        reward_fn=reward_fn,
+        extractor=extractor,
+        val_envs=val_envs,
+        soft_grpo_params=soft_grpo_params,
+    )
