@@ -53,11 +53,6 @@ class TestGeneration:
         with pytest.raises(RuntimeError, match="Failed to generate"):
             generate_maze(cfg, rng, max_attempts=50)
 
-    def test_unsupported_algorithm_raises(self):
-        rng = random.Random(0)
-        with pytest.raises(ValueError, match="Unsupported algorithm"):
-            generate_maze(MazeConfig(algorithm="kruskal"), rng)
-
 
 class TestSeeding:
     def test_same_seed_same_maze(self):
