@@ -1,13 +1,15 @@
 import argparse
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, Field, fields
 from types import UnionType
-from typing import Sequence, Type, TypeVar, get_args, get_origin
+from typing import Literal, Sequence, Type, TypeVar, get_args, get_origin
 
 T = TypeVar("T")
 
 
 def _arg_type(tp):
     origin = get_origin(tp)
+    if origin is Literal:
+        return str
     if tp == int | list[int]:
         return lambda s: [int(x) for x in s.split(",")] if "," in s else int(s)
     if origin is UnionType:
@@ -18,11 +20,16 @@ def _arg_type(tp):
 
 def _add_dataclass_to_parser_(parser: argparse.ArgumentParser, dc: Type[T]) -> None:
     for f in fields(dc):
-        parser.add_argument(
-            f"--{f.name.replace('_', '-')}",
-            type=_arg_type(f.type),
-            required=f.default is MISSING,
-        )
+        arg_type = _arg_type(f.type)
+
+        if arg_type is bool:
+            parser.add_argument(f"--{f.name.replace('_', '-')}", action="store_true")
+        else:
+            parser.add_argument(
+                f"--{f.name.replace('_', '-')}",
+                type=arg_type,
+                required=f.default is MISSING,
+            )
 
 
 def create_subparser(
@@ -40,4 +47,14 @@ def create_subparser(
 
 
 def load_dc_from_arg_parser_args(dc: Type[T], args: argparse.Namespace) -> T:
-    return dc(**{f.name: getattr(args, f.name) or f.default for f in fields(dc)})
+    def _get_value(field: Field):
+        val = getattr(args, field.name)
+        if val is None:
+            val = field.default
+        if field.type is bool and val is MISSING:
+            val = False
+
+        assert val is not MISSING
+        return val
+
+    return dc(**{f.name: _get_value(f) for f in fields(dc)})
