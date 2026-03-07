@@ -3,6 +3,7 @@ from functools import partial
 from typing import Callable
 
 import extty
+import torch
 
 from dialectic.experiments.arg_parser import (
     create_subparser,
@@ -43,6 +44,8 @@ def _train_grpo(
     extractor: Callable[[str], str | None],
     val_envs: list[Env],
 ):
+    torch.manual_seed(train_params.seed)
+
     if grpo_params.advantage_fn_type == "grpo":
         advantage_fn = partial(
             grpo_advantage, normalize=grpo_params.normalize_advantages
