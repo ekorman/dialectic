@@ -1,7 +1,10 @@
 import argparse
-from dataclasses import MISSING, Field, fields
+import inspect
+from dataclasses import MISSING, Field, dataclass, fields
 from types import UnionType
-from typing import Literal, Sequence, Type, TypeVar, get_args, get_origin
+from typing import Callable, Literal, Sequence, Type, TypeVar, get_args, get_origin
+
+from dialectic.experiments.prompts import PROMPT_COLLECTIONS, PromptCollection
 
 T = TypeVar("T")
 
@@ -36,7 +39,7 @@ def create_subparser(
     name: str,
     subparsers: argparse._SubParsersAction,
     dcs: Sequence[Type[T]],
-    include_prompt_collection_id: bool = True,
+    include_prompt_collection_id: bool,
 ):
     parser: argparse.ArgumentParser = subparsers.add_parser(name)
     for dc in dcs:
@@ -58,3 +61,53 @@ def load_dc_from_arg_parser_args(dc: Type[T], args: argparse.Namespace) -> T:
         return val
 
     return dc(**{f.name: _get_value(f) for f in fields(dc)})
+
+
+@dataclass
+class Experiment:
+    env_name: str
+    fn: Callable
+    include_prompt_collection_id: bool
+
+
+def _build_parser(
+    experiments: list[Experiment],
+) -> tuple[argparse.ArgumentParser, list[inspect.Parameter]]:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="env")
+
+    for ex in experiments:
+        sig = inspect.signature(ex.fn)
+        parameters = [
+            p
+            for p in sig.parameters.values()
+            if not (
+                p.annotation == PromptCollection and ex.include_prompt_collection_id
+            )
+        ]
+        create_subparser(
+            name=ex.env_name,
+            subparsers=subparsers,
+            dcs=[p.annotation for p in parameters],
+            include_prompt_collection_id=ex.include_prompt_collection_id,
+        )
+
+    return parser, parameters
+
+
+def run_experiments_parser(experiments: list[Experiment]):
+    parser, parameters = _build_parser(experiments)
+    args = parser.parse_args()
+    for ex in experiments:
+        if args.env == ex.env_name:
+            kwargs = {}
+            for p in parameters:
+                param_class = p.annotation
+                kwargs[p.name] = load_dc_from_arg_parser_args(param_class, args)
+
+            if ex.include_prompt_collection_id:
+                kwargs["prompt_collection"] = PROMPT_COLLECTIONS[ex.env_name][
+                    args.prompt_collection_id
+                ]
+
+            return ex.fn(**kwargs)

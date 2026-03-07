@@ -1,14 +1,10 @@
-import argparse
 from functools import partial
 
 import extty
 import torch
 from tokenizers import Tokenizer
 
-from dialectic.experiments.arg_parser import (
-    create_subparser,
-    load_dc_from_arg_parser_args,
-)
+from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import (
     get_maze_env_reward_fn_extractor_val_envs,
     get_state_to_str,
@@ -141,10 +137,11 @@ def train_hybrid_reasoning_grpo_maze(
     grpo_params: GRPOParams,
     reward_params: RewardParams,
     hybrid_reasoning_params: HybridReasoningParams,
-    prompt_collection: PromptCollection,
     maze_reward_params: MazeRewardParams,
     maze_config: MazeConfig,
 ):
+    prompt_collection = MAZE_INTERNAL_REASONING_PROMPT
+
     env, reward_fn, _, val_envs = get_maze_env_reward_fn_extractor_val_envs(
         train_params=train_params,
         reward_params=reward_params,
@@ -165,41 +162,12 @@ def train_hybrid_reasoning_grpo_maze(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="env")
-
-    # used for all environments
-    dcs = [
-        TrainParams,
-        GRPOParams,
-        RewardParams,
-        MazeRewardParams,
-        MazeConfig,
-        HybridReasoningParams,
-    ]
-
-    maze_parser = create_subparser(
-        "maze", subparsers, dcs, include_prompt_collection_id=False
-    )
-
-    args = parser.parse_args()
-
-    train_params = load_dc_from_arg_parser_args(TrainParams, args)
-    grpo_params = load_dc_from_arg_parser_args(GRPOParams, args)
-    reward_params = load_dc_from_arg_parser_args(RewardParams, args)
-    hybrid_reasoning_params = load_dc_from_arg_parser_args(HybridReasoningParams, args)
-
-    prompt_collection = MAZE_INTERNAL_REASONING_PROMPT
-
-    maze_reward_params = load_dc_from_arg_parser_args(MazeRewardParams, args)
-    maze_config = load_dc_from_arg_parser_args(MazeConfig, args)
-
-    train_hybrid_reasoning_grpo_maze(
-        train_params=train_params,
-        grpo_params=grpo_params,
-        reward_params=reward_params,
-        hybrid_reasoning_params=hybrid_reasoning_params,
-        maze_reward_params=maze_reward_params,
-        maze_config=maze_config,
-        prompt_collection=prompt_collection,
+    run_experiments_parser(
+        [
+            Experiment(
+                env_name="maze",
+                fn=train_hybrid_reasoning_grpo_maze,
+                include_prompt_collection_id=False,
+            )
+        ]
     )

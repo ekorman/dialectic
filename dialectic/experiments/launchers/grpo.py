@@ -1,14 +1,10 @@
-import argparse
 from functools import partial
 from typing import Callable
 
 import extty
 import torch
 
-from dialectic.experiments.arg_parser import (
-    create_subparser,
-    load_dc_from_arg_parser_args,
-)
+from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import (
     get_countdown_env_reward_fn_extractor_val_envs,
     get_maze_env_reward_fn_extractor_val_envs,
@@ -22,7 +18,7 @@ from dialectic.experiments.params import (
     RewardParams,
     TrainParams,
 )
-from dialectic.experiments.prompts import PROMPT_COLLECTIONS, PromptCollection
+from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import Env
 from dialectic.rl.maze import MazeConfig
@@ -155,56 +151,17 @@ def train_grpo_maze(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="env")
-
-    # used for all environments
-    shared_dcs = [TrainParams, GRPOParams, RewardParams]
-
-    maze_parser = create_subparser(
-        "maze",
-        subparsers,
-        shared_dcs + [MazeRewardParams, MazeConfig],
-        include_prompt_collection_id=True,
+    run_experiments_parser(
+        [
+            Experiment(
+                env_name="maze",
+                fn=train_grpo_maze,
+                include_prompt_collection_id=True,
+            ),
+            Experiment(
+                env_name="countdown",
+                fn=train_grpo_countdown,
+                include_prompt_collection_id=True,
+            ),
+        ]
     )
-    countdown_parser = create_subparser(
-        "countdown",
-        subparsers,
-        shared_dcs + [CountdownParams],
-        include_prompt_collection_id=True,
-    )
-
-    args = parser.parse_args()
-
-    train_params = load_dc_from_arg_parser_args(TrainParams, args)
-    grpo_params = load_dc_from_arg_parser_args(GRPOParams, args)
-    reward_params = load_dc_from_arg_parser_args(RewardParams, args)
-
-    if args.env == "maze":
-        prompt_collection = PROMPT_COLLECTIONS["maze"][args.prompt_collection_id]
-
-        maze_reward_params = load_dc_from_arg_parser_args(MazeRewardParams, args)
-        maze_config = load_dc_from_arg_parser_args(MazeConfig, args)
-
-        train_grpo_maze(
-            train_params=train_params,
-            grpo_params=grpo_params,
-            reward_params=reward_params,
-            maze_reward_params=maze_reward_params,
-            maze_config=maze_config,
-            prompt_collection=prompt_collection,
-        )
-    elif args.env == "countdown":
-        prompt_collection = PROMPT_COLLECTIONS["countdown"][args.prompt_collection_id]
-
-        countdown_params = load_dc_from_arg_parser_args(CountdownParams, args)
-
-        train_grpo_countdown(
-            train_params=train_params,
-            grpo_params=grpo_params,
-            reward_params=reward_params,
-            countdown_params=countdown_params,
-            prompt_collection=prompt_collection,
-        )
-    else:
-        raise ValueError(f"Unexpected environment {args.env}")
