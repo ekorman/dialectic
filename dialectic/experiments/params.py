@@ -34,9 +34,10 @@ class GRPOParams:
     advantage_fn_type: Literal["grpo", "rloo"]
     normalize_advantages: bool
     normalize_by_sequence_length: bool
-    eps: float
+
     beta: float
     mu: int = 1
+    eps: float | None = None
     update_ref_net_batch_cadence: int | None = None
 
 
@@ -51,10 +52,10 @@ class SoftGRPOParams:
 class HybridReasoningParams:
     soft_block_size: int
     soft_bptt_window: int
-    soft_projection: bool
-    soft_projection_alpha_init: float
-    soft_projection_rank: int
     max_cycles: int
+    soft_projection_alpha_init: float | None = None
+    soft_projection_rank: int | None = None
+    soft_projection: bool = False
     think_token_id: int | None = None
 
 
@@ -94,9 +95,3 @@ class MultiStepSFTParams:
     valid_hard_token_ids: list[int]
     normalize_by_sequence_length: bool
     think_token_id: int | None
-
-
-@dataclass
-class ConstrainedDecodingParams:
-    move_id_to_name: dict[int, str]
-    valid_hard_token_ids: list[int]
