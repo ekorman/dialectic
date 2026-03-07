@@ -521,7 +521,7 @@ def create_grpo_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
-    collect_fn: Callable[[BaseTransformer, BaseTransformer], dict],
+    collect_fn: Callable[[BaseTransformer, BaseTransformer | None], dict],
     recompute_log_probs_fn: Callable[
         [BaseTransformer, dict], tuple[torch.Tensor, torch.Tensor]
     ],
@@ -547,10 +547,12 @@ def create_grpo_step_fn(
 
     def _step(step: int):
         nonlocal ref_net, net
-        if (
-            beta != 0
-            and update_ref_net_batch_cadence
-            and (step % update_ref_net_batch_cadence == 0)
+        if beta != 0 and (
+            (update_ref_net_batch_cadence is None and step == 0)
+            or (
+                update_ref_net_batch_cadence is not None
+                and (step % update_ref_net_batch_cadence == 0)
+            )
         ):
             ref_net = deepcopy(net)
 
@@ -1124,7 +1126,7 @@ def _compute_soft_log_probs_chunked(
 def collect_soft_micro_batch(
     *,
     net: BaseTransformer,
-    ref_net: BaseTransformer,
+    ref_net: BaseTransformer | None,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],

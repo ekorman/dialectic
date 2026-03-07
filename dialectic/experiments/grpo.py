@@ -89,7 +89,7 @@ def _train_grpo(
         accumulation_steps=train_params.accumulation_steps,
         max_grad_norm=train_params.max_grad_norm,
         logprob_chunk_size=train_params.logprob_chunk_size,
-        use_bf16=train_params.use_bf_16,
+        use_bf16=train_params.use_bf16,
         save_ckpt_freq=train_params.save_ckpt_freq,
         val_batch_size=train_params.val_batch_size,
         val_episodes=train_params.val_episodes,
@@ -189,9 +189,7 @@ if __name__ == "__main__":
         prompt_collection = PROMPT_COLLECTIONS["countdown"][args.prompt_collection_id]
 
         countdown_params = load_dc_from_arg_parser_args(CountdownParams, args)
-        import pdb
 
-        pdb.set_trace()
         train_grpo_countdown(
             train_params=train_params,
             grpo_params=grpo_params,

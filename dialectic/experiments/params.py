@@ -16,13 +16,14 @@ class TrainParams:
     val_episodes: int
     val_batch_size: int
     compile_model: bool
+    use_bf16: bool
     seed: int
-    use_bf_16: bool
     temperature: float
     val_batch_size: int
     val_episodes: int
-    val_envs: int
     val_freq: int
+    start_ckpt_run: str | None = None
+    start_ckpt_step: int | None = None
     save_ckpt_freq: int = sys.maxsize
     logprob_chunk_size: int = 64
 
