@@ -7,9 +7,9 @@ from dialectic.rl.math import EASY_CONFIG, MathDatasetConfig
 from dialectic.rl.train import (
     compute_soft_prefill_log_probs,
     create_sft_val_fn,
-    run_validation,
-    train_math_sft,
+    train_internal_reasoning_single_step_sft,
 )
+from dialectic.training import run_validation
 
 PAD_TOKEN_ID = 151643
 EOS_TOKEN_ID = 151645
@@ -330,7 +330,7 @@ class TestTrainMathSft:
             name: param.clone() for name, param in tiny_model.named_parameters()
         }
 
-        train_math_sft(
+        train_internal_reasoning_single_step_sft(
             net=tiny_model,
             opt=opt,
             env=env,
@@ -339,6 +339,7 @@ class TestTrainMathSft:
             pad_token_id=PAD_TOKEN_ID,
             eos_token_id=EOS_TOKEN_ID,
             soft_block_size=2,
+            soft_bptt_window=2,
             max_answer_tokens=8,
             max_episodes=4,
             batch_size=2,

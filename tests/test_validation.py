@@ -4,7 +4,8 @@ import extty
 
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.reward import countdown_correct, weighted_reward
-from dialectic.rl.train import create_grpo_val_fn, run_validation
+from dialectic.rl.train import create_grpo_val_fn
+from dialectic.training import run_validation
 
 
 def countdown_state_to_str(data: Countdown) -> str:

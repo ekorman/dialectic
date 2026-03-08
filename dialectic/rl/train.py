@@ -2,13 +2,11 @@ import sys
 import time
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 import extty
 import torch
 import torch.nn as nn
-from extty import Example
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
@@ -17,7 +15,6 @@ from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import (
-    EvaluationResult,
     evaluate,
     evaluate_internal_reasoning,
     evaluate_soft_prefill,
@@ -30,6 +27,7 @@ from dialectic.rl.rollout import (
     generate_soft_rollout_batch,
 )
 from dialectic.rl.types import A, E, RewardResult, T
+from dialectic.training import StepFunctionReturn, train_loop
 
 
 def aggregate_reward_components(
@@ -42,38 +40,6 @@ def aggregate_reward_components(
             for name, value in r.components.items():
                 all_components.setdefault(name, []).append(value)
     return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
-
-
-@torch.no_grad()
-def run_validation(
-    *,
-    val_envs: list[Env],
-    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
-    reward_means: list[float] = []
-
-    for env in val_envs:
-        env.reseed()
-        label = str(env)
-        result, examples = val_fn(env)
-
-        metrics[f"val/{label}/reward_mean"] = result.reward_mean
-        metrics[f"val/{label}/reward_std"] = result.reward_std
-        for comp_name, comp_val in result.component_means.items():
-            metrics[f"val/{label}/reward/{comp_name}"] = comp_val
-        if examples:
-            metrics[f"val/{label}/example"] = extty.BatchExample(
-                prompts=[e.prompt for e in examples],
-                responses=[e.responses for e in examples],
-                rewards=[e.rewards for e in examples],
-            )
-        reward_means.append(result.reward_mean)
-
-    if reward_means:
-        metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
-
-    return metrics
 
 
 def rewards_to_go(
@@ -464,59 +430,6 @@ def collect_micro_batch(
     }
 
 
-@dataclass
-class StepFunctionReturn:
-    n_episodes_processed: int
-    metrics: dict[str, float | int]
-
-
-def _train_loop(
-    max_episodes: int,
-    save_ckpt_freq: int,
-    val_freq: int,
-    net: BaseTransformer,
-    opt: torch.optim.Optimizer,
-    train_step: Callable[[int], StepFunctionReturn],
-    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-    val_envs: Sequence[Env],
-):
-    n_episodes = 0
-    step = 0
-    while n_episodes < max_episodes:
-        start_time = time.perf_counter()
-        step_ret = train_step(step)
-        step_time = time.perf_counter() - start_time
-        step += 1
-
-        n_episodes += step_ret.n_episodes_processed
-
-        if extty.has_active_run():
-            metrics = step_ret.metrics
-            metrics.update({"step_time": step_time})
-            extty.log(metrics, step=step)
-
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=net.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-            if val_freq > 0 and step % val_freq == 0:
-                was_training = net.training
-                net.eval()
-                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
-                if was_training:
-                    net.train()
-                extty.log(val_metrics, step=step)
-
-    if step % save_ckpt_freq != 0 and extty.has_active_run():
-        extty.save_checkpoint(
-            step=step,
-            state_dict=net.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
-        )
-
-
 def create_grpo_step_fn(
     *,
     net: BaseTransformer,
@@ -819,7 +732,7 @@ def _grpo_train_loop(
         advantage_fn=advantage_fn,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,
@@ -1979,6 +1892,7 @@ def _encode_prompts(
     return prompt_token_ids, attention_mask
 
 
+# TODO: why no logprobs chunk size here?
 def train_internal_reasoning_grpo(
     *,
     net: BaseTransformer,
@@ -2395,7 +2309,7 @@ def train_internal_reasoning_sft(
         max_cycles=max_cycles,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,
@@ -2602,7 +2516,7 @@ def train_internal_reasoning_single_step_sft(
         val_batch_size=val_batch_size,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,
