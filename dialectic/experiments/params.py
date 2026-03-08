@@ -47,7 +47,12 @@ class SoftGRPOParams:
     normalize_soft_pdf_by_dim: bool
 
 
-# rename to internal reasoning params or hybrid reasoning params
+@dataclass
+class InternalReasoningParams:
+    soft_block_size: int
+    soft_bptt_window: int
+
+
 @dataclass
 class HybridReasoningParams:
     soft_block_size: int

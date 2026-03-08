@@ -3,7 +3,7 @@ import time
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import extty
 import torch
@@ -478,7 +478,7 @@ def _train_loop(
     opt: torch.optim.Optimizer,
     train_step: Callable[[int], StepFunctionReturn],
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-    val_envs: list[Env],
+    val_envs: Sequence[Env],
 ):
     n_episodes = 0
     step = 0
@@ -2564,7 +2564,7 @@ def train_internal_reasoning_single_step_sft(
     normalize_by_sequence_length: bool,
     use_bf16: bool,
     save_ckpt_freq: int = sys.maxsize,
-    val_envs: list[Env],
+    val_envs: Sequence[Env],
     val_batch_size: int,
     val_episodes: int,
     val_freq: int = 0,
