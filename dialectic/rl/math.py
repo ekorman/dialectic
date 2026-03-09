@@ -539,29 +539,6 @@ def generate_number_properties(
     )
 
 
-# @dataclass
-# class MathDatasetConfig:
-#     """Configuration for the math problem mix."""
-
-#     mix: dict = field(
-#         default_factory=lambda: {
-#             "direct_arithmetic": 0.20,
-#             "twostep_arithmetic": 0.30,
-#             "word_problem": 0.35,
-#             "number_properties": 0.15,
-#         }
-#     )
-#     difficulty: str = "easy"
-
-
-# GENERATORS = {
-#     "direct_arithmetic": generate_direct_arithmetic,
-#     "twostep_arithmetic": generate_twostep_arithmetic,
-#     "word_problem": generate_word_problem,
-#     "number_properties": generate_number_properties,
-# }
-
-
 def generate_problem(
     direct_arithmetic_prob: float,
     twostep_arithmetic_prob: float,
