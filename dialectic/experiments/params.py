@@ -11,7 +11,7 @@ class TrainParams:
     accumulation_steps: int
     max_grad_norm: float
     max_episodes: int
-    max_tokens_generated: int
+    max_tokens_generated: int  # seems optional for sum e.g. internal reasoning sft
     val_freq: int
     val_episodes: int
     val_batch_size: int
@@ -51,6 +51,9 @@ class SoftGRPOParams:
 class InternalReasoningParams:
     soft_block_size: int
     soft_bptt_window: int
+    soft_projection: bool = False
+    soft_projection_alpha_init: float | None = None
+    soft_projection_rank: int | None = None
 
 
 @dataclass
@@ -58,9 +61,9 @@ class HybridReasoningParams:
     soft_block_size: int
     soft_bptt_window: int
     max_cycles: int
+    soft_projection: bool = False
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
-    soft_projection: bool = False
     think_token_id: int | None = None
 
 
@@ -86,6 +89,15 @@ class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
     n_ops: int | list[int]
+
+
+@dataclass
+class MathEnvParams:
+    difficulty: Literal["trivial", "easy", "medium"]
+    direct_arithmetic_prob: float = 0.2
+    twostep_arithmetic_prob: float = 0.3
+    word_problem_prob: float = 0.35
+    number_properties_prob: float = 0.15
 
 
 @dataclass
