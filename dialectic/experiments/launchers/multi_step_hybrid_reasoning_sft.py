@@ -3,7 +3,10 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
-from dialectic.experiments.envs import get_state_to_str
+from dialectic.experiments.envs import (
+    get_maze_env_reward_fn_extractor_val_envs,
+    get_state_to_str,
+)
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     HybridReasoningParams,
@@ -16,10 +19,8 @@ from dialectic.experiments.prompts import (
     MAZE_INTERNAL_REASONING_PROMPT,
     PromptCollection,
 )
-from dialectic.experiments.reward_fns import get_maze_reward_fn
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
-from dialectic.rl.env import Env, MazeEnv
-from dialectic.rl.extractors import extract_maze_moves
+from dialectic.rl.env import Env
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import train_internal_reasoning_sft
@@ -41,35 +42,6 @@ def _get_valid_hard_token_ids_and_move_name_to_id(
     valid_hard_token_ids.append(model_info.eos_token_id)
 
     return valid_hard_token_ids, move_name_to_id
-
-
-def _get_maze_env_reward_fn_extractor_val_envs(
-    train_params: TrainParams,
-    reward_params: RewardParams,
-    maze_reward_params: MazeRewardParams,
-    maze_config: MazeConfig,
-    prompt_collection: PromptCollection,
-):
-    env = MazeEnv(
-        config=maze_config,
-        prompt_template=prompt_collection.env_prompt,
-        seed=train_params.seed,
-    )
-    reward_fn = get_maze_reward_fn(
-        answer_tags_weight=reward_params.answer_tags_weight,
-        validity_weight=maze_reward_params.validity_weight,
-        distance_weight=maze_reward_params.distance_weight,
-        think_tags_weight=reward_params.think_tags_weight,
-    )
-    val_envs = [
-        MazeEnv(
-            config=maze_config,
-            prompt_template=MAZE_INTERNAL_REASONING_PROMPT.env_prompt,
-            seed=2026,
-        )
-    ]
-
-    return env, reward_fn, extract_maze_moves, val_envs
 
 
 def _train_internal_reasoning_multi_step_sft(
@@ -144,7 +116,7 @@ def train_hybrid_reasoning_sft_maze(
 
     prompt_collection = MAZE_INTERNAL_REASONING_PROMPT
 
-    env, reward_fn, _, val_envs = _get_maze_env_reward_fn_extractor_val_envs(
+    env, reward_fn, _, val_envs = get_maze_env_reward_fn_extractor_val_envs(
         train_params=train_params,
         reward_params=reward_params,
         maze_reward_params=maze_reward_params,
