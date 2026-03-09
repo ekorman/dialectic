@@ -169,7 +169,7 @@ if __name__ == "__main__":
             ),
             Experiment(
                 env_name="maze",
-                fn=train_soft_grpo_countdown,
+                fn=train_soft_grpo_maze,
                 include_prompt_collection_id=False,
             ),
         ]
