@@ -63,6 +63,7 @@ class HybridReasoningParams:
     soft_projection: bool = False
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
+    think_token_id: int | None = None
 
 
 @dataclass
@@ -107,4 +108,3 @@ class SingleStepSFTParams:
 @dataclass
 class MultiStepSFTParams:
     normalize_by_sequence_length: bool
-    think_token_id: int | None = None

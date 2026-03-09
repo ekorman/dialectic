@@ -127,7 +127,7 @@ def _train_internal_reasoning_multi_step_sft(
         val_batch_size=train_params.val_batch_size,
         val_freq=train_params.val_freq,
         val_envs=val_envs,
-        think_token_id=multistep_sft_params.think_token_id,
+        think_token_id=hr_params.think_token_id,
     )
 
 
