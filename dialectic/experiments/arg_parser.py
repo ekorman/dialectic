@@ -72,23 +72,25 @@ class Experiment:
 
 def _build_parser(
     experiments: list[Experiment],
-) -> tuple[argparse.ArgumentParser, list[inspect.Parameter]]:
+) -> tuple[argparse.ArgumentParser, dict[str, list[inspect.Parameter]]]:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="env")
+    parameters = {}
 
     for ex in experiments:
         sig = inspect.signature(ex.fn)
-        parameters = [
+        parameters[ex.env_name] = [
             p
             for p in sig.parameters.values()
             if not (
                 p.annotation == PromptCollection and ex.include_prompt_collection_id
             )
         ]
+
         create_subparser(
             name=ex.env_name,
             subparsers=subparsers,
-            dcs=[p.annotation for p in parameters],
+            dcs=[p.annotation for p in parameters[ex.env_name]],
             include_prompt_collection_id=ex.include_prompt_collection_id,
         )
 
@@ -101,7 +103,7 @@ def run_experiments_parser(experiments: list[Experiment]):
     for ex in experiments:
         if args.env == ex.env_name:
             kwargs = {}
-            for p in parameters:
+            for p in parameters[ex.env_name]:
                 param_class = p.annotation
                 kwargs[p.name] = load_dc_from_arg_parser_args(param_class, args)
 
