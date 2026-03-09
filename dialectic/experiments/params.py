@@ -32,9 +32,8 @@ class TrainParams:
 class GRPOParams:
     group_size: int
     advantage_fn_type: Literal["grpo", "rloo"]
-    normalize_advantages: bool
+    normalize_advantages: bool  # only used for grpo
     normalize_by_sequence_length: bool
-
     beta: float
     mu: int = 1
     eps: float | None = None
@@ -64,7 +63,6 @@ class HybridReasoningParams:
     soft_projection: bool = False
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
-    think_token_id: int | None = None
 
 
 @dataclass
@@ -108,7 +106,5 @@ class SingleStepSFTParams:
 
 @dataclass
 class MultiStepSFTParams:
-    move_name_to_id: dict[str, int]
-    valid_hard_token_ids: list[int]
     normalize_by_sequence_length: bool
-    think_token_id: int | None
+    think_token_id: int | None = None
