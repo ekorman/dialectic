@@ -10,7 +10,7 @@ from dialectic.rl.reward import (
 )
 
 
-def get_coutdown_reward_fn(answer_tags_weight: float, think_tags_weight: float):
+def get_countdown_reward_fn(answer_tags_weight: float, think_tags_weight: float):
     components = [
         ("correct", 1.0, countdown_correct),
         ("answer_tags", answer_tags_weight, answer_tags),

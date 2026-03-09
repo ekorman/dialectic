@@ -10,7 +10,7 @@ from dialectic.experiments.prompts import (
     MAZE_INTERNAL_REASONING_PROMPT,
     PromptCollection,
 )
-from dialectic.experiments.reward_fns import get_coutdown_reward_fn, get_maze_reward_fn
+from dialectic.experiments.reward_fns import get_countdown_reward_fn, get_maze_reward_fn
 from dialectic.llm.templates import Message
 from dialectic.rl.env import Countdown, CountdownEnv, MathState, MazeEnv, MazeState
 from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
@@ -53,7 +53,7 @@ def get_countdown_env_reward_fn_extractor_val_envs(
         n_ops=n_ops,
         prompt_template=prompt_collection.env_prompt,
     )
-    reward_fn = get_coutdown_reward_fn(
+    reward_fn = get_countdown_reward_fn(
         answer_tags_weight=reward_params.answer_tags_weight,
         think_tags_weight=reward_params.think_tags_weight,
     )
