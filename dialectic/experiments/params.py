@@ -11,10 +11,7 @@ class TrainParams:
     accumulation_steps: int
     max_grad_norm: float
     max_episodes: int
-    max_tokens_generated: int  # seems optional for sum e.g. internal reasoning sft
-    val_freq: int
-    val_episodes: int
-    val_batch_size: int
+    max_tokens_generated: int  # seems optional for sum e.g. internal reasoning sftgert
     compile_model: bool
     use_bf16: bool
     seed: int
