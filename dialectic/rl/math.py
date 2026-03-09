@@ -582,19 +582,4 @@ def generate_problem(
         if r < cumulative:
             return method(rng=rng, difficulty=difficulty)
 
-        return generate_number_properties(rng=rng, difficulty=difficulty)
-
-
-# def generate_problem(config: MathDatasetConfig, rng: random.Random) -> MathProblem:
-#     """Generate a single problem according to the mix distribution."""
-#     r = rng.random()
-#     cumulative = 0.0
-#     for problem_type, weight in config.mix.items():
-#         cumulative += weight
-#         if r < cumulative:
-#             generator = GENERATORS[problem_type]
-#             return generator(rng, difficulty=config.difficulty)
-
-#     # Fallback to last type
-#     last_type = list(config.mix.keys())[-1]
-#     return GENERATORS[last_type](rng, difficulty=config.difficulty)
+    return generate_number_properties(rng=rng, difficulty=difficulty)
