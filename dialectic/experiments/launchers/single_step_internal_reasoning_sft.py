@@ -1,6 +1,7 @@
 from typing import Sequence
 
 import extty
+import torch
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import get_state_to_str
@@ -25,6 +26,8 @@ def _train_internal_reasoning_single_step_sft(
     prompt_collection: PromptCollection,
     val_envs: Sequence[Env],
 ):
+    torch.manual_seed(train_params.seed)
+
     model_info = MODEL_REGISTRY[train_params.model_name]
     net, opt = load_model_and_opt(
         train_params=train_params,
