@@ -2,13 +2,11 @@ import sys
 import time
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import extty
 import torch
 import torch.nn as nn
-from extty import Example
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
@@ -17,7 +15,6 @@ from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import (
-    EvaluationResult,
     evaluate,
     evaluate_internal_reasoning,
     evaluate_soft_prefill,
@@ -30,6 +27,7 @@ from dialectic.rl.rollout import (
     generate_soft_rollout_batch,
 )
 from dialectic.rl.types import A, E, RewardResult, T
+from dialectic.training import StepFunctionReturn, train_loop
 
 
 def aggregate_reward_components(
@@ -42,38 +40,6 @@ def aggregate_reward_components(
             for name, value in r.components.items():
                 all_components.setdefault(name, []).append(value)
     return {name: sum(vals) / len(vals) for name, vals in all_components.items()}
-
-
-@torch.no_grad()
-def run_validation(
-    *,
-    val_envs: list[Env],
-    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-) -> dict[str, Any]:
-    metrics: dict[str, Any] = {}
-    reward_means: list[float] = []
-
-    for env in val_envs:
-        env.reseed()
-        label = str(env)
-        result, examples = val_fn(env)
-
-        metrics[f"val/{label}/reward_mean"] = result.reward_mean
-        metrics[f"val/{label}/reward_std"] = result.reward_std
-        for comp_name, comp_val in result.component_means.items():
-            metrics[f"val/{label}/reward/{comp_name}"] = comp_val
-        if examples:
-            metrics[f"val/{label}/example"] = extty.BatchExample(
-                prompts=[e.prompt for e in examples],
-                responses=[e.responses for e in examples],
-                rewards=[e.rewards for e in examples],
-            )
-        reward_means.append(result.reward_mean)
-
-    if reward_means:
-        metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
-
-    return metrics
 
 
 def rewards_to_go(
@@ -464,71 +430,18 @@ def collect_micro_batch(
     }
 
 
-@dataclass
-class StepFunctionReturn:
-    n_episodes_processed: int
-    metrics: dict[str, float | int]
-
-
-def _train_loop(
-    max_episodes: int,
-    save_ckpt_freq: int,
-    val_freq: int,
-    net: BaseTransformer,
-    opt: torch.optim.Optimizer,
-    train_step: Callable[[int], StepFunctionReturn],
-    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-    val_envs: list[Env],
-):
-    n_episodes = 0
-    step = 0
-    while n_episodes < max_episodes:
-        start_time = time.perf_counter()
-        step_ret = train_step(step)
-        step_time = time.perf_counter() - start_time
-        step += 1
-
-        n_episodes += step_ret.n_episodes_processed
-
-        if extty.has_active_run():
-            metrics = step_ret.metrics
-            metrics.update({"step_time": step_time})
-            extty.log(metrics, step=step)
-
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=net.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-            if val_freq > 0 and step % val_freq == 0:
-                was_training = net.training
-                net.eval()
-                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
-                if was_training:
-                    net.train()
-                extty.log(val_metrics, step=step)
-
-    if step % save_ckpt_freq != 0 and extty.has_active_run():
-        extty.save_checkpoint(
-            step=step,
-            state_dict=net.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
-        )
-
-
 def create_grpo_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
-    collect_fn: Callable[[BaseTransformer, BaseTransformer], dict],
+    collect_fn: Callable[[BaseTransformer, BaseTransformer | None], dict],
     recompute_log_probs_fn: Callable[
         [BaseTransformer, dict], tuple[torch.Tensor, torch.Tensor]
     ],
     beta: float,
     eps: float | None,
     mu: int,
-    update_ref_net_batch_cadence: int,
+    update_ref_net_batch_cadence: int | None,
     batch_size: int,
     group_size: int,
     normalize_by_sequence_length: bool,
@@ -547,7 +460,13 @@ def create_grpo_step_fn(
 
     def _step(step: int):
         nonlocal ref_net, net
-        if beta != 0 and (step % update_ref_net_batch_cadence == 0):
+        if beta != 0 and (
+            (update_ref_net_batch_cadence is None and step == 0)
+            or (
+                update_ref_net_batch_cadence is not None
+                and (step % update_ref_net_batch_cadence == 0)
+            )
+        ):
             ref_net = deepcopy(net)
 
         t_gen_total = 0.0
@@ -779,7 +698,7 @@ def _grpo_train_loop(
     eps: float | None,
     mu: int,
     max_episodes: int,
-    update_ref_net_batch_cadence: int,
+    update_ref_net_batch_cadence: int | None,
     batch_size: int,
     group_size: int,
     normalize_by_sequence_length: bool,
@@ -813,7 +732,7 @@ def _grpo_train_loop(
         advantage_fn=advantage_fn,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,
@@ -841,16 +760,16 @@ def train_grpo(
     mu: int,  # number of optimization passes per accumulated batch
     max_tokens_generated: int,
     max_episodes: int,
-    update_ref_net_batch_cadence: int,
+    update_ref_net_batch_cadence: int | None,
     batch_size: int,
     group_size: int,
     temperature: float,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     normalize_by_sequence_length: bool,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    logprob_chunk_size: int = 64,
-    use_bf16: bool = True,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    logprob_chunk_size: int,
+    use_bf16: bool,
     save_ckpt_freq: int = sys.maxsize,
     val_episodes: int,
     val_envs: list[Env],
@@ -1120,7 +1039,7 @@ def _compute_soft_log_probs_chunked(
 def collect_soft_micro_batch(
     *,
     net: BaseTransformer,
-    ref_net: BaseTransformer,
+    ref_net: BaseTransformer | None,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -1296,7 +1215,7 @@ def train_soft_grpo(
     mu: int,
     max_tokens_generated: int,
     max_episodes: int,
-    update_ref_net_batch_cadence: int,
+    update_ref_net_batch_cadence: int | None,
     batch_size: int,
     group_size: int,
     temperature: float,
@@ -1309,8 +1228,8 @@ def train_soft_grpo(
     min_soft_steps: int = 0,
     prefill: PreFill | None = None,
     max_tokens_prefill_steps_before_end: int = 0,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
+    accumulation_steps: int,
+    max_grad_norm: float,
     logprob_chunk_size: int = 64,
     use_bf16: bool = True,
     save_ckpt_freq: int = sys.maxsize,
@@ -1973,6 +1892,7 @@ def _encode_prompts(
     return prompt_token_ids, attention_mask
 
 
+# TODO: why no logprobs chunk size here?
 def train_internal_reasoning_grpo(
     *,
     net: BaseTransformer,
@@ -1986,30 +1906,30 @@ def train_internal_reasoning_grpo(
     extractor: Callable[[list[str]], E],
     move_id_to_name: dict[int, str],
     valid_hard_token_ids: list[int],
-    soft_block_size: int = 4,
-    soft_bptt_window: int | None = None,
-    max_cycles: int = 30,
-    beta: float = 0.04,
-    eps: float | None = None,
+    soft_block_size: int,
+    soft_bptt_window: int,
+    max_cycles: int,
+    beta: float,
+    eps: float | None,
     mu: int = 1,
-    max_episodes: int = 1000,
-    update_ref_net_batch_cadence: int = 100,
-    batch_size: int = 2,
-    group_size: int = 8,
-    temperature: float = 0.7,
+    max_episodes: int,
+    update_ref_net_batch_cadence: int | None,
+    batch_size: int,
+    group_size: int,
+    temperature: float,
     advantage_fn: Callable[
         [Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]
     ] = grpo_advantage,
-    normalize_by_sequence_length: bool = True,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    use_bf16: bool = True,
+    normalize_by_sequence_length,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    use_bf16: bool,
     save_ckpt_freq: int = sys.maxsize,
-    val_freq: int = 0,
+    val_freq: int,
     val_episodes: int,
     val_envs: list[Env],
     val_batch_size: int,
-    think_token_id: int | None = None,
+    think_token_id: int | None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2286,7 +2206,7 @@ def create_internal_reasoning_sft_val_fn(
     val_episodes: int,
     val_batch_size: int,
     val_reward_fn: RewardFn,
-    think_token_id: int,
+    think_token_id: int | None,
     move_id_to_name: dict[int, str],
     valid_hard_token_ids: list[int],
     max_cycles: int,
@@ -2317,6 +2237,7 @@ def create_internal_reasoning_sft_val_fn(
     return _val
 
 
+# multi-step
 def train_internal_reasoning_sft(
     *,
     net: BaseTransformer,
@@ -2328,22 +2249,22 @@ def train_internal_reasoning_sft(
     eos_token_id: int,
     move_name_to_id: dict[str, int],
     valid_hard_token_ids: list[int],
-    soft_block_size: int = 4,
+    soft_block_size: int,
     soft_bptt_window: int | None = None,
-    max_cycles: int = 30,
-    max_episodes: int = 1000,
-    batch_size: int = 4,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    normalize_by_sequence_length: bool = True,
-    use_bf16: bool = True,
+    max_cycles: int,
+    max_episodes: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    normalize_by_sequence_length: bool,
+    use_bf16: bool,
     save_ckpt_freq: int = sys.maxsize,
     val_reward_fn: RewardFn,
     val_episodes: int,
     val_batch_size: int,
     val_freq: int = 0,
     val_envs: list[Env],
-    think_token_id: int,
+    think_token_id: int | None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2388,7 +2309,7 @@ def train_internal_reasoning_sft(
         max_cycles=max_cycles,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,
@@ -2409,12 +2330,12 @@ def create_sft_step_fn(
     tokenizer: Tokenizer,
     pad_token_id: int,
     eos_token_id: int,
-    soft_block_size: int = 4,
-    soft_bptt_window: int | None = None,
-    max_answer_tokens: int = 16,
-    batch_size: int = 4,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
+    soft_block_size: int,
+    soft_bptt_window: int | None,
+    max_answer_tokens: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
     normalize_by_sequence_length: bool = True,
     use_bf16: bool = True,
 ):
@@ -2537,7 +2458,8 @@ def create_sft_val_fn(
     return _val
 
 
-def train_math_sft(
+# single step
+def train_internal_reasoning_single_step_sft(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2546,17 +2468,17 @@ def train_math_sft(
     tokenizer: Tokenizer,
     pad_token_id: int,
     eos_token_id: int,
-    soft_block_size: int = 4,
-    soft_bptt_window: int | None = None,
-    max_answer_tokens: int = 16,
-    max_episodes: int = 1000,
-    batch_size: int = 4,
-    accumulation_steps: int = 1,
-    max_grad_norm: float = 1.0,
-    normalize_by_sequence_length: bool = True,
-    use_bf16: bool = True,
+    soft_block_size: int,
+    soft_bptt_window: int | None,
+    max_answer_tokens: int,
+    max_episodes: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    normalize_by_sequence_length: bool,
+    use_bf16: bool,
     save_ckpt_freq: int = sys.maxsize,
-    val_envs: list[Env],
+    val_envs: Sequence[Env],
     val_batch_size: int,
     val_episodes: int,
     val_freq: int = 0,
@@ -2594,7 +2516,7 @@ def train_math_sft(
         val_batch_size=val_batch_size,
     )
 
-    _train_loop(
+    train_loop(
         max_episodes=max_episodes,
         save_ckpt_freq=save_ckpt_freq,
         val_freq=val_freq,

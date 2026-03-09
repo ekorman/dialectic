@@ -14,6 +14,7 @@ All answers are integers (no fractions/decimals) to keep output simple.
 import math
 import random
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -538,157 +539,24 @@ def generate_number_properties(
     )
 
 
-@dataclass
-class MathDatasetConfig:
-    """Configuration for the math problem mix."""
-
-    mix: dict = field(
-        default_factory=lambda: {
-            "direct_arithmetic": 0.20,
-            "twostep_arithmetic": 0.30,
-            "word_problem": 0.35,
-            "number_properties": 0.15,
-        }
-    )
-    difficulty: str = "easy"  # default difficulty for all types
-    seed: int = 42
-
-
-GENERATORS = {
-    "direct_arithmetic": generate_direct_arithmetic,
-    "twostep_arithmetic": generate_twostep_arithmetic,
-    "word_problem": generate_word_problem,
-    "number_properties": generate_number_properties,
-}
-
-
-def generate_problem(config: MathDatasetConfig, rng: random.Random) -> MathProblem:
-    """Generate a single problem according to the mix distribution."""
+def generate_problem(
+    direct_arithmetic_prob: float,
+    twostep_arithmetic_prob: float,
+    word_problem_prob: float,
+    number_properties_prob: float,
+    difficulty: Literal["trivial", "easy", "medium"],
+    rng: random.Random,
+):
     r = rng.random()
     cumulative = 0.0
-    for problem_type, weight in config.mix.items():
-        cumulative += weight
+    for method, prob in [
+        (generate_direct_arithmetic, direct_arithmetic_prob),
+        (generate_twostep_arithmetic, twostep_arithmetic_prob),
+        (generate_word_problem, word_problem_prob),
+        (generate_number_properties, number_properties_prob),
+    ]:
+        cumulative += prob
         if r < cumulative:
-            generator = GENERATORS[problem_type]
-            return generator(rng, difficulty=config.difficulty)
+            return method(rng=rng, difficulty=difficulty)
 
-    # Fallback to last type
-    last_type = list(config.mix.keys())[-1]
-    return GENERATORS[last_type](rng, difficulty=config.difficulty)
-
-
-def generate_dataset(config: MathDatasetConfig, n: int) -> list[MathProblem]:
-    """Generate n problems according to config."""
-    rng = random.Random(config.seed)
-    problems = []
-    for _ in range(n):
-        problems.append(generate_problem(config, rng))
-    return problems
-
-
-def format_for_sft(problem: MathProblem, include_answer: bool = True) -> dict:
-    """
-    Format a problem for SFT training.
-    Returns prompt and answer as strings.
-    """
-    prompt = f"Question: {problem.question}\nAnswer:"
-    answer = str(problem.answer)
-
-    return {
-        "prompt": prompt,
-        "answer": answer,
-        "full": f"{prompt} {answer}" if include_answer else prompt,
-        "problem_type": problem.problem_type,
-        "num_operations": problem.num_operations,
-    }
-
-
-TRIVIAL_CONFIG = MathDatasetConfig(
-    mix={
-        "direct_arithmetic": 0.50,
-        "twostep_arithmetic": 0.00,
-        "word_problem": 0.25,
-        "number_properties": 0.25,
-    },
-    difficulty="trivial",
-)
-
-EASY_CONFIG = MathDatasetConfig(
-    mix={
-        "direct_arithmetic": 0.20,
-        "twostep_arithmetic": 0.30,
-        "word_problem": 0.35,
-        "number_properties": 0.15,
-    },
-    difficulty="easy",
-)
-
-MEDIUM_CONFIG = MathDatasetConfig(
-    mix={
-        "direct_arithmetic": 0.15,
-        "twostep_arithmetic": 0.30,
-        "word_problem": 0.40,
-        "number_properties": 0.15,
-    },
-    difficulty="medium",
-)
-
-
-# ============================================================
-# Demo / verification
-# ============================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Generating sample problems from each type")
-    print("=" * 60)
-
-    rng = random.Random(42)
-
-    generators_demo = [
-        ("Direct Arithmetic (trivial)", generate_direct_arithmetic, "trivial"),
-        ("Direct Arithmetic (easy)", generate_direct_arithmetic, "easy"),
-        ("Direct Arithmetic (medium)", generate_direct_arithmetic, "medium"),
-        ("Two-Step Arithmetic (easy)", generate_twostep_arithmetic, "easy"),
-        ("Two-Step Arithmetic (medium)", generate_twostep_arithmetic, "medium"),
-        ("Word Problem (easy)", generate_word_problem, "easy"),
-        ("Word Problem (medium)", generate_word_problem, "medium"),
-        ("Number Properties (easy)", generate_number_properties, "easy"),
-    ]
-
-    for label, gen, diff in generators_demo:
-        print(f"\n--- {label} ---")
-        for i in range(3):
-            p = gen(rng, difficulty=diff)
-            formatted = format_for_sft(p)
-            print(f"  {formatted['prompt']} {formatted['answer']}")
-            if p.metadata.get("solution"):
-                print(f"    (Solution: {p.metadata['solution']})")
-
-    # Dataset statistics
-    print("\n" + "=" * 60)
-    print("Dataset statistics (1000 problems, EASY_CONFIG)")
-    print("=" * 60)
-
-    dataset = generate_dataset(EASY_CONFIG, 1000)
-
-    type_counts = {}
-    op_counts = {}
-    for p in dataset:
-        type_counts[p.problem_type] = type_counts.get(p.problem_type, 0) + 1
-        op_counts[p.num_operations] = op_counts.get(p.num_operations, 0) + 1
-
-    print("\nProblem type distribution:")
-    for t, c in sorted(type_counts.items()):
-        print(f"  {t}: {c} ({c / 10:.1f}%)")
-
-    print("\nOperations distribution:")
-    for o, c in sorted(op_counts.items()):
-        print(f"  {o} ops: {c} ({c / 10:.1f}%)")
-
-    answers = [p.answer for p in dataset]
-    print("\nAnswer statistics:")
-    print(f"  min: {min(answers)}")
-    print(f"  max: {max(answers)}")
-    print(f"  mean: {sum(answers) / len(answers):.1f}")
-    print(f"  median: {sorted(answers)[len(answers) // 2]}")
+    return generate_number_properties(rng=rng, difficulty=difficulty)

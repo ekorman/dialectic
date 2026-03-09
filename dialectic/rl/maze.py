@@ -16,8 +16,6 @@ class MazeConfig:
         Reject mazes with shorter optimal paths.
     max_solution_length : int or None
         Reject mazes with longer optimal paths.
-    algorithm : str
-        Generation algorithm. Currently only "dfs".
     openness : float
         Fraction of extra walls to remove after generation.
         0.0 = perfect maze, higher = more alternative paths.
@@ -31,7 +29,6 @@ class MazeConfig:
     width: int = 5
     min_solution_length: int | None = None
     max_solution_length: int | None = None
-    algorithm: str = "dfs"
     openness: float = 0.0
     start_pos: str = "top_left"
     goal_pos: str = "bottom_right"
@@ -247,9 +244,6 @@ def generate_maze(
     RuntimeError
         If no valid maze is found within max_attempts.
     """
-    if config.algorithm != "dfs":
-        raise ValueError(f"Unsupported algorithm: {config.algorithm}")
-
     for _ in range(max_attempts):
         connections = _generate_dfs_maze(config.height, config.width, rng)
         if config.openness > 0:
@@ -393,7 +387,6 @@ def bfs_distance(
 EASY = MazeConfig(
     height=5,
     width=5,
-    algorithm="dfs",
     openness=0.0,
     start_pos="top_left",
     goal_pos="bottom_right",
@@ -402,7 +395,6 @@ EASY = MazeConfig(
 MEDIUM = MazeConfig(
     height=7,
     width=7,
-    algorithm="dfs",
     openness=0.15,
     start_pos="top_left",
     goal_pos="farthest",
@@ -412,7 +404,6 @@ MEDIUM = MazeConfig(
 HARD = MazeConfig(
     height=10,
     width=10,
-    algorithm="dfs",
     openness=0.3,
     start_pos="random",
     goal_pos="farthest",
@@ -422,7 +413,6 @@ HARD = MazeConfig(
 VERY_HARD = MazeConfig(
     height=15,
     width=15,
-    algorithm="dfs",
     openness=0.3,
     start_pos="random",
     goal_pos="farthest",
