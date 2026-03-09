@@ -4,9 +4,9 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic
+from typing import Generic, Literal
 
-from dialectic.rl.math import MathDatasetConfig, generate_problem
+from dialectic.rl.math import generate_problem
 from dialectic.rl.maze import Maze, MazeConfig, generate_maze, tokenize_maze
 from dialectic.rl.types import QA, A, EnvResponse, T
 
@@ -305,8 +305,22 @@ class MathEnv(Env[MathState, None]):
         Random seed for reproducibility.
     """
 
-    def __init__(self, *, config: MathDatasetConfig, seed: int | None = None):
-        self.config = config
+    def __init__(
+        self,
+        *,
+        direct_arithmetic_prob: float,
+        twostep_arithmetic_prob: float,
+        word_problem_prob: float,
+        number_properties_prob: float,
+        difficulty: Literal["trivial", "easy", "medium"],
+        seed: int | None = None,
+    ):
+        self.direct_arithmetic_prob = direct_arithmetic_prob
+        self.twostep_arithmetic_prob = twostep_arithmetic_prob
+        self.word_problem_prob = word_problem_prob
+        self.number_properties_prob = number_properties_prob
+        self.difficulty = difficulty
+
         self._seed = seed
         self.rng = random.Random(seed)
 
@@ -314,12 +328,19 @@ class MathEnv(Env[MathState, None]):
         self.rng = random.Random(self._seed)
 
     def __str__(self) -> str:
-        return f"math_{self.config.difficulty}"
+        return f"math_{self.difficulty}"
 
     def reset(self, seed: int | None = None) -> EnvResponse[MathState]:
         if seed is not None:
             self.rng.seed(seed)
-        problem = generate_problem(self.config, self.rng)
+        problem = generate_problem(
+            direct_arithmetic_prob=self.direct_arithmetic_prob,
+            twostep_arithmetic_prob=self.twostep_arithmetic_prob,
+            word_problem_prob=self.word_problem_prob,
+            number_properties_prob=self.number_properties_prob,
+            difficulty=self.difficulty,
+            rng=self.rng,
+        )
         return EnvResponse(
             is_done=True,
             data=MathState(

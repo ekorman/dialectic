@@ -3,7 +3,6 @@ import torch
 from dialectic.llm.generate import generate_with_soft_prefill
 from dialectic.rl.env import MathEnv, MathState
 from dialectic.rl.evaluate import EvaluationResult, evaluate_soft_prefill
-from dialectic.rl.math import EASY_CONFIG, MathDatasetConfig
 from dialectic.rl.train import (
     compute_soft_prefill_log_probs,
     create_sft_val_fn,
@@ -20,9 +19,29 @@ def math_state_to_str(data: MathState) -> str:
     return data.prompt
 
 
+math_env_kwargs = {
+    "direct_arithmetic_prob": 0.20,
+    "twostep_arithmetic_prob": 0.30,
+    "word_problem_prob": 0.35,
+    "number_properties_prob": 0.15,
+    "difficulty": "easy",
+}
+
+
+def _get_math_env(seed: int = 42):
+    return MathEnv(
+        direct_arithmetic_prob=0.2,
+        twostep_arithmetic_prob=0.3,
+        word_problem_prob=0.35,
+        number_properties_prob=0.15,
+        difficulty="easy",
+        seed=seed,
+    )
+
+
 class TestMathEnvReset:
     def test_returns_valid_state(self):
-        env = MathEnv(config=EASY_CONFIG, seed=42)
+        env = _get_math_env(seed=42)
         response = env.reset()
         assert response.is_done
         assert isinstance(response.data, MathState)
@@ -31,27 +50,27 @@ class TestMathEnvReset:
         assert len(response.data.problem_type) > 0
 
     def test_answer_is_integer_string(self):
-        env = MathEnv(config=EASY_CONFIG, seed=42)
+        env = _get_math_env(seed=42)
         for _ in range(20):
             response = env.reset()
             int(response.data.answer)
 
     def test_reseed_produces_same_sequence(self):
-        env = MathEnv(config=EASY_CONFIG, seed=42)
+        env = _get_math_env(seed=42)
         first = [env.reset().data.prompt for _ in range(5)]
         env.reseed()
         second = [env.reset().data.prompt for _ in range(5)]
         assert first == second
 
     def test_different_seeds_differ(self):
-        env1 = MathEnv(config=EASY_CONFIG, seed=42)
-        env2 = MathEnv(config=EASY_CONFIG, seed=99)
+        env1 = _get_math_env(seed=42)
+        env2 = _get_math_env(seed=99)
         r1 = env1.reset().data.prompt
         r2 = env2.reset().data.prompt
         assert r1 != r2
 
     def test_str_repr(self):
-        env = MathEnv(config=EASY_CONFIG, seed=42)
+        env = _get_math_env(seed=42)
         assert str(env) == "math_easy"
 
 
@@ -319,11 +338,8 @@ class TestGenerateWithSoftPrefill:
 class TestTrainMathSft:
     def test_step_runs_and_changes_params(self, tiny_model, tokenizer):
         torch.manual_seed(42)
-        config = MathDatasetConfig(
-            mix={"direct_arithmetic": 1.0},
-            difficulty="trivial",
-        )
-        env = MathEnv(config=config, seed=42)
+
+        env = _get_math_env()
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
 
         params_before = {
@@ -365,11 +381,7 @@ class TestEvaluateSoftPrefill:
         torch.manual_seed(42)
         tiny_model.eval()
 
-        config = MathDatasetConfig(
-            mix={"direct_arithmetic": 1.0},
-            difficulty="trivial",
-        )
-        env = MathEnv(config=config, seed=42)
+        env = _get_math_env()
 
         result, examples = evaluate_soft_prefill(
             net=tiny_model,
@@ -401,11 +413,17 @@ class TestEvaluateSoftPrefill:
         producing only 'correct' reward component (not 'answer_tags')."""
         torch.manual_seed(42)
 
-        config = MathDatasetConfig(
-            mix={"direct_arithmetic": 1.0},
-            difficulty="trivial",
-        )
-        val_envs = [MathEnv(config=config, seed=2026)]
+        val_envs = [_get_math_env(seed=2026)]
+        val_envs = [
+            MathEnv(
+                direct_arithmetic_prob=1.0,
+                twostep_arithmetic_prob=0.0,
+                word_problem_prob=0.0,
+                number_properties_prob=0.0,
+                difficulty="trivial",
+                seed=2026,
+            )
+        ]
 
         val_fn = create_sft_val_fn(
             net=tiny_model,
