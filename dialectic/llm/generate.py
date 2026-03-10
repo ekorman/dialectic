@@ -1102,7 +1102,7 @@ def generate_variable_length_internal_reasoning_tokens(
     B = token_ids.shape[0]
 
     max_seq_len = token_ids.shape[1] + max_cycles * (
-        soft_block_size + max_tokens_per_cycle
+        soft_block_size + 1 + max_tokens_per_cycle
     )
     kv_caches = [
         KVCache(
@@ -1188,7 +1188,7 @@ def generate_variable_length_internal_reasoning_tokens(
             finished = finished | just_done
             cycle_finished = cycle_finished | just_ended_cycle | just_done
 
-            if cycle_finished.all() | finished.all():
+            if cycle_finished.all() or finished.all():
                 break
 
             with torch.autocast(

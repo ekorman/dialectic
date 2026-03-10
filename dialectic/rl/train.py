@@ -2316,11 +2316,7 @@ def compute_variable_length_internal_reasoning_log_probs(
                     )
                     h = net.apply_soft_projection(h)
 
-            max_t = (
-                int(flat_lengths[:, cycle].max().item())
-                if cycle < max_actual_cycles
-                else 0
-            )
+            max_t = int(flat_lengths[:, cycle].max().item())
             cycle_lp = torch.zeros(BG, device=device)
 
             for t in range(max_t):
@@ -2405,7 +2401,7 @@ def make_variable_length_sft_per_cycle_backward_callback(
     return callback
 
 
-def create_variable_length_internal_reasoning_sft_step_fn(
+def create_countdown_sft_step_fn(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
@@ -2439,14 +2435,14 @@ def create_variable_length_internal_reasoning_sft_step_fn(
             all_cycle_token_ids: list[list[list[int]]] = []
             for er in env_responses:
                 solution = er.data.solution
+                assert solution is not None, "CountdownEnv must provide solution"
                 cycle_ids_list: list[list[int]] = []
-                if solution:
-                    for i, s in enumerate(solution):
-                        text = f"{s.left} {s.op} {s.right} = {s.result} |"
-                        ids = tokenizer.encode(text, add_special_tokens=False).ids
-                        cycle_ids_list.append(list(ids))
+                for s in solution:
+                    text = f"{s.left} {s.op} {s.right} = {s.result} |"
+                    ids = tokenizer.encode(text, add_special_tokens=False).ids
+                    cycle_ids_list.append(list(ids))
                 equation = build_countdown_equation(
-                    er.data.numbers, er.data.solution, er.data.target
+                    er.data.numbers, solution, er.data.target
                 )
                 equation_ids = tokenizer.encode(equation, add_special_tokens=False).ids
                 equation_ids = list(equation_ids) + [eos_token_id]
@@ -2638,7 +2634,7 @@ def train_variable_length_internal_reasoning_sft(
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
 
-    train_step = create_variable_length_internal_reasoning_sft_step_fn(
+    train_step = create_countdown_sft_step_fn(
         net=net,
         opt=opt,
         env=env,

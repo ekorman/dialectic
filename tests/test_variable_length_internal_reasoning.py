@@ -1,5 +1,9 @@
+import inspect
+
+import pytest
 import torch
 
+from dialectic.llm import generate as gen_module
 from dialectic.llm.generate import generate_variable_length_internal_reasoning_tokens
 from dialectic.rl.env import (
     Countdown,
@@ -585,3 +589,86 @@ class TestMakeVariableLengthSFTPerCycleBackwardCallback:
         lp = torch.tensor([-1.0, -2.0], requires_grad=True)
         result = callback(lp, 0)
         assert not result.requires_grad
+
+
+class TestKVCacheSizingVariableLength:
+    def test_kv_cache_accounts_for_logit_forward_pass(self):
+        """Each cycle uses soft_block_size + 1 + max_tokens_per_cycle KV slots:
+        soft_block_size for soft passes, 1 for the logit-producing forward pass,
+        and up to max_tokens_per_cycle for teacher-forced hard tokens.
+        The allocated max_seq_len must account for the +1.
+        """
+        L = 4
+        soft_block_size = 2
+        max_cycles = 3
+        max_tokens_per_cycle = 4
+
+        slots_per_cycle = soft_block_size + 1 + max_tokens_per_cycle
+        expected = L + max_cycles * slots_per_cycle
+        buggy = L + max_cycles * (soft_block_size + max_tokens_per_cycle)
+        assert expected > buggy, "sanity: there IS an off-by-one to fix"
+
+        src = inspect.getsource(
+            gen_module.generate_variable_length_internal_reasoning_tokens
+        )
+        assert "soft_block_size + 1 + max_tokens_per_cycle" in src
+
+
+class TestValEnvsListLengthValidation:
+    def test_mismatched_list_lengths_raises(self):
+        """CountdownEnv must reject mismatched list lengths for config params."""
+        with pytest.raises(ValueError):
+            CountdownEnv(
+                n_ops=[3, 4, 5],
+                n_total=6,
+                n_larges=2,
+            )
+
+    def test_launcher_val_envs_mixed_scalar_and_list(self):
+        """Launcher must detect mismatched list lengths for countdown val envs.
+
+        When n_ops is a list of 2 but n_total/n_larges are scalars (→ lists of 1),
+        the launcher should raise ValueError, not silently produce wrong val envs.
+        """
+        from dialectic.experiments.launchers.multi_step_hybrid_reasoning_sft import (
+            train_hybrid_reasoning_sft_countdown,
+        )
+        from dialectic.experiments.params import (
+            CountdownParams,
+            HybridReasoningParams,
+            MultiStepSFTParams,
+            TrainParams,
+        )
+
+        with pytest.raises(ValueError, match="same length"):
+            train_hybrid_reasoning_sft_countdown(
+                train_params=TrainParams(
+                    model_name="qwen2.5-0.6b",
+                    lr=1e-4,
+                    max_episodes=1,
+                    batch_size=1,
+                    accumulation_steps=1,
+                    max_grad_norm=1.0,
+                    max_tokens_generated=100,
+                    compile_model=False,
+                    use_bf16=False,
+                    seed=42,
+                    temperature=1.0,
+                    val_batch_size=1,
+                    val_episodes=1,
+                    val_freq=1,
+                ),
+                multistep_sft_params=MultiStepSFTParams(
+                    normalize_by_sequence_length=True
+                ),
+                hr_params=HybridReasoningParams(
+                    soft_block_size=2,
+                    soft_bptt_window=2,
+                    max_cycles=5,
+                ),
+                countdown_params=CountdownParams(
+                    n_ops=[3, 4],
+                    n_total=6,
+                    n_larges=2,
+                ),
+            )

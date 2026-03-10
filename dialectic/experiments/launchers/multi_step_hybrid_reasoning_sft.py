@@ -152,6 +152,20 @@ def train_hybrid_reasoning_sft_countdown(
 ):
     torch.manual_seed(train_params.seed)
 
+    n_ops = countdown_params.n_ops
+    n_larges = countdown_params.n_larges
+    n_total = countdown_params.n_total
+
+    n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
+    n_total_list = [n_total] if isinstance(n_total, int) else n_total
+    n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
+    lengths = {len(n_ops_list), len(n_total_list), len(n_larges_list)}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"n_ops, n_total, and n_larges must have the same length when lists, "
+            f"got {len(n_ops_list)}, {len(n_total_list)}, {len(n_larges_list)}"
+        )
+
     prompt_collection = COUNTDOWN_INTERNAL_REASONING_PROMPT
 
     model_info = MODEL_REGISTRY[train_params.model_name]
@@ -175,10 +189,6 @@ def train_hybrid_reasoning_sft_countdown(
         assistant_prefill=prompt_collection.assistant_prefill,
     )
 
-    n_ops = countdown_params.n_ops
-    n_larges = countdown_params.n_larges
-    n_total = countdown_params.n_total
-
     env = CountdownEnv(
         seed=train_params.seed,
         n_larges=n_larges,
@@ -189,9 +199,6 @@ def train_hybrid_reasoning_sft_countdown(
 
     reward_fn = weighted_reward([("correct", 1.0, countdown_hybrid_correct)])
 
-    n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
-    n_total_list = [n_total] if isinstance(n_total, int) else n_total
-    n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
     val_envs = [
         CountdownEnv(
             seed=2026 + i,
