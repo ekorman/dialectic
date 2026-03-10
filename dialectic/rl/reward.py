@@ -81,6 +81,29 @@ def countdown_correct(
         return 0.0
 
 
+def countdown_hybrid_correct(
+    *, env_response: EnvResponse[Countdown], raw_model_output: str | None, **_
+) -> float:
+    if not raw_model_output:
+        return 0.0
+    try:
+        text = raw_model_output.strip()
+        segments = text.split("|")
+        last_segment = segments[-1].strip()
+        if "=" not in last_segment:
+            return 0.0
+        expr = last_segment.rsplit("=", 1)[0].strip()
+        return (
+            1.0
+            if _evaluate_and_verify_countdown(
+                expr, env_response.data.numbers, env_response.data.target
+            )
+            else 0.0
+        )
+    except Exception:
+        return 0.0
+
+
 # --- Generic (environment-agnostic) ---
 
 

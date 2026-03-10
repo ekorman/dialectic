@@ -13,6 +13,7 @@ from dialectic.llm.generate import (
     generate_hard_tokens,
     generate_internal_reasoning_tokens,
     generate_soft_tokens,
+    generate_variable_length_internal_reasoning_tokens,
 )
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
@@ -418,6 +419,111 @@ def generate_internal_reasoning_rollout_batch(
         rewards=rewards,
         hard_token_ids=hard_token_ids_list,
         n_cycles=n_cycles_list,
+        prompt_token_ids=token_ids,
+        attention_mask=attention_mask,
+        t_generation=t_generation,
+    )
+
+
+@dataclass
+class VariableLengthInternalReasoningRolloutBatch(Generic[T]):
+    env_responses: list[EnvResponse[T]]
+    prompts: list[str]
+    output_strs: list[str]  # [B] - decoded text per sample
+    reward_results: list[RewardResult]  # [B]
+    rewards: Float[torch.Tensor, " B"]
+    hard_token_ids: Int[torch.Tensor, "B C T_max"]
+    hard_token_lengths: Int[torch.Tensor, "B C"]
+    n_cycles: Int[torch.Tensor, " B"]
+    prompt_token_ids: Int[torch.Tensor, "B L_prompt"]
+    attention_mask: Bool[torch.Tensor, "B L_prompt"]
+    t_generation: float
+
+
+@torch.no_grad()
+def generate_variable_length_internal_reasoning_rollout_batch(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    separator_token_id: int,
+    batch_size: int,
+    temperature: float,
+    soft_block_size: int = 4,
+    max_cycles: int = 10,
+    max_tokens_per_cycle: int = 20,
+    use_bf16: bool = False,
+    think_token_id: int | None = None,
+) -> VariableLengthInternalReasoningRolloutBatch[T]:
+    env_responses = get_batch(env, batch_size)
+    prompts = [state_to_str(resp.data) for resp in env_responses]
+    device = next(net.parameters()).device
+
+    tokenizer.enable_padding(direction="left")
+    tokens = tokenizer.encode_batch(prompts)
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+    )
+    token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+    was_training = net.training
+    net.eval()
+    t_gen_start = time.perf_counter()
+
+    gen_output = generate_variable_length_internal_reasoning_tokens(
+        net=net,
+        token_ids=token_ids,
+        soft_block_size=soft_block_size,
+        max_cycles=max_cycles,
+        max_tokens_per_cycle=max_tokens_per_cycle,
+        separator_token_id=separator_token_id,
+        done_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        temperature=temperature,
+        attention_mask=attention_mask,
+        use_bf16=use_bf16,
+        think_token_id=think_token_id,
+    )
+    t_generation = time.perf_counter() - t_gen_start
+    if was_training:
+        net.train()
+
+    output_strs: list[str] = []
+    for b in range(batch_size):
+        all_ids: list[int] = []
+        nc = gen_output.n_cycles[b].item()
+        for c in range(nc):
+            tlen = gen_output.hard_token_lengths[b, c].item()
+            for t in range(tlen):
+                tid = gen_output.hard_token_ids[b, c, t].item()
+                if tid != pad_token_id and tid != eos_token_id:
+                    all_ids.append(tid)
+        output_strs.append(tokenizer.decode(all_ids) if all_ids else "")
+
+    reward_results: list[RewardResult] = [
+        reward_fn(
+            env_response=er,
+            raw_model_output=out_str,
+            extracted_model_output=out_str,
+        )
+        for er, out_str in zip(env_responses, output_strs)
+    ]
+
+    rewards = torch.tensor([r.total for r in reward_results], device=device)
+
+    return VariableLengthInternalReasoningRolloutBatch(
+        env_responses=env_responses,
+        prompts=prompts,
+        output_strs=output_strs,
+        reward_results=reward_results,
+        rewards=rewards,
+        hard_token_ids=gen_output.hard_token_ids,
+        hard_token_lengths=gen_output.hard_token_lengths,
+        n_cycles=gen_output.n_cycles,
         prompt_token_ids=token_ids,
         attention_mask=attention_mask,
         t_generation=t_generation,

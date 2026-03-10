@@ -13,7 +13,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import GradSafeKVCache, KVCache
 from dialectic.llm.generate import PreFill
-from dialectic.rl.env import Env
+from dialectic.rl.env import Env, build_countdown_equation
 from dialectic.rl.evaluate import (
     evaluate,
     evaluate_internal_reasoning,
@@ -2307,6 +2307,515 @@ def train_internal_reasoning_sft(
         move_id_to_name=move_id_to_name,
         valid_hard_token_ids=valid_hard_token_ids,
         max_cycles=max_cycles,
+    )
+
+    train_loop(
+        max_episodes=max_episodes,
+        save_ckpt_freq=save_ckpt_freq,
+        val_freq=val_freq,
+        net=net,
+        opt=opt,
+        train_step=train_step,
+        val_envs=val_envs,
+        val_fn=val_fn,
+    )
+
+
+def compute_variable_length_internal_reasoning_log_probs(
+    *,
+    net: BaseTransformer,
+    prompt_token_ids: Integer[torch.Tensor, "B L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+    hard_token_ids: Integer[torch.Tensor, "B C T_max"],
+    hard_token_lengths: Integer[torch.Tensor, "B C"],
+    n_cycles: Integer[torch.Tensor, " B"],
+    soft_block_size: int,
+    pad_token_id: int,
+    use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
+    cycle_callback: Callable[
+        [Float[torch.Tensor, " B"], int], Float[torch.Tensor, " B"]
+    ]
+    | None = None,
+    think_token_id: int | None = None,
+) -> tuple[Float[torch.Tensor, "B C"], Bool[torch.Tensor, "B C"]]:
+    """Compute log probs for variable-length internal reasoning trajectories.
+
+    Each cycle produces a variable number of hard tokens. Log probs are summed
+    within each cycle to produce per-cycle log probs.
+
+    Parameters
+    ----------
+    net
+        The transformer model.
+    prompt_token_ids
+        Prompt token IDs [B, L].
+    attention_mask
+        Attention mask for prompt [B, L].
+    hard_token_ids
+        Known hard tokens per cycle [B, C, T_max], right-padded.
+    hard_token_lengths
+        Number of actual hard tokens per cycle [B, C].
+    n_cycles
+        Actual number of cycles per sample [B].
+    soft_block_size
+        Number of soft forward passes per cycle.
+    pad_token_id
+        Padding token ID.
+    use_bf16
+        Whether to use bf16 autocast.
+    soft_bptt_window
+        Number of soft tokens at the end of each cycle's soft block to
+        backpropagate through. None means full BPTT.
+    cycle_callback
+        Optional callback invoked after each cycle's summed log_probs are computed.
+        Receives (cycle_log_probs [B], cycle_index) and returns log_probs to store.
+    think_token_id
+        If set, use this token's embedding for soft passes instead of hidden state passthrough.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (log_probs [B, C], completion_mask [B, C])
+        log_probs are summed across tokens within each cycle.
+    """
+    if soft_bptt_window is None:
+        soft_bptt_window = soft_block_size
+    n_no_grad_soft = soft_block_size - soft_bptt_window
+    B, C, T_max = hard_token_ids.shape
+    device = prompt_token_ids.device
+
+    L_prompt = prompt_token_ids.shape[1]
+    max_actual_cycles = int(n_cycles.max().item())
+    max_seq_len = L_prompt + max_actual_cycles * (soft_block_size + T_max)
+
+    std_kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    with torch.no_grad():
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                prompt_token_ids,
+                kv_caches=std_kv_caches,
+                attention_mask=attention_mask,
+                return_hidden_states=True,
+            )
+    h = h[:, -1:]  # [B, 1, D]
+
+    grad_kv_caches: list[GradSafeKVCache | KVCache] = [
+        GradSafeKVCache.from_standard(c) for c in std_kv_caches
+    ]
+
+    attn_mask = attention_mask
+
+    if think_token_id is not None:
+        think_embed = net.embed_tokens(
+            torch.full((B, 1), think_token_id, dtype=torch.long, device=device)
+        ).detach()
+
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+
+    all_log_probs = []
+    for cycle in range(max_actual_cycles):
+        h = h.detach()
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            if n_no_grad_soft > 0:
+                with torch.no_grad():
+                    for _ in range(n_no_grad_soft):
+                        attn_mask = torch.cat([attn_mask, ones], dim=1)
+                        if think_token_id is not None:
+                            h = net(
+                                think_embed,
+                                kv_caches=grad_kv_caches,
+                                attention_mask=attn_mask,
+                                return_hidden_states=True,
+                            )
+                        else:
+                            h = net(
+                                h,
+                                kv_caches=grad_kv_caches,
+                                attention_mask=attn_mask,
+                                return_hidden_states=True,
+                            )
+                            h = net.apply_soft_projection(h)
+                h = h.detach()
+
+            for _ in range(soft_bptt_window):
+                attn_mask = torch.cat([attn_mask, ones], dim=1)
+                if think_token_id is not None:
+                    h = net(
+                        think_embed,
+                        kv_caches=grad_kv_caches,
+                        attention_mask=attn_mask,
+                        return_hidden_states=True,
+                    )
+                else:
+                    h = net(
+                        h,
+                        kv_caches=grad_kv_caches,
+                        attention_mask=attn_mask,
+                        return_hidden_states=True,
+                    )
+                    h = net.apply_soft_projection(h)
+
+            max_t = (
+                int(hard_token_lengths[:, cycle].max().item())
+                if cycle < max_actual_cycles
+                else 0
+            )
+            cycle_lp = torch.zeros(B, device=device)
+
+            for t in range(max_t):
+                attn_mask = torch.cat([attn_mask, ones], dim=1)
+                h_out = net(
+                    h,
+                    kv_caches=grad_kv_caches,
+                    attention_mask=attn_mask,
+                    return_hidden_states=True,
+                )
+                logits = net.lm_head(h_out)  # [B, 1, V]
+
+                logits_squeezed = logits.squeeze(1).float()  # [B, V]
+                lp_all = torch.log_softmax(logits_squeezed, dim=-1)
+                target_token = hard_token_ids[:, cycle, t]  # [B]
+                lp = lp_all[torch.arange(B, device=device), target_token]  # [B]
+
+                token_mask = (t < hard_token_lengths[:, cycle]) & (cycle < n_cycles)
+                lp = torch.where(token_mask, lp, torch.zeros_like(lp))
+                cycle_lp = cycle_lp + lp
+
+                with torch.no_grad():
+                    h = net.embed_tokens(target_token.unsqueeze(1))
+
+        if cycle_callback is not None:
+            cycle_lp = cycle_callback(cycle_lp, cycle)
+
+        all_log_probs.append(cycle_lp)
+
+        for gc in grad_kv_caches:
+            assert isinstance(gc, GradSafeKVCache)
+            gc.freeze()
+
+    log_probs = torch.stack(all_log_probs, dim=1)  # [B, max_actual_cycles]
+
+    if max_actual_cycles < C:
+        pad_lp = torch.zeros(B, C - max_actual_cycles, device=device)
+        log_probs = torch.cat([log_probs, pad_lp], dim=1)
+
+    cycle_indices = torch.arange(C, device=device).unsqueeze(0).expand(B, C)
+    completion_mask = cycle_indices < n_cycles.unsqueeze(-1)
+
+    return log_probs, completion_mask
+
+
+def make_variable_length_sft_per_cycle_backward_callback(
+    *,
+    B: int,
+    completion_mask: Bool[torch.Tensor, "B C"],
+    hard_token_lengths: Integer[torch.Tensor, "B C"],
+    n_cycles: Integer[torch.Tensor, " B"],
+    normalize_by_sequence_length: bool,
+    loss_scale: float,
+) -> Callable[[Float[torch.Tensor, " B"], int], Float[torch.Tensor, " B"]]:
+    """Build a cycle_callback for variable-length SFT that calls backward per cycle.
+
+    When normalize_by_sequence_length is True, normalizes by total hard tokens
+    (not cycle count).
+    """
+    if normalize_by_sequence_length:
+        total_tokens = torch.zeros(B, device=completion_mask.device)
+        for b in range(B):
+            nc = n_cycles[b].item()
+            total_tokens[b] = hard_token_lengths[b, :nc].sum().clamp(min=1).float()
+    else:
+        total_tokens = torch.ones(B, device=completion_mask.device)
+
+    def callback(
+        lp: Float[torch.Tensor, " B"], cycle_idx: int
+    ) -> Float[torch.Tensor, " B"]:
+        mask_c = completion_mask[:, cycle_idx]  # [B]
+        cycle_loss = -(lp * mask_c / total_tokens).mean()
+        (cycle_loss * loss_scale).backward()
+        return lp.detach()
+
+    return callback
+
+
+def create_variable_length_internal_reasoning_sft_step_fn(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    separator_token_id: int,
+    soft_block_size: int,
+    soft_bptt_window: int | None,
+    max_cycles: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    normalize_by_sequence_length: bool,
+    use_bf16: bool,
+    think_token_id: int | None,
+):
+    device = next(net.parameters()).device
+
+    def _step(step: int):
+        nonlocal net
+        opt.zero_grad()
+        step_nll_sum = 0.0
+        step_solution_lengths: list[int] = []
+
+        for _ in range(accumulation_steps):
+            env_responses = [env.reset() for _ in range(batch_size)]
+
+            all_cycle_token_ids: list[list[list[int]]] = []
+            for er in env_responses:
+                solution = er.data.solution
+                cycle_ids_list: list[list[int]] = []
+                if solution:
+                    for i, s in enumerate(solution):
+                        text = f"{s.left} {s.op} {s.right} = {s.result} |"
+                        ids = tokenizer.encode(text, add_special_tokens=False).ids
+                        cycle_ids_list.append(list(ids))
+                equation = build_countdown_equation(
+                    er.data.numbers, er.data.solution, er.data.target
+                )
+                equation_ids = tokenizer.encode(equation, add_special_tokens=False).ids
+                equation_ids = list(equation_ids) + [eos_token_id]
+                cycle_ids_list.append(equation_ids)
+
+                total_tokens = sum(len(c) for c in cycle_ids_list)
+                step_solution_lengths.append(total_tokens)
+
+                if len(cycle_ids_list) > max_cycles:
+                    cycle_ids_list = cycle_ids_list[:max_cycles]
+
+                all_cycle_token_ids.append(cycle_ids_list)
+
+            n_c = [len(c) for c in all_cycle_token_ids]
+            max_c = max(n_c)
+            max_t = max(len(tok) for sample in all_cycle_token_ids for tok in sample)
+
+            hard_token_ids = torch.full(
+                (batch_size, max_c, max_t),
+                pad_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            hard_token_lengths_tensor = torch.zeros(
+                batch_size, max_c, dtype=torch.long, device=device
+            )
+            n_cycles_tensor = torch.tensor(n_c, dtype=torch.long, device=device)
+
+            for b, cycles in enumerate(all_cycle_token_ids):
+                for c_idx, tok_ids in enumerate(cycles):
+                    hard_token_ids[b, c_idx, : len(tok_ids)] = torch.tensor(
+                        tok_ids, device=device
+                    )
+                    hard_token_lengths_tensor[b, c_idx] = len(tok_ids)
+
+            prompt_token_ids, attn_mask = _encode_prompts(
+                env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
+            )
+
+            cycle_indices = (
+                torch.arange(max_c, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, max_c)
+            )
+            completion_mask = cycle_indices < n_cycles_tensor.unsqueeze(-1)
+
+            callback = make_variable_length_sft_per_cycle_backward_callback(
+                B=batch_size,
+                completion_mask=completion_mask,
+                hard_token_lengths=hard_token_lengths_tensor,
+                n_cycles=n_cycles_tensor,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+                loss_scale=1.0 / accumulation_steps,
+            )
+
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                log_probs, _ = compute_variable_length_internal_reasoning_log_probs(
+                    net=net,
+                    prompt_token_ids=prompt_token_ids,
+                    attention_mask=attn_mask,
+                    hard_token_ids=hard_token_ids,
+                    hard_token_lengths=hard_token_lengths_tensor,
+                    n_cycles=n_cycles_tensor,
+                    soft_block_size=soft_block_size,
+                    pad_token_id=pad_token_id,
+                    use_bf16=use_bf16,
+                    soft_bptt_window=soft_bptt_window,
+                    cycle_callback=callback,
+                    think_token_id=think_token_id,
+                )
+
+            masked_lp = log_probs.detach() * completion_mask
+            if normalize_by_sequence_length:
+                total_toks = torch.zeros(batch_size, device=device)
+                for b in range(batch_size):
+                    nc = n_cycles_tensor[b].item()
+                    total_toks[b] = (
+                        hard_token_lengths_tensor[b, :nc].sum().clamp(min=1).float()
+                    )
+                per_seq_nll = -(masked_lp.sum(dim=-1) / total_toks)
+            else:
+                per_seq_nll = -masked_lp.sum(dim=-1)
+            step_nll_sum += per_seq_nll.mean().item() / accumulation_steps
+
+        grad_norm_val: float | None = None
+        if max_grad_norm > 0:
+            params = [p for group in opt.param_groups for p in group["params"]]
+            grad_norm_val = torch.nn.utils.clip_grad_norm_(
+                params, max_norm=max_grad_norm
+            ).item()
+        opt.step()
+
+        metrics: dict[str, Any] = {
+            "sft/nll_loss": step_nll_sum,
+            "sft/mean_solution_length": (
+                sum(step_solution_lengths) / len(step_solution_lengths)
+            ),
+        }
+        if grad_norm_val is not None:
+            metrics["sft/grad_norm"] = grad_norm_val
+        if net.soft_projection_alpha is not None:
+            metrics["sft/soft_projection_alpha"] = net.soft_projection_alpha.item()
+
+        return StepFunctionReturn(
+            n_episodes_processed=batch_size * accumulation_steps, metrics=metrics
+        )
+
+    return _step
+
+
+def create_variable_length_internal_reasoning_sft_val_fn(
+    *,
+    net: BaseTransformer,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    separator_token_id: int,
+    soft_block_size: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    use_bf16: bool,
+    val_episodes: int,
+    val_batch_size: int,
+    val_reward_fn: RewardFn,
+    think_token_id: int | None,
+):
+    def _val(env: Env):
+        from dialectic.rl.evaluate import evaluate_variable_length_internal_reasoning
+
+        return evaluate_variable_length_internal_reasoning(
+            net=net,
+            env=env,
+            reward_fn=val_reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            separator_token_id=separator_token_id,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+            think_token_id=think_token_id,
+        )
+
+    return _val
+
+
+def train_variable_length_internal_reasoning_sft(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    eos_token_id: int,
+    separator_token_id: int,
+    soft_block_size: int,
+    soft_bptt_window: int | None = None,
+    max_cycles: int,
+    max_tokens_per_cycle: int = 20,
+    max_episodes: int,
+    batch_size: int,
+    accumulation_steps: int,
+    max_grad_norm: float,
+    normalize_by_sequence_length: bool,
+    use_bf16: bool,
+    save_ckpt_freq: int = sys.maxsize,
+    val_reward_fn: RewardFn,
+    val_episodes: int,
+    val_batch_size: int,
+    val_freq: int = 0,
+    val_envs: Sequence[Env],
+    think_token_id: int | None,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    train_step = create_variable_length_internal_reasoning_sft_step_fn(
+        net=net,
+        opt=opt,
+        env=env,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        separator_token_id=separator_token_id,
+        soft_block_size=soft_block_size,
+        soft_bptt_window=soft_bptt_window,
+        max_cycles=max_cycles,
+        batch_size=batch_size,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        use_bf16=use_bf16,
+        think_token_id=think_token_id,
+    )
+
+    val_fn = create_variable_length_internal_reasoning_sft_val_fn(
+        net=net,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+        separator_token_id=separator_token_id,
+        soft_block_size=soft_block_size,
+        max_cycles=max_cycles,
+        max_tokens_per_cycle=max_tokens_per_cycle,
+        use_bf16=use_bf16,
+        val_episodes=val_episodes,
+        val_batch_size=val_batch_size,
+        val_reward_fn=val_reward_fn,
+        think_token_id=think_token_id,
     )
 
     train_loop(

@@ -160,10 +160,43 @@ class GSM8kEnv(Env[QA[float], None]):
 
 
 @dataclass
+class CountdownStep:
+    left: int
+    op: str
+    right: int
+    result: int
+
+
+@dataclass
 class Countdown:
     prompt: str
     numbers: list[int]
     target: int
+    solution: list[CountdownStep] | None = None
+
+
+def build_countdown_equation(
+    numbers: list[int], steps: list[CountdownStep], target: int
+) -> str:
+    pool: list[tuple[int, str]] = [(n, str(n)) for n in numbers]
+
+    for step in steps:
+        left_idx = next(i for i, (v, _) in enumerate(pool) if v == step.left)
+        _, left_expr = pool.pop(left_idx)
+
+        right_idx = next(i for i, (v, _) in enumerate(pool) if v == step.right)
+        _, right_expr = pool.pop(right_idx)
+
+        if " " in left_expr:
+            left_expr = f"({left_expr})"
+        if " " in right_expr:
+            right_expr = f"({right_expr})"
+
+        combined = f"{left_expr} {step.op} {right_expr}"
+        pool.append((step.result, combined))
+
+    _, final_expr = pool[-1]
+    return f"{final_expr} = {target}"
 
 
 class CountdownEnv(Env[Countdown, None]):
@@ -189,28 +222,28 @@ class CountdownEnv(Env[Countdown, None]):
     LARGES = [25, 50, 75, 100]
 
     @staticmethod
-    def _valid_ops(a: int, b: int) -> list[tuple[str, int]]:
-        ops: list[tuple[str, int]] = []
-        ops.append(("+", a + b))
-        ops.append(("*", a * b))
+    def _valid_ops(a: int, b: int) -> list[tuple[str, int, int, int]]:
+        ops: list[tuple[str, int, int, int]] = []
+        ops.append(("+", a + b, a, b))
+        ops.append(("*", a * b, a, b))
 
         if a > b:
-            ops.append(("-", a - b))
+            ops.append(("-", a - b, a, b))
         elif b > a:
-            ops.append(("-", b - a))
+            ops.append(("-", b - a, b, a))
 
         if b != 0 and a % b == 0:
             q = a // b
             if q > 0:
-                ops.append(("/", q))
+                ops.append(("/", q, a, b))
         if a != 0 and b % a == 0:
             q = b // a
             if q > 0:
-                ops.append(("/", q))
+                ops.append(("/", q, b, a))
 
         return ops
 
-    def _generate_problem(self):
+    def _generate_problem(self) -> tuple[list[int], int, list[CountdownStep]]:
         idx = self.rng.randrange(len(self._n_larges))
         n_larges = self._n_larges[idx]
         n_total = self._n_total[idx]
@@ -221,20 +254,22 @@ class CountdownEnv(Env[Countdown, None]):
         )
         self.rng.shuffle(numbers)
         pool = numbers[:]
+        steps: list[CountdownStep] = []
 
         for _ in range(n_ops):
             if len(pool) < 2:
                 break
             i, j = self.rng.sample(range(len(pool)), 2)
             candidates = self._valid_ops(pool[i], pool[j])
-            _, output = self.rng.choice(candidates)
+            op, result, left, right = self.rng.choice(candidates)
 
             for idx in sorted((i, j), reverse=True):
                 del pool[idx]
 
-            pool.append(output)
+            pool.append(result)
+            steps.append(CountdownStep(left=left, op=op, right=right, result=result))
 
-        return numbers, pool[-1]
+        return numbers, pool[-1], steps
 
     def __init__(
         self,
@@ -270,13 +305,15 @@ class CountdownEnv(Env[Countdown, None]):
         if seed is not None:
             self.rng.seed(seed)
 
-        numbers, target = self._generate_problem()
+        numbers, target, steps = self._generate_problem()
 
         prompt = self.prompt_template.format(numbers=numbers, target=target)
 
         return EnvResponse(
             is_done=True,
-            data=Countdown(prompt=prompt, numbers=numbers, target=target),
+            data=Countdown(
+                prompt=prompt, numbers=numbers, target=target, solution=steps
+            ),
         )
 
     def step(self, action: None):

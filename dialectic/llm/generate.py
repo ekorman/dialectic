@@ -1074,3 +1074,149 @@ def generate_internal_reasoning_tokens(
         hard_log_probs=hard_log_probs,
         n_cycles=n_cycles,
     )
+
+
+@dataclass
+class VariableLengthInternalReasoningGeneratorOutput:
+    hard_token_ids: Int[torch.Tensor, "B C T_max"]
+    hard_token_lengths: Int[torch.Tensor, "B C"]
+    n_cycles: Int[torch.Tensor, " B"]
+
+
+@torch.inference_mode()
+def generate_variable_length_internal_reasoning_tokens(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    soft_block_size: int = 4,
+    max_cycles: int = 10,
+    max_tokens_per_cycle: int = 20,
+    separator_token_id: int = -1,
+    done_token_id: int = 151645,
+    pad_token_id: int = 151643,
+    temperature: float = 1.0,
+    attention_mask: Bool[Tensor, "B L"] | None = None,
+    use_bf16: bool = False,
+    think_token_id: int | None = None,
+) -> VariableLengthInternalReasoningGeneratorOutput:
+    device = token_ids.device
+    B = token_ids.shape[0]
+
+    max_seq_len = token_ids.shape[1] + max_cycles * (
+        soft_block_size + max_tokens_per_cycle
+    )
+    kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    hard_token_ids = torch.full(
+        (B, max_cycles, max_tokens_per_cycle),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    n_cycles = torch.full((B,), max_cycles, dtype=torch.long, device=device)
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        h: Float[Tensor, "B L D"] = net(
+            token_ids,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+            return_hidden_states=True,
+        )
+    h = h[:, -1:]
+
+    if think_token_id is not None:
+        think_embed = net.embed_tokens(
+            torch.full((B, 1), think_token_id, dtype=torch.long, device=device)
+        )
+    else:
+        think_embed = None
+
+    for cycle in range(max_cycles):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            if think_token_id is not None:
+                for _ in range(soft_block_size):
+                    h = net(think_embed, kv_caches=kv_caches, return_hidden_states=True)
+            else:
+                for _ in range(soft_block_size):
+                    h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+                    h = net.apply_soft_projection(h)
+
+            h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+            logits = net.lm_head(h)
+
+        cycle_finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for t in range(max_tokens_per_cycle):
+            logits_squeezed = logits.squeeze(1).float()
+            if temperature > 0:
+                probs = torch.softmax(logits_squeezed / temperature, dim=-1)
+                token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                token = logits_squeezed.argmax(dim=-1)
+
+            token = torch.where(finished, torch.full_like(token, pad_token_id), token)
+            token = torch.where(
+                cycle_finished & ~finished,
+                torch.full_like(token, pad_token_id),
+                token,
+            )
+
+            hard_token_ids[:, cycle, t] = token
+
+            is_separator = token == separator_token_id
+            is_done = token == done_token_id
+
+            just_ended_cycle = is_separator & ~finished & ~cycle_finished
+            just_done = is_done & ~finished & ~cycle_finished
+
+            hard_token_lengths[just_ended_cycle | just_done, cycle] = t + 1
+
+            n_cycles[just_done] = cycle + 1
+            finished = finished | just_done
+            cycle_finished = cycle_finished | just_ended_cycle | just_done
+
+            if cycle_finished.all() | finished.all():
+                break
+
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                logits = net(token.unsqueeze(1), kv_caches=kv_caches)
+
+        still_going = ~cycle_finished & ~finished
+        hard_token_lengths[still_going, cycle] = max_tokens_per_cycle
+
+        if finished.all():
+            break
+
+        last_token_idx = (hard_token_lengths[:, cycle] - 1).clamp(min=0)
+        last_token = (
+            hard_token_ids[:, cycle].gather(1, last_token_idx.unsqueeze(1)).squeeze(1)
+        )
+        last_token = torch.where(
+            finished, torch.full_like(last_token, pad_token_id), last_token
+        )
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net.embed_tokens(last_token.unsqueeze(1))
+
+    return VariableLengthInternalReasoningGeneratorOutput(
+        hard_token_ids=hard_token_ids,
+        hard_token_lengths=hard_token_lengths,
+        n_cycles=n_cycles,
+    )

@@ -1,0 +1,587 @@
+import torch
+
+from dialectic.llm.generate import generate_variable_length_internal_reasoning_tokens
+from dialectic.rl.env import (
+    Countdown,
+    CountdownEnv,
+    CountdownStep,
+    build_countdown_equation,
+)
+from dialectic.rl.reward import countdown_hybrid_correct, weighted_reward
+from dialectic.rl.train import (
+    compute_variable_length_internal_reasoning_log_probs,
+    make_variable_length_sft_per_cycle_backward_callback,
+)
+from dialectic.rl.types import EnvResponse
+
+EOS_TOKEN_ID = 151645
+PAD_TOKEN_ID = 151643
+SOFT_BLOCK_SIZE = 2
+MAX_CYCLES = 5
+MAX_TOKENS_PER_CYCLE = 10
+
+
+class TestCountdownEnvSolution:
+    def test_solution_present(self):
+        env = CountdownEnv(seed=42)
+        resp = env.reset()
+        assert resp.data.solution is not None
+        assert len(resp.data.solution) > 0
+
+    def test_solution_steps_are_arithmetically_correct(self):
+        env = CountdownEnv(seed=42)
+        for _ in range(20):
+            resp = env.reset()
+            for step in resp.data.solution:
+                if step.op == "+":
+                    assert step.left + step.right == step.result
+                elif step.op == "-":
+                    assert step.left - step.right == step.result
+                elif step.op == "*":
+                    assert step.left * step.right == step.result
+                elif step.op == "/":
+                    assert step.left // step.right == step.result
+                    assert step.left % step.right == 0
+
+    def test_final_result_equals_target(self):
+        env = CountdownEnv(seed=42)
+        for _ in range(20):
+            resp = env.reset()
+            assert resp.data.solution is not None
+            assert len(resp.data.solution) > 0
+            assert resp.data.solution[-1].result == resp.data.target
+
+    def test_solution_length_matches_n_ops(self):
+        env = CountdownEnv(n_ops=3, n_total=6, n_larges=2, seed=42)
+        for _ in range(20):
+            resp = env.reset()
+            assert len(resp.data.solution) <= 3
+
+    def test_seed_reproducibility_includes_solution(self):
+        env1 = CountdownEnv(seed=42)
+        env2 = CountdownEnv(seed=42)
+        for _ in range(5):
+            r1 = env1.reset()
+            r2 = env2.reset()
+            assert len(r1.data.solution) == len(r2.data.solution)
+            for s1, s2 in zip(r1.data.solution, r2.data.solution):
+                assert s1.left == s2.left
+                assert s1.op == s2.op
+                assert s1.right == s2.right
+                assert s1.result == s2.result
+
+    def test_countdown_step_dataclass(self):
+        step = CountdownStep(left=75, op="-", right=2, result=73)
+        assert step.left == 75
+        assert step.op == "-"
+        assert step.right == 2
+        assert step.result == 73
+
+    def test_valid_ops_returns_4_tuples(self):
+        ops = CountdownEnv._valid_ops(10, 3)
+        for op_str, result, left, right in ops:
+            assert isinstance(op_str, str)
+            assert isinstance(result, int)
+            assert isinstance(left, int)
+            assert isinstance(right, int)
+
+    def test_valid_ops_subtraction_ordering(self):
+        ops = CountdownEnv._valid_ops(10, 3)
+        sub_ops = [(o, r, l, rr) for o, r, l, rr in ops if o == "-"]
+        assert len(sub_ops) == 1
+        _, result, left, right = sub_ops[0]
+        assert left == 10
+        assert right == 3
+        assert result == 7
+
+    def test_valid_ops_division_ordering(self):
+        ops = CountdownEnv._valid_ops(12, 4)
+        div_ops = [(o, r, l, rr) for o, r, l, rr in ops if o == "/"]
+        assert len(div_ops) == 1
+        _, result, left, right = div_ops[0]
+        assert left == 12
+        assert right == 4
+        assert result == 3
+
+
+class TestBuildCountdownEquation:
+    def test_single_step(self):
+        steps = [CountdownStep(left=75, op="-", right=2, result=73)]
+        eq = build_countdown_equation([75, 2], steps, 73)
+        assert eq == "75 - 2 = 73"
+
+    def test_two_steps(self):
+        steps = [
+            CountdownStep(left=75, op="-", right=2, result=73),
+            CountdownStep(left=73, op="+", right=25, result=98),
+        ]
+        eq = build_countdown_equation([75, 2, 25], steps, 98)
+        assert eq == "(75 - 2) + 25 = 98"
+
+    def test_three_steps(self):
+        steps = [
+            CountdownStep(left=10, op="+", right=5, result=15),
+            CountdownStep(left=15, op="*", right=3, result=45),
+            CountdownStep(left=45, op="-", right=2, result=43),
+        ]
+        eq = build_countdown_equation([10, 5, 3, 2], steps, 43)
+        assert eq == "((10 + 5) * 3) - 2 = 43"
+
+    def test_bare_numbers_not_parenthesized(self):
+        steps = [CountdownStep(left=4, op="*", right=5, result=20)]
+        eq = build_countdown_equation([4, 5], steps, 20)
+        assert eq == "4 * 5 = 20"
+
+    def test_from_env(self):
+        env = CountdownEnv(seed=42)
+        for _ in range(20):
+            resp = env.reset()
+            assert resp.data.solution is not None
+            eq = build_countdown_equation(
+                resp.data.numbers, resp.data.solution, resp.data.target
+            )
+            assert eq.endswith(f"= {resp.data.target}")
+            expr = eq.split("=")[0].strip()
+            result = eval(expr, {"__builtins__": {}}, {})
+            assert result == resp.data.target
+
+
+class TestCountdownHybridCorrectReward:
+    def _make_env_response(
+        self, numbers: list[int], target: int
+    ) -> EnvResponse[Countdown]:
+        return EnvResponse(
+            is_done=True,
+            data=Countdown(prompt="", numbers=numbers, target=target),
+        )
+
+    def test_equation_correct(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([1, 2, 3], 6),
+            raw_model_output="1 + 2 = 3 | 3 + 3 = 6 | (1 + 2) + 3 = 6",
+        )
+        assert result == 1.0
+
+    def test_equation_wrong_target(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([1, 2, 3], 6),
+            raw_model_output="1 + 2 = 3 | (1 + 2) * 3 = 5",
+        )
+        assert result == 0.0
+
+    def test_wrong_arithmetic_right_target(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([75, 8, 2], 602),
+            raw_model_output="8 * 2 = 602 | 75 = 8 | 2 |(8 * 2) * 602 = 602",
+        )
+        assert result == 0.0
+
+    def test_wrong_numbers_used(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            raw_model_output="7 + 8 = 15",
+        )
+        assert result == 0.0
+
+    def test_last_segment_after_pipe(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            raw_model_output="10 + 5 = 15",
+        )
+        assert result == 1.0
+
+    def test_none_output(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([1], 1),
+            raw_model_output=None,
+        )
+        assert result == 0.0
+
+    def test_empty_output(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([1], 1),
+            raw_model_output="",
+        )
+        assert result == 0.0
+
+    def test_no_numbers_in_output(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([1], 1),
+            raw_model_output="no numbers here",
+        )
+        assert result == 0.0
+
+    def test_weighted_reward_integration(self):
+        fn = weighted_reward([("correct", 1.0, countdown_hybrid_correct)])
+        output = "75 - 2 = 73"
+        result = fn(
+            env_response=self._make_env_response([75, 2], 73),
+            raw_model_output=output,
+            extracted_model_output=output,
+        )
+        assert result.total == 1.0
+        assert result.components["correct"] == 1.0
+
+
+class TestGenerateVariableLengthInternalReasoningTokens:
+    def test_output_shapes(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 10
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=999,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        assert out.hard_token_ids.shape == (B, MAX_CYCLES, MAX_TOKENS_PER_CYCLE)
+        assert out.hard_token_lengths.shape == (B, MAX_CYCLES)
+        assert out.n_cycles.shape == (B,)
+        assert (out.n_cycles >= 1).all()
+        assert (out.n_cycles <= MAX_CYCLES).all()
+
+    def test_eos_terminates_generation(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 8
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=999,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        for b in range(B):
+            nc = out.n_cycles[b].item()
+            if nc < MAX_CYCLES:
+                last_cycle = nc - 1
+                tlen = out.hard_token_lengths[b, last_cycle].item()
+                last_token = out.hard_token_ids[b, last_cycle, tlen - 1].item()
+                assert last_token == EOS_TOKEN_ID
+
+    def test_padded_positions_are_pad(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 8
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=999,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        for b in range(B):
+            nc = out.n_cycles[b].item()
+            for c in range(nc, MAX_CYCLES):
+                assert (out.hard_token_ids[b, c] == PAD_TOKEN_ID).all()
+            for c in range(nc):
+                tlen = out.hard_token_lengths[b, c].item()
+                if tlen < MAX_TOKENS_PER_CYCLE:
+                    assert (out.hard_token_ids[b, c, tlen:] == PAD_TOKEN_ID).all()
+
+    def test_hard_token_lengths_positive_for_active_cycles(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 3, 6
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=999,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        for b in range(B):
+            nc = out.n_cycles[b].item()
+            for c in range(nc):
+                assert out.hard_token_lengths[b, c].item() > 0
+
+
+class TestComputeVariableLengthInternalReasoningLogProbs:
+    def test_output_shape(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 2, 3, 5
+        L = 6
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 4, 2], [5, 3, 0]])
+        n_cycles = torch.tensor([3, 2])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        assert log_probs.shape == (B, C)
+        assert mask.shape == (B, C)
+
+    def test_completion_mask_matches_n_cycles(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 2, 4, 5
+        L = 6
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 4, 2, 1], [5, 3, 0, 0]])
+        n_cycles = torch.tensor([4, 2])
+
+        _, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        for b in range(B):
+            nc = n_cycles[b].item()
+            assert mask[b, :nc].all()
+            if nc < C:
+                assert not mask[b, nc:].any()
+
+    def test_log_probs_are_negative(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 2, 3, 4
+        L = 6
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 2, 4], [4, 3, 2]])
+        n_cycles = torch.tensor([3, 3])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        assert (log_probs[mask] <= 0).all()
+
+    def test_grad_flows_through_soft_block(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 1, 2, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 2]])
+        n_cycles = torch.tensor([2])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        has_grad = False
+        for _, p in tiny_model.named_parameters():
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                has_grad = True
+                break
+        assert has_grad
+
+    def test_per_cycle_backward_frees_memory(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 2, 3, 4
+        L = 6
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 2, 4], [4, 3, 2]])
+        n_cycles = torch.tensor([3, 3])
+
+        cycle_indices = torch.arange(C).unsqueeze(0).expand(B, C)
+        completion_mask = cycle_indices < n_cycles.unsqueeze(-1)
+
+        tiny_model.zero_grad()
+        callback = make_variable_length_sft_per_cycle_backward_callback(
+            B=B,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+
+        log_probs, _ = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            cycle_callback=callback,
+        )
+
+        assert not log_probs.requires_grad
+
+        has_grad = False
+        for _, p in tiny_model.named_parameters():
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                has_grad = True
+                break
+        assert has_grad
+
+    def test_grad_magnitude_reasonable(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 1, 2, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 2]])
+        n_cycles = torch.tensor([2])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        for name, p in tiny_model.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"Non-finite grad in {name}"
+                assert not torch.isnan(p.grad).any(), f"NaN grad in {name}"
+
+    def test_bptt_window(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, C, T_max = 1, 2, 3
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, 100, (B, C, T_max))
+        hard_lengths = torch.tensor([[3, 2]])
+        n_cycles = torch.tensor([2])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            pad_token_id=PAD_TOKEN_ID,
+            soft_bptt_window=1,
+        )
+
+        loss = (log_probs * mask).sum()
+        loss.backward()
+
+        has_grad = False
+        for _, p in tiny_model.named_parameters():
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                has_grad = True
+                break
+        assert has_grad
+
+
+class TestMakeVariableLengthSFTPerCycleBackwardCallback:
+    def test_normalizes_by_total_tokens(self):
+        B = 2
+        completion_mask = torch.tensor([[True, True, True], [True, True, False]])
+        hard_token_lengths = torch.tensor([[3, 4, 2], [5, 3, 0]])
+        n_cycles = torch.tensor([3, 2])
+
+        callback = make_variable_length_sft_per_cycle_backward_callback(
+            B=B,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+
+        lp = torch.tensor([-1.0, -2.0], requires_grad=True)
+        result = callback(lp, 0)
+        assert not result.requires_grad
+
+    def test_no_normalization(self):
+        B = 2
+        completion_mask = torch.tensor([[True, True, True], [True, True, False]])
+        hard_token_lengths = torch.tensor([[3, 4, 2], [5, 3, 0]])
+        n_cycles = torch.tensor([3, 2])
+
+        callback = make_variable_length_sft_per_cycle_backward_callback(
+            B=B,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            normalize_by_sequence_length=False,
+            loss_scale=1.0,
+        )
+
+        lp = torch.tensor([-1.0, -2.0], requires_grad=True)
+        result = callback(lp, 0)
+        assert not result.requires_grad
