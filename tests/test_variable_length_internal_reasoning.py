@@ -326,13 +326,13 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 2, 3, 5
+        B, G, C, T_max = 2, 1, 3, 5
         L = 6
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 4, 2], [5, 3, 0]])
-        n_cycles = torch.tensor([3, 2])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 4, 2]], [[5, 3, 0]]])
+        n_cycles = torch.tensor([[3], [2]])
 
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
@@ -345,20 +345,20 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             pad_token_id=PAD_TOKEN_ID,
         )
 
-        assert log_probs.shape == (B, C)
-        assert mask.shape == (B, C)
+        assert log_probs.shape == (B, G, C)
+        assert mask.shape == (B, G, C)
 
     def test_completion_mask_matches_n_cycles(self, tiny_model):
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 2, 4, 5
+        B, G, C, T_max = 2, 1, 4, 5
         L = 6
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 4, 2, 1], [5, 3, 0, 0]])
-        n_cycles = torch.tensor([4, 2])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 4, 2, 1]], [[5, 3, 0, 0]]])
+        n_cycles = torch.tensor([[4], [2]])
 
         _, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
@@ -372,22 +372,22 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         )
 
         for b in range(B):
-            nc = n_cycles[b].item()
-            assert mask[b, :nc].all()
+            nc = n_cycles[b, 0].item()
+            assert mask[b, 0, :nc].all()
             if nc < C:
-                assert not mask[b, nc:].any()
+                assert not mask[b, 0, nc:].any()
 
     def test_log_probs_are_negative(self, tiny_model):
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 2, 3, 4
+        B, G, C, T_max = 2, 1, 3, 4
         L = 6
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 2, 4], [4, 3, 2]])
-        n_cycles = torch.tensor([3, 3])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 2, 4]], [[4, 3, 2]]])
+        n_cycles = torch.tensor([[3], [3]])
 
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
@@ -406,13 +406,13 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 1, 2, 3
+        B, G, C, T_max = 1, 1, 2, 3
         L = 4
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 2]])
-        n_cycles = torch.tensor([2])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 2]]])
+        n_cycles = torch.tensor([[2]])
 
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
@@ -439,23 +439,23 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 2, 3, 4
+        B, G, C, T_max = 2, 1, 3, 4
         L = 6
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 2, 4], [4, 3, 2]])
-        n_cycles = torch.tensor([3, 3])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 2, 4]], [[4, 3, 2]]])
+        n_cycles = torch.tensor([[3], [3]])
 
         cycle_indices = torch.arange(C).unsqueeze(0).expand(B, C)
-        completion_mask = cycle_indices < n_cycles.unsqueeze(-1)
+        completion_mask = cycle_indices < n_cycles[:, 0].unsqueeze(-1)
 
         tiny_model.zero_grad()
         callback = make_variable_length_sft_per_cycle_backward_callback(
             B=B,
             completion_mask=completion_mask,
-            hard_token_lengths=hard_lengths,
-            n_cycles=n_cycles,
+            hard_token_lengths=hard_lengths[:, 0],
+            n_cycles=n_cycles[:, 0],
             normalize_by_sequence_length=True,
             loss_scale=1.0,
         )
@@ -485,13 +485,13 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 1, 2, 3
+        B, G, C, T_max = 1, 1, 2, 3
         L = 4
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 2]])
-        n_cycles = torch.tensor([2])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 2]]])
+        n_cycles = torch.tensor([[2]])
 
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
@@ -516,13 +516,13 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         torch.manual_seed(42)
         tiny_model.train()
 
-        B, C, T_max = 1, 2, 3
+        B, G, C, T_max = 1, 1, 2, 3
         L = 4
         prompt_ids = torch.randint(0, 100, (B, L))
         attention_mask = torch.ones(B, L, dtype=torch.bool)
-        hard_ids = torch.randint(0, 100, (B, C, T_max))
-        hard_lengths = torch.tensor([[3, 2]])
-        n_cycles = torch.tensor([2])
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max))
+        hard_lengths = torch.tensor([[[3, 2]]])
+        n_cycles = torch.tensor([[2]])
 
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=tiny_model,
