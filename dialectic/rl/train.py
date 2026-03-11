@@ -1355,7 +1355,6 @@ def compute_internal_reasoning_log_probs(
     n_cycles: Integer[torch.Tensor, "B G"],
     valid_hard_token_ids: list[int],
     soft_block_size: int,
-    pad_token_id: int,
     use_bf16: bool = False,
     soft_bptt_window: int | None = None,
     cycle_callback: Callable[
@@ -1381,7 +1380,6 @@ def compute_internal_reasoning_log_probs(
         hard_token_lengths=hard_token_lengths,
         n_cycles=n_cycles,
         soft_block_size=soft_block_size,
-        pad_token_id=pad_token_id,
         valid_hard_token_ids=valid_hard_token_ids,
         use_bf16=use_bf16,
         soft_bptt_window=soft_bptt_window,
@@ -1647,7 +1645,6 @@ def collect_internal_reasoning_micro_batch(
                 n_cycles=stacked_n_cycles,
                 valid_hard_token_ids=valid_hard_token_ids,
                 soft_block_size=soft_block_size,
-                pad_token_id=pad_token_id,
                 use_bf16=use_bf16,
                 think_token_id=think_token_id,
             )
@@ -1663,7 +1660,6 @@ def collect_internal_reasoning_micro_batch(
                 n_cycles=stacked_n_cycles,
                 valid_hard_token_ids=valid_hard_token_ids,
                 soft_block_size=soft_block_size,
-                pad_token_id=pad_token_id,
                 use_bf16=use_bf16,
                 soft_bptt_window=soft_bptt_window,
                 think_token_id=think_token_id,
@@ -1820,7 +1816,6 @@ def train_internal_reasoning_grpo(
             n_cycles=mb["n_cycles"],
             valid_hard_token_ids=valid_hard_token_ids,
             soft_block_size=soft_block_size,
-            pad_token_id=pad_token_id,
             use_bf16=use_bf16,
             soft_bptt_window=soft_bptt_window,
             cycle_callback=callback,
@@ -1980,7 +1975,6 @@ def create_internal_reasoning_sft_step_fn(
                     n_cycles=n_cycles,
                     valid_hard_token_ids=valid_hard_token_ids,
                     soft_block_size=soft_block_size,
-                    pad_token_id=pad_token_id,
                     use_bf16=use_bf16,
                     soft_bptt_window=soft_bptt_window,
                     cycle_callback=callback,
@@ -2157,7 +2151,6 @@ def compute_variable_length_internal_reasoning_log_probs(
     hard_token_lengths: Integer[torch.Tensor, "B G C"],
     n_cycles: Integer[torch.Tensor, "B G"],
     soft_block_size: int,
-    pad_token_id: int,
     valid_hard_token_ids: list[int] | None = None,
     use_bf16: bool = False,
     soft_bptt_window: int | None = None,
@@ -2189,8 +2182,6 @@ def compute_variable_length_internal_reasoning_log_probs(
         Actual number of cycles per sample [B, G].
     soft_block_size
         Number of soft forward passes per cycle.
-    pad_token_id
-        Padding token ID.
     valid_hard_token_ids
         Optional token IDs to restrict logits to. When set, logits for tokens
         not in this list are set to -inf before log_softmax.
@@ -2410,7 +2401,6 @@ def create_countdown_sft_step_fn(
     tokenizer: Tokenizer,
     pad_token_id: int,
     eos_token_id: int,
-    separator_token_id: int,
     soft_block_size: int,
     soft_bptt_window: int | None,
     max_cycles: int,
@@ -2512,7 +2502,6 @@ def create_countdown_sft_step_fn(
                     hard_token_lengths=hard_token_lengths_tensor,
                     n_cycles=n_cycles_tensor,
                     soft_block_size=soft_block_size,
-                    pad_token_id=pad_token_id,
                     use_bf16=use_bf16,
                     soft_bptt_window=soft_bptt_window,
                     cycle_callback=callback,
@@ -2648,7 +2637,6 @@ def train_variable_length_internal_reasoning_sft(
         tokenizer=tokenizer,
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
-        separator_token_id=separator_token_id,
         soft_block_size=soft_block_size,
         soft_bptt_window=soft_bptt_window,
         max_cycles=max_cycles,
