@@ -45,6 +45,15 @@ MAZE_INTERNAL_REASONING_PROMPT = PromptCollection(
     assistant_prefill=None,
 )
 
+COUNTDOWN_INTERNAL_REASONING_PROMPT = PromptCollection(
+    system_prompt=None,
+    env_prompt=(
+        "Using the numbers {numbers}, reach the target {target}. "
+        "Show each computation step."
+    ),
+    assistant_prefill=None,
+)
+
 PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
     "countdown": [
         PromptCollection(

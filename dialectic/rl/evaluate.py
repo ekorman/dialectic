@@ -6,12 +6,18 @@ import torch
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import generate_with_soft_prefill
+from dialectic.llm.generate import (
+    generate_variable_length_internal_reasoning_tokens,
+    generate_with_soft_prefill,
+)
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
+    decode_variable_length_gen_output,
     generate_internal_reasoning_rollout_batch,
     generate_rollout_batch,
+    generate_variable_length_internal_reasoning_rollout_batch,
+    get_batch,
 )
 from dialectic.rl.types import A, E, T
 
@@ -395,3 +401,204 @@ def evaluate_soft_prefill(
         reward_std=reward_std,
         component_means=component_means,
     ), examples
+
+
+@torch.no_grad()
+def evaluate_variable_length_internal_reasoning(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    separator_token_id: int,
+    soft_block_size: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int = 20,
+    max_episodes: int,
+    batch_size: int = 1,
+    temperature: float = 0.0,
+    n_examples: int = 10,
+    use_bf16: bool = False,
+    think_token_id: int | None = None,
+    pass_at_k_samples: int = 0,
+    pass_at_k_temperature: float = 0.7,
+) -> tuple[EvaluationResult, list[extty.Example]]:
+    all_rewards: list[float] = []
+    all_reward_results: list[dict[str, float]] = []
+    all_prompts: list[str] = []
+    all_output_strs: list[str] = []
+
+    n_episodes = 0
+    while n_episodes < max_episodes:
+        current_batch_size = min(batch_size, max_episodes - n_episodes)
+
+        rollout = generate_variable_length_internal_reasoning_rollout_batch(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            separator_token_id=separator_token_id,
+            batch_size=current_batch_size,
+            temperature=temperature,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            use_bf16=use_bf16,
+            think_token_id=think_token_id,
+        )
+
+        for b in range(current_batch_size):
+            all_rewards.append(rollout.reward_results[b].total)
+            all_prompts.append(rollout.prompts[b])
+            all_output_strs.append(rollout.output_strs[b])
+            all_reward_results.append(rollout.reward_results[b].components)
+
+        n_episodes += current_batch_size
+
+    reward_tensor = torch.tensor(all_rewards)
+    reward_mean = reward_tensor.mean().item()
+    reward_std = reward_tensor.std().item()
+
+    component_means: dict[str, float] = {}
+    if all_reward_results:
+        all_components: dict[str, list[float]] = {}
+        for r in all_reward_results:
+            for name, value in r.items():
+                all_components.setdefault(name, []).append(value)
+        component_means = {
+            name: sum(vals) / len(vals) for name, vals in all_components.items()
+        }
+
+    if pass_at_k_samples > 0:
+        pass_at_k_metrics = _compute_pass_at_k(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            separator_token_id=separator_token_id,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            max_episodes=max_episodes,
+            batch_size=batch_size,
+            n_samples=pass_at_k_samples,
+            temperature=pass_at_k_temperature,
+            use_bf16=use_bf16,
+            think_token_id=think_token_id,
+        )
+        component_means.update(pass_at_k_metrics)
+
+    sample_idxs = range(min(n_examples, len(all_prompts)))
+    examples = [
+        extty.Example(
+            prompt=all_prompts[i],
+            responses=[all_output_strs[i]],
+            rewards=[all_reward_results[i]],
+        )
+        for i in sample_idxs
+    ]
+
+    return EvaluationResult(
+        n_episodes=n_episodes,
+        reward_mean=reward_mean,
+        reward_std=reward_std,
+        component_means=component_means,
+    ), examples
+
+
+@torch.no_grad()
+def _compute_pass_at_k(
+    *,
+    net: BaseTransformer,
+    env: Env,
+    reward_fn: RewardFn,
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    separator_token_id: int,
+    soft_block_size: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    max_episodes: int,
+    batch_size: int,
+    n_samples: int,
+    temperature: float,
+    use_bf16: bool,
+    think_token_id: int | None,
+) -> dict[str, float]:
+    device = next(net.parameters()).device
+    any_correct: list[bool] = []
+    per_sample_correct: list[list[bool]] = []
+
+    n_episodes = 0
+    while n_episodes < max_episodes:
+        current_batch_size = min(batch_size, max_episodes - n_episodes)
+        env_responses = get_batch(env, current_batch_size)
+        prompts = [state_to_str(resp.data) for resp in env_responses]
+
+        tokenizer.enable_padding(direction="left")
+        tokens = tokenizer.encode_batch(prompts)
+        attention_mask = torch.tensor(
+            [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+        )
+        token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+        batch_any_correct = [False] * current_batch_size
+        batch_per_sample: list[list[bool]] = [[] for _ in range(current_batch_size)]
+
+        for _ in range(n_samples):
+            gen_output = generate_variable_length_internal_reasoning_tokens(
+                net=net,
+                token_ids=token_ids,
+                soft_block_size=soft_block_size,
+                max_cycles=max_cycles,
+                max_tokens_per_cycle=max_tokens_per_cycle,
+                separator_token_id=separator_token_id,
+                done_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                temperature=temperature,
+                attention_mask=attention_mask,
+                use_bf16=use_bf16,
+                think_token_id=think_token_id,
+            )
+
+            output_strs = decode_variable_length_gen_output(
+                gen_output, current_batch_size, pad_token_id, eos_token_id, tokenizer
+            )
+
+            for b in range(current_batch_size):
+                result = reward_fn(
+                    env_response=env_responses[b],
+                    raw_model_output=output_strs[b],
+                    extracted_model_output=output_strs[b],
+                )
+                correct = result.total > 0.0
+                batch_per_sample[b].append(correct)
+                if correct:
+                    batch_any_correct[b] = True
+
+        any_correct.extend(batch_any_correct)
+        per_sample_correct.extend(batch_per_sample)
+        n_episodes += current_batch_size
+
+    n = len(any_correct)
+    pass_at_k = sum(any_correct) / n if n > 0 else 0.0
+    all_individual = [c for sample in per_sample_correct for c in sample]
+    pass_at_1_sampled = (
+        sum(all_individual) / len(all_individual) if all_individual else 0.0
+    )
+
+    return {
+        f"pass@{n_samples}": pass_at_k,
+        "pass@1_sampled": pass_at_1_sampled,
+    }
