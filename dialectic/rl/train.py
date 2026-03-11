@@ -2438,7 +2438,7 @@ def create_countdown_sft_step_fn(
                 assert solution is not None, "CountdownEnv must provide solution"
                 cycle_ids_list: list[list[int]] = []
                 for s in solution:
-                    text = f"{s.left} {s.op} {s.right} = {s.result} |"
+                    text = s.format_step()
                     ids = tokenizer.encode(text, add_special_tokens=False).ids
                     cycle_ids_list.append(list(ids))
                 equation = build_countdown_equation(

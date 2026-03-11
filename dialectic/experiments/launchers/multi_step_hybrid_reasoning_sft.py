@@ -22,7 +22,7 @@ from dialectic.experiments.prompts import (
     PromptCollection,
 )
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
-from dialectic.rl.env import CountdownEnv, Env
+from dialectic.rl.env import CountdownEnv, CountdownStep, Env
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn, countdown_hybrid_correct, weighted_reward
 from dialectic.rl.train import (
@@ -140,16 +140,14 @@ def train_hybrid_reasoning_sft_maze(
     )
 
 
-SAMPLE_STEP_STR = "1 + 2 = 3 |"
-
-
 def _extract_separator_token_id(tokenizer: Tokenizer) -> int:
     """Extract the separator token from a sample training step.
 
     Derives the token from the same format used in training
-    (``f"{left} {op} {right} = {result} |"``) so it is guaranteed to match.
+    (``CountdownStep.format_step()``) so it is guaranteed to match.
     """
-    ids = tokenizer.encode(SAMPLE_STEP_STR, add_special_tokens=False).ids
+    sample = CountdownStep(left=1, op="+", right=2, result=3).format_step()
+    ids = tokenizer.encode(sample, add_special_tokens=False).ids
     return ids[-1]
 
 

@@ -166,6 +166,9 @@ class CountdownStep:
     right: int
     result: int
 
+    def format_step(self) -> str:
+        return f"{self.left} {self.op} {self.right} = {self.result} |"
+
 
 @dataclass
 class Countdown:
