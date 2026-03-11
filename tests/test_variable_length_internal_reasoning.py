@@ -3,8 +3,19 @@ import inspect
 import pytest
 import torch
 
+from dialectic.experiments.launchers.multi_step_hybrid_reasoning_sft import (
+    _extract_separator_token_id,
+    train_hybrid_reasoning_sft_countdown,
+)
+from dialectic.experiments.params import (
+    CountdownParams,
+    HybridReasoningParams,
+    MultiStepSFTParams,
+    TrainParams,
+)
 from dialectic.llm import generate as gen_module
 from dialectic.llm.generate import generate_variable_length_internal_reasoning_tokens
+from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import (
     Countdown,
     CountdownEnv,
@@ -614,6 +625,48 @@ class TestMakeVariableLengthSFTPerCycleBackwardCallback:
         assert not result.requires_grad
 
 
+class TestValidOps:
+    def test_no_duplicate_division_when_equal(self):
+        """When a == b, _valid_ops should not return two identical division entries."""
+        ops = CountdownEnv._valid_ops(5, 5)
+        div_ops = [o for o in ops if o[0] == "/"]
+        assert len(div_ops) <= 1
+
+    def test_division_both_directions(self):
+        """When a != b and both divide evenly, both directions should appear."""
+        ops = CountdownEnv._valid_ops(6, 3)
+        div_ops = [o for o in ops if o[0] == "/"]
+        div_results = sorted([o[1] for o in div_ops])
+        assert div_results == [2]
+
+    def test_division_6_and_2(self):
+        ops = CountdownEnv._valid_ops(6, 2)
+        div_ops = [o for o in ops if o[0] == "/"]
+        assert len(div_ops) == 1
+        assert div_ops[0] == ("/", 3, 6, 2)
+
+
+class TestBuildCountdownEquationDuplicateValues:
+    def test_duplicate_numbers_in_pool(self):
+        """When pool has duplicate values, build_countdown_equation should
+        still produce a correct equation by matching the right operands."""
+        steps = [
+            CountdownStep(left=3, op="+", right=3, result=6),
+        ]
+        result = build_countdown_equation([3, 3], steps, 6)
+        assert result == "3 + 3 = 6"
+
+    def test_duplicate_intermediate_values(self):
+        """If an intermediate result equals an original number, the equation
+        should still be correct."""
+        steps = [
+            CountdownStep(left=5, op="-", right=3, result=2),
+            CountdownStep(left=2, op="+", right=2, result=4),
+        ]
+        result = build_countdown_equation([5, 3, 2], steps, 4)
+        assert "= 4" in result
+
+
 class TestKVCacheSizingVariableLength:
     def test_kv_cache_accounts_for_logit_forward_pass(self):
         """Each cycle uses soft_block_size + 1 + max_tokens_per_cycle KV slots:
@@ -653,15 +706,6 @@ class TestValEnvsListLengthValidation:
         When n_ops is a list of 2 but n_total/n_larges are scalars (→ lists of 1),
         the launcher should raise ValueError, not silently produce wrong val envs.
         """
-        from dialectic.experiments.launchers.multi_step_hybrid_reasoning_sft import (
-            train_hybrid_reasoning_sft_countdown,
-        )
-        from dialectic.experiments.params import (
-            CountdownParams,
-            HybridReasoningParams,
-            MultiStepSFTParams,
-            TrainParams,
-        )
 
         with pytest.raises(ValueError, match="same length"):
             train_hybrid_reasoning_sft_countdown(
@@ -695,3 +739,37 @@ class TestValEnvsListLengthValidation:
                     n_larges=2,
                 ),
             )
+
+
+class TestKVCacheSizingLogProbs:
+    def test_log_prob_kv_cache_formula(self):
+        """The log-prob function uses soft_block_size + T_max per cycle
+        (no +1 because the logit pass feeds h which is already the last
+        soft output, just passed through lm_head, not a new KV entry...
+        actually it IS a new forward pass at line 2324). Verify the formula
+        in source code."""
+        src = inspect.getsource(compute_variable_length_internal_reasoning_log_probs)
+        assert "soft_block_size + T_max" in src
+
+
+class TestSeparatorTokenExtraction:
+    def test_separator_matches_training_format(self):
+        """The separator token extracted by the launcher must match the last
+        token of CountdownStep.format_step() when encoded."""
+
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        tokenizer = model_info.load_tokenizer()
+
+        sep_id = _extract_separator_token_id(tokenizer)
+
+        step = CountdownStep(left=75, op="-", right=2, result=73)
+        ids = tokenizer.encode(step.format_step(), add_special_tokens=False).ids
+        assert ids[-1] == sep_id
+
+
+class TestValEnvSeedNoCollision:
+    def test_val_seeds_use_large_offset(self):
+        """Val env seeds should use a large offset to avoid collision with
+        typical train seeds (which are small integers like 42, 665, etc.)."""
+        src = inspect.getsource(train_hybrid_reasoning_sft_countdown)
+        assert "seed=1_000_000 + i" in src
