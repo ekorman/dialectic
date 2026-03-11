@@ -1,5 +1,3 @@
-import inspect
-
 import pytest
 import torch
 
@@ -13,7 +11,7 @@ from dialectic.experiments.params import (
     MultiStepSFTParams,
     TrainParams,
 )
-from dialectic.llm import generate as gen_module
+from dialectic.llm.components.kv_cache import KVCache
 from dialectic.llm.generate import generate_variable_length_internal_reasoning_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import (
@@ -380,7 +378,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         assert log_probs.shape == (B, G, C)
@@ -406,7 +403,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         for b in range(B):
@@ -435,7 +431,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         assert (log_probs[mask] <= 0).all()
@@ -460,7 +455,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -506,7 +500,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             cycle_callback=callback,
         )
 
@@ -539,7 +532,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -570,7 +562,6 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
             hard_token_lengths=hard_lengths,
             n_cycles=n_cycles,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             soft_bptt_window=1,
         )
 
@@ -632,8 +623,8 @@ class TestValidOps:
         div_ops = [o for o in ops if o[0] == "/"]
         assert len(div_ops) <= 1
 
-    def test_division_both_directions(self):
-        """When a != b and both divide evenly, both directions should appear."""
+    def test_division_only_valid_direction(self):
+        """When a != b, only the direction that divides evenly should appear."""
         ops = CountdownEnv._valid_ops(6, 3)
         div_ops = [o for o in ops if o[0] == "/"]
         div_results = sorted([o[1] for o in div_ops])
@@ -668,26 +659,46 @@ class TestBuildCountdownEquationDuplicateValues:
 
 
 class TestKVCacheSizingVariableLength:
-    def test_kv_cache_accounts_for_logit_forward_pass(self):
-        """Each cycle uses soft_block_size + 1 + max_tokens_per_cycle KV slots:
-        soft_block_size for soft passes, 1 for the logit-producing forward pass,
-        and up to max_tokens_per_cycle for teacher-forced hard tokens.
-        The allocated max_seq_len must account for the +1.
+    def test_kv_cache_accounts_for_logit_forward_pass(self, tiny_model, monkeypatch):
+        """Each cycle uses soft_block_size + 1 + max_tokens_per_cycle KV slots.
+
+        Verify at runtime by capturing the max_seq_len passed to KVCache.
         """
-        L = 4
+
+        captured_max_seq_lens: list[int] = []
+        orig_init = KVCache.__init__
+
+        def patched_init(self, *args, **kwargs):
+            captured_max_seq_lens.append(kwargs.get("max_seq_len") or args[0])
+            orig_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(KVCache, "__init__", patched_init)
+
         soft_block_size = 2
-        max_cycles = 3
-        max_tokens_per_cycle = 4
+        max_cycles = 2
+        max_tokens_per_cycle = 3
+        B = 1
+        device = next(tiny_model.parameters()).device
 
-        slots_per_cycle = soft_block_size + 1 + max_tokens_per_cycle
-        expected = L + max_cycles * slots_per_cycle
-        buggy = L + max_cycles * (soft_block_size + max_tokens_per_cycle)
-        assert expected > buggy, "sanity: there IS an off-by-one to fix"
+        prompt_ids = torch.randint(0, 100, (B, 4), device=device)
+        attn_mask = torch.ones(B, 4, dtype=torch.bool, device=device)
+        L = prompt_ids.shape[1]
 
-        src = inspect.getsource(
-            gen_module.generate_variable_length_internal_reasoning_tokens
+        generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=prompt_ids,
+            attention_mask=attn_mask,
+            done_token_id=2,
+            pad_token_id=0,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
         )
-        assert "soft_block_size + 1 + max_tokens_per_cycle" in src
+
+        expected = L + max_cycles * (soft_block_size + 1 + max_tokens_per_cycle)
+        assert any(s == expected for s in captured_max_seq_lens), (
+            f"Expected KVCache max_seq_len={expected}, got {captured_max_seq_lens}"
+        )
 
 
 class TestValEnvsListLengthValidation:
@@ -710,7 +721,7 @@ class TestValEnvsListLengthValidation:
         with pytest.raises(ValueError, match="same length"):
             train_hybrid_reasoning_sft_countdown(
                 train_params=TrainParams(
-                    model_name="qwen2.5-0.6b",
+                    model_name="qwen3-0.6b",
                     lr=1e-4,
                     max_episodes=1,
                     batch_size=1,
@@ -742,14 +753,44 @@ class TestValEnvsListLengthValidation:
 
 
 class TestKVCacheSizingLogProbs:
-    def test_log_prob_kv_cache_formula(self):
-        """The log-prob function uses soft_block_size + T_max per cycle
-        (no +1 because the logit pass feeds h which is already the last
-        soft output, just passed through lm_head, not a new KV entry...
-        actually it IS a new forward pass at line 2324). Verify the formula
-        in source code."""
-        src = inspect.getsource(compute_variable_length_internal_reasoning_log_probs)
-        assert "soft_block_size + T_max" in src
+    def test_log_prob_kv_cache_formula(self, tiny_model, monkeypatch):
+        """Verify compute_variable_length_internal_reasoning_log_probs allocates
+        KV cache with soft_block_size + T_max slots per cycle at runtime."""
+
+        captured_max_seq_lens: list[int] = []
+        orig_init = KVCache.__init__
+
+        def patched_init(self, *args, **kwargs):
+            captured_max_seq_lens.append(kwargs.get("max_seq_len") or args[0])
+            orig_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(KVCache, "__init__", patched_init)
+
+        B, G, C, T_max = 1, 1, 2, 3
+        soft_block_size = 2
+        device = next(tiny_model.parameters()).device
+        prompt_ids = torch.randint(0, 100, (B, 4), device=device)
+        attn_mask = torch.ones(B, 4, dtype=torch.bool, device=device)
+        hard_ids = torch.randint(0, 100, (B, G, C, T_max), device=device)
+        hard_lengths = torch.full((B, G, C), T_max, dtype=torch.long, device=device)
+        n_cycles = torch.full((B, G), C, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            compute_variable_length_internal_reasoning_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attn_mask,
+                hard_token_ids=hard_ids,
+                hard_token_lengths=hard_lengths,
+                n_cycles=n_cycles,
+                soft_block_size=soft_block_size,
+            )
+
+        L = prompt_ids.shape[1]
+        expected = L + C * (soft_block_size + T_max)
+        assert any(s == expected for s in captured_max_seq_lens), (
+            f"Expected KVCache max_seq_len={expected}, got {captured_max_seq_lens}"
+        )
 
 
 class TestSeparatorTokenExtraction:

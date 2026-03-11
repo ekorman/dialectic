@@ -165,7 +165,6 @@ class TestComputeInternalReasoningLogProbs:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         assert log_probs.shape == (B, G, C)
@@ -191,7 +190,6 @@ class TestComputeInternalReasoningLogProbs:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         for b in range(B):
@@ -299,7 +297,6 @@ class TestPerCycleBackward:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
         loss, _, _ = compute_grpo_loss(
             log_probs=log_probs,
@@ -341,7 +338,6 @@ class TestPerCycleBackward:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             cycle_callback=callback,
         )
         grads_per_cycle = {
@@ -379,7 +375,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -405,7 +400,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -438,7 +432,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles_single,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
         loss_c1 = log_probs_c1[:, :, 0].sum()
         tiny_model.zero_grad()
@@ -458,7 +451,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles_two,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
         loss_c2_only = log_probs_c2[:, :, 1].sum()
         tiny_model.zero_grad()
@@ -478,7 +470,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles_both,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
         loss_both = log_probs_both[:, :, 0].sum() + log_probs_both[:, :, 1].sum()
         tiny_model.zero_grad()
@@ -516,7 +507,6 @@ class TestKVCacheAndAutograd:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -760,7 +750,6 @@ class TestSoftProjection:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -795,7 +784,6 @@ class TestSoftProjection:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -832,7 +820,6 @@ class TestSoftProjection:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (log_probs * mask).sum()
@@ -870,7 +857,6 @@ class TestSoftBpttWindow:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
         lp_default.sum().backward()
         grads_default = {
@@ -888,7 +874,6 @@ class TestSoftBpttWindow:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             soft_bptt_window=SOFT_BLOCK_SIZE,
         )
         lp_full.sum().backward()
@@ -926,7 +911,6 @@ class TestSoftBpttWindow:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=soft_block_size,
-            pad_token_id=PAD_TOKEN_ID,
             soft_bptt_window=soft_block_size,
         )
         lp_full.sum().backward()
@@ -948,7 +932,6 @@ class TestSoftBpttWindow:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=soft_block_size,
-            pad_token_id=PAD_TOKEN_ID,
             soft_bptt_window=1,
         )
         lp_window.sum().backward()
@@ -990,7 +973,6 @@ class TestSoftBpttWindow:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             soft_bptt_window=0,
         )
         lp.sum().backward()
@@ -1142,7 +1124,6 @@ class TestThinkTokens:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             think_token_id=think_id,
         )
 
@@ -1170,7 +1151,6 @@ class TestThinkTokens:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             think_token_id=think_id,
         )
 
@@ -1203,7 +1183,6 @@ class TestThinkTokens:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         lp_think, _ = compute_internal_reasoning_log_probs(
@@ -1214,7 +1193,6 @@ class TestThinkTokens:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
             think_token_id=think_id,
         )
 
@@ -1245,7 +1223,6 @@ class TestSoftTokenRegeneration:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         loss = (lp_before * mask).sum()
@@ -1265,7 +1242,6 @@ class TestSoftTokenRegeneration:
             n_cycles=n_cycles,
             valid_hard_token_ids=VALID_HARD_TOKEN_IDS,
             soft_block_size=SOFT_BLOCK_SIZE,
-            pad_token_id=PAD_TOKEN_ID,
         )
 
         assert not torch.allclose(lp_before, lp_after.detach(), atol=1e-6), (
