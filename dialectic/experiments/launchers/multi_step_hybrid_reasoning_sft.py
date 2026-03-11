@@ -140,7 +140,17 @@ def train_hybrid_reasoning_sft_maze(
     )
 
 
-SEPARATOR_STR = "|"
+SAMPLE_STEP_STR = "1 + 2 = 3 |"
+
+
+def _extract_separator_token_id(tokenizer: Tokenizer) -> int:
+    """Extract the separator token from a sample training step.
+
+    Derives the token from the same format used in training
+    (``f"{left} {op} {right} = {result} |"``) so it is guaranteed to match.
+    """
+    ids = tokenizer.encode(SAMPLE_STEP_STR, add_special_tokens=False).ids
+    return ids[-1]
 
 
 @extty.experiment(project="sft-hybrid-reasoning-countdown")
@@ -177,11 +187,7 @@ def train_hybrid_reasoning_sft_countdown(
     )
     tokenizer = model_info.load_tokenizer()
 
-    separator_ids = tokenizer.encode(SEPARATOR_STR, add_special_tokens=False).ids
-    assert len(separator_ids) == 1, (
-        f"'|' tokenizes to {len(separator_ids)} tokens, expected 1"
-    )
-    separator_token_id = separator_ids[0]
+    separator_token_id = _extract_separator_token_id(tokenizer)
 
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,
@@ -235,6 +241,8 @@ def train_hybrid_reasoning_sft_countdown(
         val_freq=train_params.val_freq,
         val_envs=val_envs,
         think_token_id=hr_params.think_token_id,
+        pass_at_k_samples=hr_params.pass_at_k_samples,
+        pass_at_k_temperature=hr_params.pass_at_k_temperature,
     )
 
 

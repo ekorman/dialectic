@@ -215,6 +215,29 @@ class TestCountdownHybridCorrectReward:
         )
         assert result == 0.0
 
+    def test_stated_result_doesnt_match_evaluation(self):
+        """Expression evaluates to target but stated result is wrong."""
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([100, 6, 1], 94),
+            raw_model_output="100 - 6 = 94 | 1 * 94 = 91 * (100 - 6) = 994 | 1 * (100 - 6) = 994",
+        )
+        assert result == 0.0
+
+    def test_correct_expr_wrong_stated_result(self):
+        """Last segment: expr is correct but stated number after = is wrong."""
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            raw_model_output="10 + 5 = 99",
+        )
+        assert result == 0.0
+
+    def test_correct_with_matching_stated_result(self):
+        result = countdown_hybrid_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            raw_model_output="10 + 5 = 15",
+        )
+        assert result == 1.0
+
     def test_weighted_reward_integration(self):
         fn = weighted_reward([("correct", 1.0, countdown_hybrid_correct)])
         output = "75 - 2 = 73"

@@ -61,6 +61,8 @@ class HybridReasoningParams:
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
     think_token_id: int | None = None
+    pass_at_k_samples: int = 0
+    pass_at_k_temperature: float = 0.7
 
 
 @dataclass

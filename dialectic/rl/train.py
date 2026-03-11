@@ -2576,6 +2576,8 @@ def create_variable_length_internal_reasoning_sft_val_fn(
     val_batch_size: int,
     val_reward_fn: RewardFn,
     think_token_id: int | None,
+    pass_at_k_samples: int = 0,
+    pass_at_k_temperature: float = 0.7,
 ):
     def _val(env: Env):
         from dialectic.rl.evaluate import evaluate_variable_length_internal_reasoning
@@ -2598,6 +2600,8 @@ def create_variable_length_internal_reasoning_sft_val_fn(
             use_bf16=use_bf16,
             n_examples=val_episodes,
             think_token_id=think_token_id,
+            pass_at_k_samples=pass_at_k_samples,
+            pass_at_k_temperature=pass_at_k_temperature,
         )
 
     return _val
@@ -2630,6 +2634,8 @@ def train_variable_length_internal_reasoning_sft(
     val_freq: int = 0,
     val_envs: Sequence[Env],
     think_token_id: int | None,
+    pass_at_k_samples: int = 0,
+    pass_at_k_temperature: float = 0.7,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2669,6 +2675,8 @@ def train_variable_length_internal_reasoning_sft(
         val_batch_size=val_batch_size,
         val_reward_fn=val_reward_fn,
         think_token_id=think_token_id,
+        pass_at_k_samples=pass_at_k_samples,
+        pass_at_k_temperature=pass_at_k_temperature,
     )
 
     train_loop(

@@ -92,12 +92,18 @@ def countdown_hybrid_correct(
         last_segment = segments[-1].strip()
         if "=" not in last_segment:
             return 0.0
-        expr = last_segment.rsplit("=", 1)[0].strip()
+        expr, stated_result_str = last_segment.rsplit("=", 1)
+        expr = expr.strip()
+        stated_result_str = stated_result_str.strip()
+        if not stated_result_str:
+            return 0.0
+        stated_result = float(stated_result_str)
+        target = env_response.data.target
+        if abs(stated_result - target) > 1e-6:
+            return 0.0
         return (
             1.0
-            if _evaluate_and_verify_countdown(
-                expr, env_response.data.numbers, env_response.data.target
-            )
+            if _evaluate_and_verify_countdown(expr, env_response.data.numbers, target)
             else 0.0
         )
     except Exception:
