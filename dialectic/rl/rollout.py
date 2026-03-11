@@ -10,6 +10,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import (
     PreFill,
+    VariableLengthInternalReasoningGeneratorOutput,
     generate_hard_tokens,
     generate_internal_reasoning_tokens,
     generate_soft_tokens,
@@ -23,6 +24,27 @@ from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
 def _embedding_rms_norm(net: BaseTransformer) -> float:
     W = net.embed_tokens.weight
     return W.pow(2).mean().sqrt().item()
+
+
+def decode_variable_length_gen_output(
+    gen_output: VariableLengthInternalReasoningGeneratorOutput,
+    batch_size: int,
+    pad_token_id: int,
+    eos_token_id: int,
+    tokenizer: Tokenizer,
+) -> list[str]:
+    output_strs: list[str] = []
+    for b in range(batch_size):
+        all_ids: list[int] = []
+        nc = gen_output.n_cycles[b].item()
+        for c in range(nc):
+            tlen = gen_output.hard_token_lengths[b, c].item()
+            for t in range(tlen):
+                tid = gen_output.hard_token_ids[b, c, t].item()
+                if tid != pad_token_id and tid != eos_token_id:
+                    all_ids.append(tid)
+        output_strs.append(tokenizer.decode(all_ids) if all_ids else "")
+    return output_strs
 
 
 def get_batch(env: Env, batch_size: int) -> list[EnvResponse]:
@@ -492,17 +514,9 @@ def generate_variable_length_internal_reasoning_rollout_batch(
     if was_training:
         net.train()
 
-    output_strs: list[str] = []
-    for b in range(batch_size):
-        all_ids: list[int] = []
-        nc = gen_output.n_cycles[b].item()
-        for c in range(nc):
-            tlen = gen_output.hard_token_lengths[b, c].item()
-            for t in range(tlen):
-                tid = gen_output.hard_token_ids[b, c, t].item()
-                if tid != pad_token_id and tid != eos_token_id:
-                    all_ids.append(tid)
-        output_strs.append(tokenizer.decode(all_ids) if all_ids else "")
+    output_strs = decode_variable_length_gen_output(
+        gen_output, batch_size, pad_token_id, eos_token_id, tokenizer
+    )
 
     reward_results: list[RewardResult] = [
         reward_fn(

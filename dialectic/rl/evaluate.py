@@ -7,13 +7,13 @@ from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import (
-    VariableLengthInternalReasoningGeneratorOutput,
     generate_variable_length_internal_reasoning_tokens,
     generate_with_soft_prefill,
 )
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
+    decode_variable_length_gen_output,
     generate_internal_reasoning_rollout_batch,
     generate_rollout_batch,
     generate_variable_length_internal_reasoning_rollout_batch,
@@ -515,27 +515,6 @@ def evaluate_variable_length_internal_reasoning(
     ), examples
 
 
-def _decode_gen_output(
-    gen_output: VariableLengthInternalReasoningGeneratorOutput,
-    batch_size: int,
-    pad_token_id: int,
-    eos_token_id: int,
-    tokenizer: Tokenizer,
-) -> list[str]:
-    output_strs: list[str] = []
-    for b in range(batch_size):
-        all_ids: list[int] = []
-        nc = gen_output.n_cycles[b].item()
-        for c in range(nc):
-            tlen = gen_output.hard_token_lengths[b, c].item()
-            for t in range(tlen):
-                tid = gen_output.hard_token_ids[b, c, t].item()
-                if tid != pad_token_id and tid != eos_token_id:
-                    all_ids.append(tid)
-        output_strs.append(tokenizer.decode(all_ids) if all_ids else "")
-    return output_strs
-
-
 @torch.no_grad()
 def _compute_pass_at_k(
     *,
@@ -593,7 +572,7 @@ def _compute_pass_at_k(
                 think_token_id=think_token_id,
             )
 
-            output_strs = _decode_gen_output(
+            output_strs = decode_variable_length_gen_output(
                 gen_output, current_batch_size, pad_token_id, eos_token_id, tokenizer
             )
 
