@@ -239,7 +239,7 @@ class CountdownEnv(Env[Countdown, None]):
             q = a // b
             if q > 0:
                 ops.append(("/", q, a, b))
-        if a != 0 and b % a == 0:
+        if a != b and a != 0 and b % a == 0:
             q = b // a
             if q > 0:
                 ops.append(("/", q, b, a))
