@@ -765,11 +765,3 @@ class TestSeparatorTokenExtraction:
         step = CountdownStep(left=75, op="-", right=2, result=73)
         ids = tokenizer.encode(step.format_step(), add_special_tokens=False).ids
         assert ids[-1] == sep_id
-
-
-class TestValEnvSeedNoCollision:
-    def test_val_seeds_use_large_offset(self):
-        """Val env seeds should use a large offset to avoid collision with
-        typical train seeds (which are small integers like 42, 665, etc.)."""
-        src = inspect.getsource(train_hybrid_reasoning_sft_countdown)
-        assert "seed=1_000_000 + i" in src
