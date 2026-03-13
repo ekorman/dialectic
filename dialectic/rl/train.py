@@ -2118,7 +2118,7 @@ def train_variable_length_internal_reasoning_grpo(
     save_ckpt_freq: int = sys.maxsize,
     val_freq: int,
     val_episodes: int,
-    val_envs: list[Env],
+    val_envs: Sequence[Env],
     val_batch_size: int,
     think_token_id: int | None,
     pass_at_k_samples: int = 0,
