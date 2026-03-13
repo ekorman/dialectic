@@ -7,6 +7,7 @@ from dialectic.experiments.envs import (
     get_maze_env_reward_fn_extractor_val_envs,
     get_state_to_str,
 )
+from dialectic.experiments.launchers import extract_separator_token_id
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     CountdownParams,
@@ -22,7 +23,7 @@ from dialectic.experiments.prompts import (
     PromptCollection,
 )
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
-from dialectic.rl.env import CountdownEnv, CountdownStep, Env
+from dialectic.rl.env import CountdownEnv, Env
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn, countdown_hybrid_correct, weighted_reward
 from dialectic.rl.train import (
@@ -140,17 +141,6 @@ def train_hybrid_reasoning_sft_maze(
     )
 
 
-def _extract_separator_token_id(tokenizer: Tokenizer) -> int:
-    """Extract the separator token from a sample training step.
-
-    Derives the token from the same format used in training
-    (``CountdownStep.format_step()``) so it is guaranteed to match.
-    """
-    sample = CountdownStep(left=1, op="+", right=2, result=3).format_step()
-    ids = tokenizer.encode(sample, add_special_tokens=False).ids
-    return ids[-1]
-
-
 @extty.experiment(project="hybrid-reasoning-sft-countdown")
 def train_hybrid_reasoning_sft_countdown(
     train_params: TrainParams,
@@ -185,7 +175,7 @@ def train_hybrid_reasoning_sft_countdown(
     )
     tokenizer = model_info.load_tokenizer()
 
-    separator_token_id = _extract_separator_token_id(tokenizer)
+    separator_token_id = extract_separator_token_id(tokenizer)
 
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,
