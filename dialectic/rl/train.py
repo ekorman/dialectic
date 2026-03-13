@@ -1923,13 +1923,11 @@ def make_variable_length_per_cycle_backward_callback(
     """
     advs_bg = advs.squeeze(-1)  # [B, G]
     if normalize_by_sequence_length:
-        seq_lengths = torch.zeros(B, G, device=advs.device)
-        for b in range(B):
-            for g in range(G):
-                nc = n_cycles[b, g].item()
-                seq_lengths[b, g] = (
-                    hard_token_lengths[b, g, :nc].sum().clamp(min=1).float()
-                )
+        C = hard_token_lengths.shape[2]
+        cycle_mask = torch.arange(C, device=advs.device).unsqueeze(0).unsqueeze(
+            0
+        ) < n_cycles.unsqueeze(-1)
+        seq_lengths = (hard_token_lengths * cycle_mask).sum(dim=-1).clamp(min=1).float()
     else:
         seq_lengths = torch.ones(B, G, device=advs.device)
 
@@ -2740,10 +2738,13 @@ def make_variable_length_sft_per_cycle_backward_callback(
     (not cycle count).
     """
     if normalize_by_sequence_length:
-        total_tokens = torch.zeros(B, device=completion_mask.device)
-        for b in range(B):
-            nc = n_cycles[b].item()
-            total_tokens[b] = hard_token_lengths[b, :nc].sum().clamp(min=1).float()
+        C = hard_token_lengths.shape[1]
+        cycle_mask = torch.arange(C, device=completion_mask.device).unsqueeze(
+            0
+        ) < n_cycles.unsqueeze(-1)
+        total_tokens = (
+            (hard_token_lengths * cycle_mask).sum(dim=-1).clamp(min=1).float()
+        )
     else:
         total_tokens = torch.ones(B, device=completion_mask.device)
 
