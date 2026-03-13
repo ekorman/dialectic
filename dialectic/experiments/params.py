@@ -57,6 +57,7 @@ class HybridReasoningParams:
     soft_block_size: int
     soft_bptt_window: int
     max_cycles: int
+    max_tokens_per_cycle: int
     soft_projection: bool = False
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
