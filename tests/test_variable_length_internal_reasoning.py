@@ -739,10 +739,11 @@ class TestValEnvsListLengthValidation:
                 multistep_sft_params=MultiStepSFTParams(
                     normalize_by_sequence_length=True
                 ),
-                hr_params=HybridReasoningParams(
+                hybrid_reasoning_params=HybridReasoningParams(
                     soft_block_size=2,
                     soft_bptt_window=2,
                     max_cycles=5,
+                    max_tokens_per_cycle=5,
                 ),
                 countdown_params=CountdownParams(
                     n_ops=[3, 4],
