@@ -108,7 +108,7 @@ def _train_internal_reasoning_multi_step_sft(
     )
 
 
-@extty.experiment(project="sft-hybrid-reasoning-maze")
+@extty.experiment(project="hybrid-reasoning-sft-maze")
 def train_hybrid_reasoning_sft_maze(
     train_params: TrainParams,
     multistep_sft_params: MultiStepSFTParams,
@@ -151,7 +151,7 @@ def _extract_separator_token_id(tokenizer: Tokenizer) -> int:
     return ids[-1]
 
 
-@extty.experiment(project="sft-hybrid-reasoning-countdown")
+@extty.experiment(project="hybrid-reasoning-sft-countdown")
 def train_hybrid_reasoning_sft_countdown(
     train_params: TrainParams,
     multistep_sft_params: MultiStepSFTParams,
