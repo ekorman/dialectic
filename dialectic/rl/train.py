@@ -1555,6 +1555,7 @@ def make_per_cycle_backward_callback(
     eps: float | None,
     normalize_by_sequence_length: bool,
     loss_scale: float,
+    clip_ratio_c: float = 3.0,
 ) -> Callable[[Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]]:
     """Build a cycle_callback that computes per-cycle GRPO loss and calls backward.
 
@@ -1578,7 +1579,7 @@ def make_per_cycle_backward_callback(
             unclipped = ratio * advs_bg
             clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs_bg
             main_obj = torch.min(unclipped, clipped)
-            dual_clip_obj = 3.0 * advs_bg
+            dual_clip_obj = clip_ratio_c * advs_bg
             main_obj = torch.where(
                 advs_bg < 0, torch.max(main_obj, dual_clip_obj), main_obj
             )
@@ -1771,6 +1772,7 @@ def train_internal_reasoning_grpo(
     val_envs: list[Env],
     val_batch_size: int,
     think_token_id: int | None,
+    clip_ratio_c: float = 3.0,
     warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
@@ -1826,6 +1828,7 @@ def train_internal_reasoning_grpo(
                 eps=eps,
                 normalize_by_sequence_length=normalize_by_sequence_length,
                 loss_scale=mb.get("_loss_scale", 1.0),
+                clip_ratio_c=clip_ratio_c,
             )
         log_probs, mask = compute_internal_reasoning_log_probs(
             net=net,
@@ -1934,6 +1937,7 @@ def make_variable_length_per_cycle_backward_callback(
     eps: float | None,
     normalize_by_sequence_length: bool,
     loss_scale: float,
+    clip_ratio_c: float = 3.0,
 ) -> Callable[[Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]]:
     """Build a cycle_callback for variable-length GRPO that calls backward per cycle.
 
@@ -1961,7 +1965,7 @@ def make_variable_length_per_cycle_backward_callback(
             unclipped = ratio * advs_bg
             clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs_bg
             main_obj = torch.min(unclipped, clipped)
-            dual_clip_obj = 3.0 * advs_bg
+            dual_clip_obj = clip_ratio_c * advs_bg
             main_obj = torch.where(
                 advs_bg < 0, torch.max(main_obj, dual_clip_obj), main_obj
             )
@@ -2140,6 +2144,7 @@ def train_variable_length_internal_reasoning_grpo(
     think_token_id: int | None,
     pass_at_k_samples: int = 0,
     pass_at_k_temperature: float = 0.7,
+    clip_ratio_c: float = 3.0,
     warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
@@ -2189,6 +2194,7 @@ def train_variable_length_internal_reasoning_grpo(
                 eps=eps,
                 normalize_by_sequence_length=normalize_by_sequence_length,
                 loss_scale=mb.get("_loss_scale", 1.0),
+                clip_ratio_c=clip_ratio_c,
             )
         log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
             net=net,
