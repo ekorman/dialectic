@@ -1097,6 +1097,7 @@ def generate_variable_length_internal_reasoning_tokens(
     attention_mask: Bool[Tensor, "B L"] | None = None,
     use_bf16: bool = False,
     think_token_id: int | None = None,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> VariableLengthInternalReasoningGeneratorOutput:
     device = token_ids.device
     B = token_ids.shape[0]
@@ -1123,6 +1124,11 @@ def generate_variable_length_internal_reasoning_tokens(
     hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
     finished = torch.zeros(B, dtype=torch.bool, device=device)
     n_cycles = torch.full((B,), max_cycles, dtype=torch.long, device=device)
+
+    valid_mask: Tensor | None = None
+    if valid_hard_token_ids is not None:
+        valid_mask = torch.full((net.vocab_size,), float("-inf"), device=device)
+        valid_mask[valid_hard_token_ids] = 0.0
 
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -1161,6 +1167,8 @@ def generate_variable_length_internal_reasoning_tokens(
 
         for t in range(max_tokens_per_cycle):
             logits_squeezed = logits.squeeze(1).float()
+            if valid_mask is not None:
+                logits_squeezed = logits_squeezed + valid_mask.unsqueeze(0)
             if temperature > 0:
                 probs = torch.softmax(logits_squeezed / temperature, dim=-1)
                 token = torch.multinomial(probs, num_samples=1).squeeze(1)

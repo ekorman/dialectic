@@ -2009,6 +2009,7 @@ def collect_variable_length_internal_reasoning_micro_batch(
     use_bf16: bool = False,
     soft_bptt_window: int | None = None,
     think_token_id: int | None = None,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> dict:
     rollout = generate_grouped_variable_length_internal_reasoning_rollout_batch(
         net=net,
@@ -2027,6 +2028,7 @@ def collect_variable_length_internal_reasoning_micro_batch(
         max_tokens_per_cycle=max_tokens_per_cycle,
         use_bf16=use_bf16,
         think_token_id=think_token_id,
+        valid_hard_token_ids=valid_hard_token_ids,
     )
 
     stacked_hard_ids, stacked_lengths, stacked_n_cycles = (
@@ -2055,6 +2057,7 @@ def collect_variable_length_internal_reasoning_micro_batch(
                 soft_block_size=soft_block_size,
                 use_bf16=use_bf16,
                 think_token_id=think_token_id,
+                valid_hard_token_ids=valid_hard_token_ids,
             )
         else:
             ref_log_probs = None
@@ -2072,6 +2075,7 @@ def collect_variable_length_internal_reasoning_micro_batch(
                     use_bf16=use_bf16,
                     soft_bptt_window=soft_bptt_window,
                     think_token_id=think_token_id,
+                    valid_hard_token_ids=valid_hard_token_ids,
                 )
             )
         else:
@@ -2146,6 +2150,7 @@ def train_variable_length_internal_reasoning_grpo(
     pass_at_k_temperature: float = 0.7,
     clip_ratio_c: float = 3.0,
     warmup_steps: int = 0,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2173,6 +2178,7 @@ def train_variable_length_internal_reasoning_grpo(
             use_bf16=use_bf16,
             soft_bptt_window=soft_bptt_window,
             think_token_id=think_token_id,
+            valid_hard_token_ids=valid_hard_token_ids,
         )
 
     def recompute_fn(
@@ -2204,6 +2210,7 @@ def train_variable_length_internal_reasoning_grpo(
             hard_token_lengths=mb["hard_token_lengths"],
             n_cycles=mb["n_cycles"],
             soft_block_size=soft_block_size,
+            valid_hard_token_ids=valid_hard_token_ids,
             use_bf16=use_bf16,
             soft_bptt_window=soft_bptt_window,
             cycle_callback=callback,
@@ -2230,6 +2237,7 @@ def train_variable_length_internal_reasoning_grpo(
         think_token_id=think_token_id,
         pass_at_k_samples=pass_at_k_samples,
         pass_at_k_temperature=pass_at_k_temperature,
+        valid_hard_token_ids=valid_hard_token_ids,
     )
 
     _grpo_train_loop(
@@ -2961,6 +2969,7 @@ def create_variable_length_internal_reasoning_sft_val_fn(
     think_token_id: int | None,
     pass_at_k_samples: int = 0,
     pass_at_k_temperature: float = 0.7,
+    valid_hard_token_ids: list[int] | None = None,
 ):
     def _val(env: Env):
         from dialectic.rl.evaluate import evaluate_variable_length_internal_reasoning
@@ -2985,6 +2994,7 @@ def create_variable_length_internal_reasoning_sft_val_fn(
             think_token_id=think_token_id,
             pass_at_k_samples=pass_at_k_samples,
             pass_at_k_temperature=pass_at_k_temperature,
+            valid_hard_token_ids=valid_hard_token_ids,
         )
 
     return _val

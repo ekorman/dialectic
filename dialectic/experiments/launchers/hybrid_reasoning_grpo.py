@@ -54,6 +54,23 @@ def _get_valid_hard_token_ids_and_move_id_to_name(
     return valid_hard_token_ids, move_id_to_name
 
 
+def _get_valid_countdown_hard_token_ids(
+    tokenizer: Tokenizer,
+    separator_token_id: int,
+    eos_token_id: int,
+) -> list[int]:
+    allowed_chars = set("0123456789+-*/() =\n ")
+    valid: set[int] = set()
+    vocab = tokenizer.get_vocab()
+    for _, token_id in vocab.items():
+        decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+        if decoded and all(ch in allowed_chars for ch in decoded):
+            valid.add(token_id)
+    valid.add(separator_token_id)
+    valid.add(eos_token_id)
+    return sorted(valid)
+
+
 def _train_hybrid_reasoning_grpo(
     *,
     train_params: TrainParams,
@@ -211,6 +228,12 @@ def train_hybrid_reasoning_grpo_countdown(
 
     separator_token_id = extract_separator_token_id(tokenizer)
 
+    valid_hard_token_ids = _get_valid_countdown_hard_token_ids(
+        tokenizer=tokenizer,
+        separator_token_id=separator_token_id,
+        eos_token_id=model_info.eos_token_id,
+    )
+
     prompt_collection = COUNTDOWN_INTERNAL_REASONING_PROMPT
 
     state_to_str = get_state_to_str(
@@ -276,6 +299,7 @@ def train_hybrid_reasoning_grpo_countdown(
         pass_at_k_samples=hybrid_reasoning_params.pass_at_k_samples,
         pass_at_k_temperature=hybrid_reasoning_params.pass_at_k_temperature,
         warmup_steps=train_params.warmup_steps,
+        valid_hard_token_ids=valid_hard_token_ids,
     )
 
 

@@ -1006,6 +1006,266 @@ class TestMakeVariableLengthPerCycleBackwardCallback:
         assert lp.grad.item() == 0.0
 
 
+SEPARATOR_TOKEN_ID = 999
+ARITHMETIC_TOKEN_IDS = list(range(15, 25)) + [7, 8, 9, 10, 12, 14, 28, 198, 220]
+VALID_COUNTDOWN_TOKEN_IDS = ARITHMETIC_TOKEN_IDS + [SEPARATOR_TOKEN_ID, EOS_TOKEN_ID]
+
+
+class TestConstrainedDecodingVariableLength:
+    def test_all_hard_tokens_in_allowlist(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 3, 8
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=SEPARATOR_TOKEN_ID,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+            valid_hard_token_ids=VALID_COUNTDOWN_TOKEN_IDS,
+        )
+
+        allowed = set(VALID_COUNTDOWN_TOKEN_IDS) | {PAD_TOKEN_ID}
+        for b in range(B):
+            nc = out.n_cycles[b].item()
+            for c in range(nc):
+                tlen = out.hard_token_lengths[b, c].item()
+                for t in range(tlen):
+                    tok = out.hard_token_ids[b, c, t].item()
+                    assert tok in allowed, (
+                        f"Token {tok} at b={b} c={c} t={t} not in allowlist"
+                    )
+
+    def test_unconstrained_produces_out_of_set_tokens(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 3, 8
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=SEPARATOR_TOKEN_ID,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+        )
+
+        allowed = set(VALID_COUNTDOWN_TOKEN_IDS) | {PAD_TOKEN_ID}
+        all_tokens = set()
+        for b in range(B):
+            nc = out.n_cycles[b].item()
+            for c in range(nc):
+                tlen = out.hard_token_lengths[b, c].item()
+                for t in range(tlen):
+                    all_tokens.add(out.hard_token_ids[b, c, t].item())
+        assert not all_tokens.issubset(allowed), (
+            "Unconstrained generation should produce tokens outside the arithmetic set"
+        )
+
+    def test_constrained_output_shapes_unchanged(self, tiny_model):
+        torch.manual_seed(42)
+        B, L = 2, 10
+        token_ids = torch.randint(0, 100, (B, L))
+
+        out = generate_variable_length_internal_reasoning_tokens(
+            net=tiny_model,
+            token_ids=token_ids,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            separator_token_id=SEPARATOR_TOKEN_ID,
+            done_token_id=EOS_TOKEN_ID,
+            pad_token_id=PAD_TOKEN_ID,
+            temperature=1.0,
+            valid_hard_token_ids=VALID_COUNTDOWN_TOKEN_IDS,
+        )
+
+        assert out.hard_token_ids.shape == (B, MAX_CYCLES, MAX_TOKENS_PER_CYCLE)
+        assert out.hard_token_lengths.shape == (B, MAX_CYCLES)
+        assert out.n_cycles.shape == (B,)
+
+    def test_constrained_log_probs_valid_mask(self, tiny_model):
+        torch.manual_seed(42)
+        tiny_model.train()
+
+        B, G, C, T_max = 2, 1, 3, 4
+        L = 6
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+        hard_ids = torch.randint(0, len(ARITHMETIC_TOKEN_IDS), (B, G, C, T_max))
+        for i in range(B):
+            for g in range(G):
+                for c in range(C):
+                    for t in range(T_max):
+                        hard_ids[i, g, c, t] = ARITHMETIC_TOKEN_IDS[
+                            hard_ids[i, g, c, t].item()
+                        ]
+        hard_lengths = torch.tensor([[[3, 2, 4]], [[4, 3, 2]]])
+        n_cycles = torch.tensor([[3], [3]])
+
+        log_probs, mask = compute_variable_length_internal_reasoning_log_probs(
+            net=tiny_model,
+            prompt_token_ids=prompt_ids,
+            attention_mask=attention_mask,
+            hard_token_ids=hard_ids,
+            hard_token_lengths=hard_lengths,
+            n_cycles=n_cycles,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            valid_hard_token_ids=VALID_COUNTDOWN_TOKEN_IDS,
+        )
+
+        assert log_probs.shape == (B, G, C)
+        assert (log_probs[mask] <= 0).all()
+        assert torch.isfinite(log_probs[mask]).all()
+
+    def test_constrained_rollout_tokens_in_allowlist(self, tiny_model, tokenizer, env):
+        from dialectic.rl.rollout import (
+            generate_variable_length_internal_reasoning_rollout_batch,
+        )
+
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        sep_id = extract_separator_token_id(tokenizer)
+
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=model_info.eos_token_id,
+        )
+
+        rollout = generate_variable_length_internal_reasoning_rollout_batch(
+            net=tiny_model,
+            env=env,
+            reward_fn=weighted_reward([("correct", 1.0, countdown_hybrid_correct)]),
+            state_to_str=lambda data: data.prompt,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            separator_token_id=sep_id,
+            batch_size=2,
+            temperature=1.0,
+            soft_block_size=SOFT_BLOCK_SIZE,
+            max_cycles=MAX_CYCLES,
+            max_tokens_per_cycle=MAX_TOKENS_PER_CYCLE,
+            valid_hard_token_ids=valid_ids,
+        )
+
+        allowed = set(valid_ids) | {model_info.pad_token_id}
+        for b in range(2):
+            nc = rollout.n_cycles[b].item()
+            for c in range(nc):
+                tlen = rollout.hard_token_lengths[b, c].item()
+                for t in range(tlen):
+                    tok = rollout.hard_token_ids[b, c, t].item()
+                    assert tok in allowed
+
+
+class TestGetValidCountdownHardTokenIds:
+    def test_includes_digit_tokens(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+
+        for digit in "0123456789":
+            token_id = tokenizer.encode(digit, add_special_tokens=False).ids[0]
+            assert token_id in valid_ids
+
+    def test_includes_operator_tokens(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+
+        for op in ["+", "-", "*", "/", "=", "(", ")"]:
+            token_id = tokenizer.encode(op, add_special_tokens=False).ids[0]
+            assert token_id in valid_ids
+
+    def test_includes_separator_and_eos(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+
+        assert sep_id in valid_ids
+        assert EOS_TOKEN_ID in valid_ids
+
+    def test_excludes_alpha_tokens(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+        valid_set = set(valid_ids)
+
+        for word in ["hello", "the", "print"]:
+            token_id = tokenizer.encode(word, add_special_tokens=False).ids[0]
+            assert token_id not in valid_set
+
+    def test_is_sorted(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+
+        assert valid_ids == sorted(valid_ids)
+
+    def test_vocab_reduction(self, tokenizer):
+        from dialectic.experiments.launchers.hybrid_reasoning_grpo import (
+            _get_valid_countdown_hard_token_ids,
+        )
+
+        sep_id = extract_separator_token_id(tokenizer)
+        valid_ids = _get_valid_countdown_hard_token_ids(
+            tokenizer=tokenizer,
+            separator_token_id=sep_id,
+            eos_token_id=EOS_TOKEN_ID,
+        )
+
+        full_vocab_size = len(tokenizer.get_vocab())
+        assert len(valid_ids) < full_vocab_size / 10
+
+
 class TestGroupedVariableLengthRolloutBatch:
     def test_rollout_shapes_and_grouping(self, tiny_model, tokenizer, env):
         from dialectic.rl.rollout import (

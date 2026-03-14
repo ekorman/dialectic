@@ -425,6 +425,7 @@ def evaluate_variable_length_internal_reasoning(
     think_token_id: int | None = None,
     pass_at_k_samples: int = 0,
     pass_at_k_temperature: float = 0.7,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> tuple[EvaluationResult, list[extty.Example]]:
     all_rewards: list[float] = []
     all_reward_results: list[dict[str, float]] = []
@@ -451,6 +452,7 @@ def evaluate_variable_length_internal_reasoning(
             max_tokens_per_cycle=max_tokens_per_cycle,
             use_bf16=use_bf16,
             think_token_id=think_token_id,
+            valid_hard_token_ids=valid_hard_token_ids,
         )
 
         for b in range(current_batch_size):
@@ -494,6 +496,7 @@ def evaluate_variable_length_internal_reasoning(
             temperature=pass_at_k_temperature,
             use_bf16=use_bf16,
             think_token_id=think_token_id,
+            valid_hard_token_ids=valid_hard_token_ids,
         )
         component_means.update(pass_at_k_metrics)
 
@@ -535,6 +538,7 @@ def _compute_pass_at_k(
     temperature: float,
     use_bf16: bool,
     think_token_id: int | None,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> dict[str, float]:
     device = next(net.parameters()).device
     any_correct: list[bool] = []
@@ -570,6 +574,7 @@ def _compute_pass_at_k(
                 attention_mask=attention_mask,
                 use_bf16=use_bf16,
                 think_token_id=think_token_id,
+                valid_hard_token_ids=valid_hard_token_ids,
             )
 
             output_strs = decode_variable_length_gen_output(

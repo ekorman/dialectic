@@ -480,6 +480,7 @@ def generate_variable_length_internal_reasoning_rollout_batch(
     max_tokens_per_cycle: int = 20,
     use_bf16: bool = False,
     think_token_id: int | None = None,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> VariableLengthInternalReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -509,6 +510,7 @@ def generate_variable_length_internal_reasoning_rollout_batch(
         attention_mask=attention_mask,
         use_bf16=use_bf16,
         think_token_id=think_token_id,
+        valid_hard_token_ids=valid_hard_token_ids,
     )
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
@@ -578,6 +580,7 @@ def generate_grouped_variable_length_internal_reasoning_rollout_batch(
     max_tokens_per_cycle: int = 20,
     use_bf16: bool = False,
     think_token_id: int | None = None,
+    valid_hard_token_ids: list[int] | None = None,
 ) -> GroupedVariableLengthInternalReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -610,6 +613,7 @@ def generate_grouped_variable_length_internal_reasoning_rollout_batch(
         attention_mask=expanded_attention_mask,
         use_bf16=use_bf16,
         think_token_id=think_token_id,
+        valid_hard_token_ids=valid_hard_token_ids,
     )
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
