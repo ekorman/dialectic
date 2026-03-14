@@ -97,6 +97,7 @@ def _train_soft_grpo(
         val_envs=val_envs,
         noise_std=soft_grpo_params.noise_std,
         normalize_soft_pdf_by_dim=soft_grpo_params.normalize_soft_pdf_by_dim,
+        warmup_steps=train_params.warmup_steps,
     )
 
 

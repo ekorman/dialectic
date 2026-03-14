@@ -451,10 +451,17 @@ def create_grpo_step_fn(
     use_bf16: bool,
     device: torch.device,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
+    warmup_steps: int = 0,
 ):
     if mu > 1 and eps is None:
         raise RuntimeError(
             "Should not have `mu` > 1 when not doing PPO style training."
+        )
+
+    scheduler = None
+    if warmup_steps > 0:
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
         )
 
     ref_net = None
@@ -543,8 +550,11 @@ def create_grpo_step_fn(
                     params, max_norm=max_grad_norm
                 ).item()
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
         t_opt = time.perf_counter() - t_opt_start
+        current_lr = opt.param_groups[0]["lr"]
 
         all_output_strs_nested: list[list[str]] = [
             [mb["output_strs"][g][b] for g in range(group_size)]
@@ -592,6 +602,7 @@ def create_grpo_step_fn(
             "train/generation_time": t_gen_total,
             "train/logprobs_time": t_logprobs_total,
             "train/optimization_time": t_opt,
+            "train/lr": current_lr,
             **(
                 {
                     "train/hard_completion_ratio": sum(
@@ -711,6 +722,7 @@ def _grpo_train_loop(
     val_fn,
     val_envs: list[Env],
     val_freq: int = 0,
+    warmup_steps: int = 0,
 ) -> None:
     device = next(net.parameters()).device
 
@@ -731,6 +743,7 @@ def _grpo_train_loop(
         use_bf16=use_bf16,
         device=device,
         advantage_fn=advantage_fn,
+        warmup_steps=warmup_steps,
     )
 
     train_loop(
@@ -776,6 +789,7 @@ def train_grpo(
     val_envs: list[Env],
     val_batch_size: int,
     val_freq: int = 0,
+    warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -847,6 +861,7 @@ def train_grpo(
         val_freq=val_freq,
         val_envs=val_envs,
         val_fn=val_fn,
+        warmup_steps=warmup_steps,
     )
 
 
@@ -1238,6 +1253,7 @@ def train_soft_grpo(
     val_envs: list[Env],
     val_batch_size: int,
     val_freq: int = 0,
+    warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -1321,6 +1337,7 @@ def train_soft_grpo(
         val_freq=val_freq,
         val_fn=val_fn,
         val_envs=val_envs,
+        warmup_steps=warmup_steps,
     )
 
 
@@ -1754,6 +1771,7 @@ def train_internal_reasoning_grpo(
     val_envs: list[Env],
     val_batch_size: int,
     think_token_id: int | None,
+    warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -1864,6 +1882,7 @@ def train_internal_reasoning_grpo(
         val_envs=val_envs,
         val_freq=val_freq,
         val_fn=val_fn,
+        warmup_steps=warmup_steps,
     )
 
 
@@ -2121,6 +2140,7 @@ def train_variable_length_internal_reasoning_grpo(
     think_token_id: int | None,
     pass_at_k_samples: int = 0,
     pass_at_k_temperature: float = 0.7,
+    warmup_steps: int = 0,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -2227,6 +2247,7 @@ def train_variable_length_internal_reasoning_grpo(
         val_envs=val_envs,
         val_freq=val_freq,
         val_fn=val_fn,
+        warmup_steps=warmup_steps,
     )
 
 

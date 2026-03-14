@@ -23,6 +23,7 @@ class TrainParams:
     start_ckpt_step: int | None = None
     save_ckpt_freq: int = sys.maxsize
     logprob_chunk_size: int = 64
+    warmup_steps: int = 0
 
 
 @dataclass
@@ -83,6 +84,7 @@ class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
     n_ops: int | list[int]
+    prompt: str | None = None
 
 
 @dataclass
