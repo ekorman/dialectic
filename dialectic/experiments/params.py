@@ -84,7 +84,6 @@ class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
     n_ops: int | list[int]
-    prompt: str | None = None
 
 
 @dataclass

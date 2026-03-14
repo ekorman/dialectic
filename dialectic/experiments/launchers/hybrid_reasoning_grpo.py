@@ -27,11 +27,7 @@ from dialectic.experiments.prompts import (
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
 from dialectic.rl.env import CountdownEnv, Env
 from dialectic.rl.maze import MazeConfig
-from dialectic.rl.reward import (
-    RewardFn,
-    countdown_hybrid_correct,
-    weighted_reward,
-)
+from dialectic.rl.reward import RewardFn, countdown_hybrid_correct, weighted_reward
 from dialectic.rl.train import (
     grpo_advantage,
     rloo_advantage,
@@ -136,6 +132,7 @@ def _train_hybrid_reasoning_grpo(
         val_episodes=train_params.val_episodes,
         val_freq=train_params.val_freq,
         val_envs=val_envs,
+        warmup_steps=train_params.warmup_steps,
     )
 
 
@@ -278,6 +275,7 @@ def train_hybrid_reasoning_grpo_countdown(
         val_envs=val_envs,
         pass_at_k_samples=hybrid_reasoning_params.pass_at_k_samples,
         pass_at_k_temperature=hybrid_reasoning_params.pass_at_k_temperature,
+        warmup_steps=train_params.warmup_steps,
     )
 
 
