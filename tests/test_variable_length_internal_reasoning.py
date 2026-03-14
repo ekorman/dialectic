@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from dialectic.experiments.launchers import extract_separator_token_id
 from dialectic.experiments.launchers.multi_step_hybrid_reasoning_sft import (
-    _extract_separator_token_id,
     train_hybrid_reasoning_sft_countdown,
 )
 from dialectic.experiments.params import (
@@ -23,7 +23,9 @@ from dialectic.rl.env import (
 from dialectic.rl.reward import countdown_hybrid_correct, weighted_reward
 from dialectic.rl.train import (
     compute_variable_length_internal_reasoning_log_probs,
+    make_variable_length_per_cycle_backward_callback,
     make_variable_length_sft_per_cycle_backward_callback,
+    stack_and_pad_variable_length_internal_reasoning,
 )
 from dialectic.rl.types import EnvResponse
 
@@ -739,10 +741,11 @@ class TestValEnvsListLengthValidation:
                 multistep_sft_params=MultiStepSFTParams(
                     normalize_by_sequence_length=True
                 ),
-                hr_params=HybridReasoningParams(
+                hybrid_reasoning_params=HybridReasoningParams(
                     soft_block_size=2,
                     soft_bptt_window=2,
                     max_cycles=5,
+                    max_tokens_per_cycle=5,
                 ),
                 countdown_params=CountdownParams(
                     n_ops=[3, 4],
@@ -801,8 +804,261 @@ class TestSeparatorTokenExtraction:
         model_info = MODEL_REGISTRY["qwen3-0.6b"]
         tokenizer = model_info.load_tokenizer()
 
-        sep_id = _extract_separator_token_id(tokenizer)
+        sep_id = extract_separator_token_id(tokenizer)
 
         step = CountdownStep(left=75, op="-", right=2, result=73)
         ids = tokenizer.encode(step.format_step(), add_special_tokens=False).ids
         assert ids[-1] == sep_id
+
+
+class TestStackAndPadVariableLengthInternalReasoning:
+    def test_output_shapes(self):
+        B, G = 2, 3
+        C_vals = [4, 3, 5]
+        T_vals = [6, 8, 7]
+        pad_id = 0
+
+        hard_token_ids = [
+            torch.randint(1, 100, (B, C_vals[g], T_vals[g])) for g in range(G)
+        ]
+        hard_token_lengths = [
+            torch.randint(1, T_vals[g] + 1, (B, C_vals[g])) for g in range(G)
+        ]
+        n_cycles = [torch.tensor([C_vals[g], C_vals[g] - 1]) for g in range(G)]
+
+        stacked_ids, stacked_lengths, stacked_n = (
+            stack_and_pad_variable_length_internal_reasoning(
+                hard_token_ids, hard_token_lengths, n_cycles, pad_id
+            )
+        )
+
+        max_c = max(C_vals)
+        max_t = max(T_vals)
+        assert stacked_ids.shape == (B, G, max_c, max_t)
+        assert stacked_lengths.shape == (B, G, max_c)
+        assert stacked_n.shape == (B, G)
+
+    def test_padding_fills_with_pad_token(self):
+        B = 1
+        pad_id = -1
+        ids_0 = torch.ones(B, 2, 3, dtype=torch.long) * 10
+        ids_1 = torch.ones(B, 3, 5, dtype=torch.long) * 20
+        lengths_0 = torch.tensor([[2, 1]])
+        lengths_1 = torch.tensor([[3, 4, 2]])
+        n_0 = torch.tensor([2])
+        n_1 = torch.tensor([3])
+
+        stacked_ids, stacked_lengths, stacked_n = (
+            stack_and_pad_variable_length_internal_reasoning(
+                [ids_0, ids_1], [lengths_0, lengths_1], [n_0, n_1], pad_id
+            )
+        )
+
+        assert stacked_ids[0, 0, :2, :3].eq(10).all()
+        assert stacked_ids[0, 0, 2:, :].eq(pad_id).all()
+        assert stacked_ids[0, 0, :, 3:].eq(pad_id).all()
+
+        assert stacked_ids[0, 1, :3, :5].eq(20).all()
+
+    def test_n_cycles_preserved(self):
+        B, G = 2, 2
+        pad_id = 0
+        ids = [torch.randint(1, 50, (B, 3, 4)) for _ in range(G)]
+        lengths = [torch.tensor([[3, 2, 1], [4, 3, 2]]) for _ in range(G)]
+        nc = [torch.tensor([3, 2]), torch.tensor([1, 3])]
+
+        _, _, stacked_n = stack_and_pad_variable_length_internal_reasoning(
+            ids, lengths, nc, pad_id
+        )
+
+        assert stacked_n[0, 0] == 3
+        assert stacked_n[0, 1] == 1
+        assert stacked_n[1, 0] == 2
+        assert stacked_n[1, 1] == 3
+
+
+class TestMakeVariableLengthPerCycleBackwardCallback:
+    def test_callback_detaches_output(self):
+        B, G, C = 2, 2, 3
+        advs = torch.randn(B, G, 1)
+        completion_mask = torch.ones(B, G, C, dtype=torch.bool)
+        hard_token_lengths = torch.tensor(
+            [[[3, 4, 2], [5, 3, 1]], [[4, 2, 3], [6, 1, 2]]]
+        )
+        n_cycles = torch.tensor([[3, 3], [3, 3]])
+
+        callback = make_variable_length_per_cycle_backward_callback(
+            B=B,
+            G=G,
+            advs=advs,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            old_log_probs=None,
+            ref_log_probs=None,
+            beta=0.0,
+            eps=None,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+
+        lp = torch.randn(B, G, requires_grad=True)
+        result = callback(lp, 0)
+        assert not result.requires_grad
+
+    def test_normalize_by_sequence_length_values(self):
+        B, G, C = 1, 1, 2
+        advs = torch.ones(B, G, 1)
+        completion_mask = torch.ones(B, G, C, dtype=torch.bool)
+        hard_token_lengths = torch.tensor([[[5, 3]]])
+        n_cycles = torch.tensor([[2]])
+
+        callback_norm = make_variable_length_per_cycle_backward_callback(
+            B=B,
+            G=G,
+            advs=advs,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            old_log_probs=None,
+            ref_log_probs=None,
+            beta=0.0,
+            eps=None,
+            normalize_by_sequence_length=True,
+            loss_scale=1.0,
+        )
+        callback_no_norm = make_variable_length_per_cycle_backward_callback(
+            B=B,
+            G=G,
+            advs=advs,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            old_log_probs=None,
+            ref_log_probs=None,
+            beta=0.0,
+            eps=None,
+            normalize_by_sequence_length=False,
+            loss_scale=1.0,
+        )
+
+        lp_norm = torch.tensor([[-1.0]], requires_grad=True)
+        lp_no_norm = torch.tensor([[-1.0]], requires_grad=True)
+
+        callback_norm(lp_norm, 0)
+        callback_no_norm(lp_no_norm, 0)
+
+        grad_norm = lp_norm.grad.item()
+        grad_no_norm = lp_no_norm.grad.item()
+        assert abs(grad_norm) < abs(grad_no_norm)
+
+    def test_clipped_objective_with_eps(self):
+        B, G, C = 1, 1, 2
+        advs = torch.ones(B, G, 1)
+        completion_mask = torch.ones(B, G, C, dtype=torch.bool)
+        hard_token_lengths = torch.tensor([[[3, 3]]])
+        n_cycles = torch.tensor([[2]])
+        old_log_probs = torch.tensor([[[-1.0, -1.0]]])
+
+        callback = make_variable_length_per_cycle_backward_callback(
+            B=B,
+            G=G,
+            advs=advs,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            old_log_probs=old_log_probs,
+            ref_log_probs=None,
+            beta=0.0,
+            eps=0.2,
+            normalize_by_sequence_length=False,
+            loss_scale=1.0,
+        )
+
+        lp = torch.tensor([[-1.0]], requires_grad=True)
+        result = callback(lp, 0)
+        assert not result.requires_grad
+
+    def test_masks_invalid_cycles(self):
+        B, G = 1, 1
+        advs = torch.ones(B, G, 1)
+        completion_mask = torch.tensor([[[True, False, False]]])
+        hard_token_lengths = torch.tensor([[[5, 0, 0]]])
+        n_cycles = torch.tensor([[1]])
+
+        callback = make_variable_length_per_cycle_backward_callback(
+            B=B,
+            G=G,
+            advs=advs,
+            completion_mask=completion_mask,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+            old_log_probs=None,
+            ref_log_probs=None,
+            beta=0.0,
+            eps=None,
+            normalize_by_sequence_length=False,
+            loss_scale=1.0,
+        )
+
+        lp = torch.tensor([[0.0]], requires_grad=True)
+        callback(lp, 1)
+        assert lp.grad.item() == 0.0
+
+
+class TestGroupedVariableLengthRolloutBatch:
+    def test_rollout_shapes_and_grouping(self, tiny_model, tokenizer, env):
+        from dialectic.rl.rollout import (
+            generate_grouped_variable_length_internal_reasoning_rollout_batch,
+        )
+
+        B, G = 2, 3
+        max_cycles = 4
+        max_tokens_per_cycle = 8
+        soft_block_size = 2
+
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        sep_id = extract_separator_token_id(tokenizer)
+
+        def state_to_str(data):
+            return data.prompt
+
+        reward_fn = weighted_reward([("correct", 1.0, countdown_hybrid_correct)])
+
+        rollout = generate_grouped_variable_length_internal_reasoning_rollout_batch(
+            net=tiny_model,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            separator_token_id=sep_id,
+            batch_size=B,
+            group_size=G,
+            temperature=1.0,
+            soft_block_size=soft_block_size,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+        )
+
+        assert len(rollout.hard_token_ids) == G
+        assert len(rollout.hard_token_lengths) == G
+        assert len(rollout.n_cycles) == G
+        assert len(rollout.output_strs) == G
+        assert len(rollout.reward_results) == G
+
+        for g in range(G):
+            assert rollout.hard_token_ids[g].shape[0] == B
+            assert rollout.hard_token_ids[g].shape[1] == max_cycles
+            assert rollout.hard_token_ids[g].shape[2] == max_tokens_per_cycle
+            assert rollout.hard_token_lengths[g].shape == (B, max_cycles)
+            assert rollout.n_cycles[g].shape == (B,)
+            assert len(rollout.output_strs[g]) == B
+            assert len(rollout.reward_results[g]) == B
+
+        assert rollout.rewards.shape == (G, B)
+        assert rollout.prompt_token_ids.shape[0] == B
+        assert rollout.attention_mask.shape[0] == B
+        assert len(rollout.env_responses) == B
+        assert len(rollout.prompts) == B

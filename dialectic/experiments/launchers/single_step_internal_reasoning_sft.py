@@ -68,7 +68,7 @@ def _train_internal_reasoning_single_step_sft(
     )
 
 
-@extty.experiment(project="sft-internal-reasoning-math")
+@extty.experiment(project="internal-reasoning-sft-math")
 def train_internal_reasoning_sft_math(
     *,
     train_params: TrainParams,

@@ -90,6 +90,7 @@ def _train_grpo(
         val_episodes=train_params.val_episodes,
         val_freq=train_params.val_freq,
         val_envs=val_envs,
+        warmup_steps=train_params.warmup_steps,
     )
 
 

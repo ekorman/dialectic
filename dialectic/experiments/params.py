@@ -23,6 +23,7 @@ class TrainParams:
     start_ckpt_step: int | None = None
     save_ckpt_freq: int = sys.maxsize
     logprob_chunk_size: int = 64
+    warmup_steps: int = 0
 
 
 @dataclass
@@ -60,6 +61,7 @@ class HybridReasoningParams:
     soft_projection: bool = False
     soft_projection_alpha_init: float | None = None
     soft_projection_rank: int | None = None
+    max_tokens_per_cycle: int = 20
     think_token_id: int | None = None
     pass_at_k_samples: int = 0
     pass_at_k_temperature: float = 0.7

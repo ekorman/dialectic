@@ -7,6 +7,7 @@ from dialectic.experiments.envs import (
     get_maze_env_reward_fn_extractor_val_envs,
     get_state_to_str,
 )
+from dialectic.experiments.launchers import extract_separator_token_id
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     CountdownParams,
@@ -22,7 +23,7 @@ from dialectic.experiments.prompts import (
     PromptCollection,
 )
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
-from dialectic.rl.env import CountdownEnv, CountdownStep, Env
+from dialectic.rl.env import CountdownEnv, Env
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn, countdown_hybrid_correct, weighted_reward
 from dialectic.rl.train import (
@@ -53,7 +54,7 @@ def _train_internal_reasoning_multi_step_sft(
     train_params: TrainParams,
     env: Env,
     multistep_sft_params: MultiStepSFTParams,
-    hr_params: HybridReasoningParams,
+    hybrid_reasoning_params: HybridReasoningParams,
     prompt_collection: PromptCollection,
     val_reward_fn: RewardFn,
     val_envs: list[Env],
@@ -61,9 +62,9 @@ def _train_internal_reasoning_multi_step_sft(
     model_info = MODEL_REGISTRY[train_params.model_name]
     net, opt = load_model_and_opt(
         train_params=train_params,
-        soft_projection=hr_params.soft_projection,
-        soft_projection_alpha_init=hr_params.soft_projection_alpha_init,
-        soft_projection_rank=hr_params.soft_projection_rank,
+        soft_projection=hybrid_reasoning_params.soft_projection,
+        soft_projection_alpha_init=hybrid_reasoning_params.soft_projection_alpha_init,
+        soft_projection_rank=hybrid_reasoning_params.soft_projection_rank,
     )
     tokenizer = model_info.load_tokenizer()
 
@@ -89,9 +90,9 @@ def _train_internal_reasoning_multi_step_sft(
         eos_token_id=model_info.eos_token_id,
         move_name_to_id=move_name_to_id,
         valid_hard_token_ids=valid_hard_token_ids,
-        soft_block_size=hr_params.soft_block_size,
-        soft_bptt_window=hr_params.soft_bptt_window,
-        max_cycles=hr_params.max_cycles,
+        soft_block_size=hybrid_reasoning_params.soft_block_size,
+        soft_bptt_window=hybrid_reasoning_params.soft_bptt_window,
+        max_cycles=hybrid_reasoning_params.max_cycles,
         max_episodes=train_params.max_episodes,
         batch_size=train_params.batch_size,
         accumulation_steps=train_params.accumulation_steps,
@@ -104,15 +105,15 @@ def _train_internal_reasoning_multi_step_sft(
         val_batch_size=train_params.val_batch_size,
         val_freq=train_params.val_freq,
         val_envs=val_envs,
-        think_token_id=hr_params.think_token_id,
+        think_token_id=hybrid_reasoning_params.think_token_id,
     )
 
 
-@extty.experiment(project="sft-hybrid-reasoning-maze")
+@extty.experiment(project="hybrid-reasoning-sft-maze")
 def train_hybrid_reasoning_sft_maze(
     train_params: TrainParams,
     multistep_sft_params: MultiStepSFTParams,
-    hr_params: HybridReasoningParams,
+    hybrid_reasoning_params: HybridReasoningParams,
     reward_params: RewardParams,
     maze_reward_params: MazeRewardParams,
     maze_config: MazeConfig,  # TODO: move this with the other params
@@ -132,7 +133,7 @@ def train_hybrid_reasoning_sft_maze(
     return _train_internal_reasoning_multi_step_sft(
         train_params=train_params,
         env=env,
-        hr_params=hr_params,
+        hybrid_reasoning_params=hybrid_reasoning_params,
         multistep_sft_params=multistep_sft_params,
         prompt_collection=prompt_collection,
         val_reward_fn=reward_fn,
@@ -140,22 +141,11 @@ def train_hybrid_reasoning_sft_maze(
     )
 
 
-def _extract_separator_token_id(tokenizer: Tokenizer) -> int:
-    """Extract the separator token from a sample training step.
-
-    Derives the token from the same format used in training
-    (``CountdownStep.format_step()``) so it is guaranteed to match.
-    """
-    sample = CountdownStep(left=1, op="+", right=2, result=3).format_step()
-    ids = tokenizer.encode(sample, add_special_tokens=False).ids
-    return ids[-1]
-
-
-@extty.experiment(project="sft-hybrid-reasoning-countdown")
+@extty.experiment(project="hybrid-reasoning-sft-countdown")
 def train_hybrid_reasoning_sft_countdown(
     train_params: TrainParams,
     multistep_sft_params: MultiStepSFTParams,
-    hr_params: HybridReasoningParams,
+    hybrid_reasoning_params: HybridReasoningParams,
     countdown_params: CountdownParams,
 ):
     torch.manual_seed(train_params.seed)
@@ -179,13 +169,13 @@ def train_hybrid_reasoning_sft_countdown(
     model_info = MODEL_REGISTRY[train_params.model_name]
     net, opt = load_model_and_opt(
         train_params=train_params,
-        soft_projection=hr_params.soft_projection,
-        soft_projection_alpha_init=hr_params.soft_projection_alpha_init,
-        soft_projection_rank=hr_params.soft_projection_rank,
+        soft_projection=hybrid_reasoning_params.soft_projection,
+        soft_projection_alpha_init=hybrid_reasoning_params.soft_projection_alpha_init,
+        soft_projection_rank=hybrid_reasoning_params.soft_projection_rank,
     )
     tokenizer = model_info.load_tokenizer()
 
-    separator_token_id = _extract_separator_token_id(tokenizer)
+    separator_token_id = extract_separator_token_id(tokenizer)
 
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,
@@ -223,9 +213,9 @@ def train_hybrid_reasoning_sft_countdown(
         pad_token_id=model_info.pad_token_id,
         eos_token_id=model_info.eos_token_id,
         separator_token_id=separator_token_id,
-        soft_block_size=hr_params.soft_block_size,
-        soft_bptt_window=hr_params.soft_bptt_window,
-        max_cycles=hr_params.max_cycles,
+        soft_block_size=hybrid_reasoning_params.soft_block_size,
+        soft_bptt_window=hybrid_reasoning_params.soft_bptt_window,
+        max_cycles=hybrid_reasoning_params.max_cycles,
         max_episodes=train_params.max_episodes,
         batch_size=train_params.batch_size,
         accumulation_steps=train_params.accumulation_steps,
@@ -238,9 +228,9 @@ def train_hybrid_reasoning_sft_countdown(
         val_batch_size=train_params.val_batch_size,
         val_freq=train_params.val_freq,
         val_envs=val_envs,
-        think_token_id=hr_params.think_token_id,
-        pass_at_k_samples=hr_params.pass_at_k_samples,
-        pass_at_k_temperature=hr_params.pass_at_k_temperature,
+        think_token_id=hybrid_reasoning_params.think_token_id,
+        pass_at_k_samples=hybrid_reasoning_params.pass_at_k_samples,
+        pass_at_k_temperature=hybrid_reasoning_params.pass_at_k_temperature,
     )
 
 

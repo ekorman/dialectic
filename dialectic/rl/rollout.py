@@ -542,3 +542,138 @@ def generate_variable_length_internal_reasoning_rollout_batch(
         attention_mask=attention_mask,
         t_generation=t_generation,
     )
+
+
+@dataclass
+class GroupedVariableLengthInternalReasoningRolloutBatch(Generic[T]):
+    env_responses: list[EnvResponse[T]]
+    prompts: list[str]
+    output_strs: list[list[str]]  # [G][B]
+    reward_results: list[list[RewardResult]]  # [G][B]
+    rewards: Float[torch.Tensor, "G B"]
+    hard_token_ids: list[Int[torch.Tensor, "B C T_max"]]  # len G
+    hard_token_lengths: list[Int[torch.Tensor, "B C"]]  # len G
+    n_cycles: list[Int[torch.Tensor, " B"]]  # len G
+    prompt_token_ids: Int[torch.Tensor, "B L_prompt"]
+    attention_mask: Bool[torch.Tensor, "B L_prompt"]
+    t_generation: float
+
+
+@torch.no_grad()
+def generate_grouped_variable_length_internal_reasoning_rollout_batch(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    separator_token_id: int,
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    soft_block_size: int = 4,
+    max_cycles: int = 10,
+    max_tokens_per_cycle: int = 20,
+    use_bf16: bool = False,
+    think_token_id: int | None = None,
+) -> GroupedVariableLengthInternalReasoningRolloutBatch[T]:
+    env_responses = get_batch(env, batch_size)
+    prompts = [state_to_str(resp.data) for resp in env_responses]
+    device = next(net.parameters()).device
+
+    tokenizer.enable_padding(direction="left")
+    tokens = tokenizer.encode_batch(prompts)
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+    )
+    token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
+    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+
+    was_training = net.training
+    net.eval()
+    t_gen_start = time.perf_counter()
+
+    gen_output = generate_variable_length_internal_reasoning_tokens(
+        net=net,
+        token_ids=expanded_token_ids,
+        soft_block_size=soft_block_size,
+        max_cycles=max_cycles,
+        max_tokens_per_cycle=max_tokens_per_cycle,
+        separator_token_id=separator_token_id,
+        done_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        temperature=temperature,
+        attention_mask=expanded_attention_mask,
+        use_bf16=use_bf16,
+        think_token_id=think_token_id,
+    )
+    t_generation = time.perf_counter() - t_gen_start
+    if was_training:
+        net.train()
+
+    all_hard_ids = gen_output.hard_token_ids.view(
+        batch_size, group_size, *gen_output.hard_token_ids.shape[1:]
+    ).permute(1, 0, 2, 3)
+    hard_token_ids_list: list[Int[torch.Tensor, "B C T_max"]] = list(
+        all_hard_ids.unbind(0)
+    )
+
+    all_lengths = gen_output.hard_token_lengths.view(
+        batch_size, group_size, gen_output.hard_token_lengths.shape[1]
+    ).permute(1, 0, 2)
+    hard_token_lengths_list: list[Int[torch.Tensor, "B C"]] = list(
+        all_lengths.unbind(0)
+    )
+
+    all_n_cycles = gen_output.n_cycles.view(batch_size, group_size).permute(1, 0)
+    n_cycles_list: list[Int[torch.Tensor, " B"]] = list(all_n_cycles.unbind(0))
+
+    output_strs: list[list[str]] = []
+    for g in range(group_size):
+        group_strs = decode_variable_length_gen_output(
+            VariableLengthInternalReasoningGeneratorOutput(
+                hard_token_ids=hard_token_ids_list[g],
+                hard_token_lengths=hard_token_lengths_list[g],
+                n_cycles=n_cycles_list[g],
+            ),
+            batch_size,
+            pad_token_id,
+            eos_token_id,
+            tokenizer,
+        )
+        output_strs.append(group_strs)
+
+    reward_results: list[list[RewardResult]] = [
+        [
+            reward_fn(
+                env_response=env_response,
+                raw_model_output=out_str,
+                extracted_model_output=out_str,
+            )
+            for env_response, out_str in zip(env_responses, group_out_strs)
+        ]
+        for group_out_strs in output_strs
+    ]
+
+    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        [[r.total for r in row] for row in reward_results],
+        device=device,
+    )
+
+    return GroupedVariableLengthInternalReasoningRolloutBatch(
+        env_responses=env_responses,
+        prompts=prompts,
+        output_strs=output_strs,
+        reward_results=reward_results,
+        rewards=rewards,
+        hard_token_ids=hard_token_ids_list,
+        hard_token_lengths=hard_token_lengths_list,
+        n_cycles=n_cycles_list,
+        prompt_token_ids=token_ids,
+        attention_mask=attention_mask,
+        t_generation=t_generation,
+    )
