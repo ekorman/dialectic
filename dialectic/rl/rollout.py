@@ -26,13 +26,48 @@ def _embedding_rms_norm(net: BaseTransformer) -> float:
     return W.pow(2).mean().sqrt().item()
 
 
+def decode_variable_length_gen_output_per_cycle(
+    gen_output: VariableLengthInternalReasoningGeneratorOutput,
+    batch_size: int,
+    pad_token_id: int,
+    eos_token_id: int,
+    separator_token_id: int,
+    tokenizer: Tokenizer,
+) -> list[list[str]]:
+    result: list[list[str]] = []
+    for b in range(batch_size):
+        cycles: list[str] = []
+        nc = gen_output.n_cycles[b].item()
+        for c in range(nc):
+            cycle_ids: list[int] = []
+            tlen = gen_output.hard_token_lengths[b, c].item()
+            for t in range(tlen):
+                tid = gen_output.hard_token_ids[b, c, t].item()
+                if tid not in (pad_token_id, eos_token_id, separator_token_id):
+                    cycle_ids.append(tid)
+            cycles.append(tokenizer.decode(cycle_ids) if cycle_ids else "")
+        result.append(cycles)
+    return result
+
+
 def decode_variable_length_gen_output(
     gen_output: VariableLengthInternalReasoningGeneratorOutput,
     batch_size: int,
     pad_token_id: int,
     eos_token_id: int,
     tokenizer: Tokenizer,
+    separator_token_id: int | None = None,
 ) -> list[str]:
+    if separator_token_id is not None:
+        per_cycle = decode_variable_length_gen_output_per_cycle(
+            gen_output,
+            batch_size,
+            pad_token_id,
+            eos_token_id,
+            separator_token_id,
+            tokenizer,
+        )
+        return [" | ".join(cycles) for cycles in per_cycle]
     output_strs: list[str] = []
     for b in range(batch_size):
         all_ids: list[int] = []
@@ -516,17 +551,23 @@ def generate_variable_length_internal_reasoning_rollout_batch(
     if was_training:
         net.train()
 
-    output_strs = decode_variable_length_gen_output(
-        gen_output, batch_size, pad_token_id, eos_token_id, tokenizer
+    per_cycle_strs = decode_variable_length_gen_output_per_cycle(
+        gen_output,
+        batch_size,
+        pad_token_id,
+        eos_token_id,
+        separator_token_id,
+        tokenizer,
     )
+    output_strs = [" | ".join(cycles) for cycles in per_cycle_strs]
 
     reward_results: list[RewardResult] = [
         reward_fn(
             env_response=er,
             raw_model_output=out_str,
-            extracted_model_output=out_str,
+            extracted_model_output=cycle_strs,
         )
-        for er, out_str in zip(env_responses, output_strs)
+        for er, out_str, cycle_strs in zip(env_responses, output_strs, per_cycle_strs)
     ]
 
     rewards = torch.tensor([r.total for r in reward_results], device=device)
@@ -637,30 +678,36 @@ def generate_grouped_variable_length_internal_reasoning_rollout_batch(
     n_cycles_list: list[Int[torch.Tensor, " B"]] = list(all_n_cycles.unbind(0))
 
     output_strs: list[list[str]] = []
+    per_cycle_strs_all: list[list[list[str]]] = []
     for g in range(group_size):
-        group_strs = decode_variable_length_gen_output(
-            VariableLengthInternalReasoningGeneratorOutput(
-                hard_token_ids=hard_token_ids_list[g],
-                hard_token_lengths=hard_token_lengths_list[g],
-                n_cycles=n_cycles_list[g],
-            ),
+        group_gen = VariableLengthInternalReasoningGeneratorOutput(
+            hard_token_ids=hard_token_ids_list[g],
+            hard_token_lengths=hard_token_lengths_list[g],
+            n_cycles=n_cycles_list[g],
+        )
+        group_per_cycle = decode_variable_length_gen_output_per_cycle(
+            group_gen,
             batch_size,
             pad_token_id,
             eos_token_id,
+            separator_token_id,
             tokenizer,
         )
-        output_strs.append(group_strs)
+        per_cycle_strs_all.append(group_per_cycle)
+        output_strs.append([" | ".join(cycles) for cycles in group_per_cycle])
 
     reward_results: list[list[RewardResult]] = [
         [
             reward_fn(
                 env_response=env_response,
                 raw_model_output=out_str,
-                extracted_model_output=out_str,
+                extracted_model_output=cycle_strs,
             )
-            for env_response, out_str in zip(env_responses, group_out_strs)
+            for env_response, out_str, cycle_strs in zip(
+                env_responses, group_out_strs, group_per_cycle
+            )
         ]
-        for group_out_strs in output_strs
+        for group_out_strs, group_per_cycle in zip(output_strs, per_cycle_strs_all)
     ]
 
     rewards: Float[torch.Tensor, "G B"] = torch.tensor(

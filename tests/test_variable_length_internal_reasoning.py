@@ -12,7 +12,10 @@ from dialectic.experiments.params import (
     TrainParams,
 )
 from dialectic.llm.components.kv_cache import KVCache
-from dialectic.llm.generate import generate_variable_length_internal_reasoning_tokens
+from dialectic.llm.generate import (
+    VariableLengthInternalReasoningGeneratorOutput,
+    generate_variable_length_internal_reasoning_tokens,
+)
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import (
     Countdown,
@@ -20,7 +23,14 @@ from dialectic.rl.env import (
     CountdownStep,
     build_countdown_equation,
 )
-from dialectic.rl.reward import countdown_hybrid_correct, weighted_reward
+from dialectic.rl.reward import (
+    _is_valid_arithmetic_equation,
+    countdown_final_correct,
+    countdown_hybrid_correct,
+    countdown_intermediate_valid,
+    weighted_reward,
+)
+from dialectic.rl.rollout import decode_variable_length_gen_output_per_cycle
 from dialectic.rl.train import (
     compute_variable_length_internal_reasoning_log_probs,
     make_variable_length_per_cycle_backward_callback,
@@ -1322,3 +1332,292 @@ class TestGroupedVariableLengthRolloutBatch:
         assert rollout.attention_mask.shape[0] == B
         assert len(rollout.env_responses) == B
         assert len(rollout.prompts) == B
+
+
+class TestDecodeVariableLengthPerCycle:
+    def test_basic_per_cycle_decode(self):
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        tokenizer = model_info.load_tokenizer()
+        separator_token_id = extract_separator_token_id(tokenizer)
+
+        cycle0_text = "3 + 2 = 5"
+        cycle1_text = "5 * 4 = 20"
+        cycle0_ids = tokenizer.encode(cycle0_text, add_special_tokens=False).ids
+        cycle1_ids = tokenizer.encode(cycle1_text, add_special_tokens=False).ids
+
+        T_max = max(len(cycle0_ids), len(cycle1_ids)) + 3
+        C = 2
+        B = 1
+        hard_token_ids = torch.full((B, C, T_max), PAD_TOKEN_ID, dtype=torch.long)
+        hard_token_lengths = torch.zeros((B, C), dtype=torch.long)
+        n_cycles = torch.tensor([2], dtype=torch.long)
+
+        for t, tid in enumerate(cycle0_ids):
+            hard_token_ids[0, 0, t] = tid
+        hard_token_ids[0, 0, len(cycle0_ids)] = separator_token_id
+        hard_token_lengths[0, 0] = len(cycle0_ids) + 1
+
+        for t, tid in enumerate(cycle1_ids):
+            hard_token_ids[0, 1, t] = tid
+        hard_token_ids[0, 1, len(cycle1_ids)] = EOS_TOKEN_ID
+        hard_token_lengths[0, 1] = len(cycle1_ids) + 1
+
+        gen_output = VariableLengthInternalReasoningGeneratorOutput(
+            hard_token_ids=hard_token_ids,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+        )
+
+        result = decode_variable_length_gen_output_per_cycle(
+            gen_output, B, PAD_TOKEN_ID, EOS_TOKEN_ID, separator_token_id, tokenizer
+        )
+
+        assert len(result) == 1
+        assert len(result[0]) == 2
+        assert cycle0_text in result[0][0]
+        assert cycle1_text in result[0][1]
+
+    def test_strips_separator_eos_pad(self):
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        tokenizer = model_info.load_tokenizer()
+        separator_token_id = extract_separator_token_id(tokenizer)
+
+        text = "hello"
+        text_ids = tokenizer.encode(text, add_special_tokens=False).ids
+
+        T_max = len(text_ids) + 5
+        hard_token_ids = torch.full((1, 1, T_max), PAD_TOKEN_ID, dtype=torch.long)
+        for t, tid in enumerate(text_ids):
+            hard_token_ids[0, 0, t] = tid
+        hard_token_ids[0, 0, len(text_ids)] = separator_token_id
+        hard_token_ids[0, 0, len(text_ids) + 1] = EOS_TOKEN_ID
+        hard_token_lengths = torch.tensor([[len(text_ids) + 2]], dtype=torch.long)
+        n_cycles = torch.tensor([1], dtype=torch.long)
+
+        gen_output = VariableLengthInternalReasoningGeneratorOutput(
+            hard_token_ids=hard_token_ids,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+        )
+
+        result = decode_variable_length_gen_output_per_cycle(
+            gen_output, 1, PAD_TOKEN_ID, EOS_TOKEN_ID, separator_token_id, tokenizer
+        )
+
+        decoded = result[0][0].strip()
+        assert "hello" in decoded
+        assert str(separator_token_id) not in decoded
+
+    def test_empty_cycle(self):
+        model_info = MODEL_REGISTRY["qwen3-0.6b"]
+        tokenizer = model_info.load_tokenizer()
+        separator_token_id = extract_separator_token_id(tokenizer)
+
+        hard_token_ids = torch.full((1, 1, 5), PAD_TOKEN_ID, dtype=torch.long)
+        hard_token_ids[0, 0, 0] = EOS_TOKEN_ID
+        hard_token_lengths = torch.tensor([[1]], dtype=torch.long)
+        n_cycles = torch.tensor([1], dtype=torch.long)
+
+        gen_output = VariableLengthInternalReasoningGeneratorOutput(
+            hard_token_ids=hard_token_ids,
+            hard_token_lengths=hard_token_lengths,
+            n_cycles=n_cycles,
+        )
+
+        result = decode_variable_length_gen_output_per_cycle(
+            gen_output, 1, PAD_TOKEN_ID, EOS_TOKEN_ID, separator_token_id, tokenizer
+        )
+
+        assert len(result) == 1
+        assert len(result[0]) == 1
+        assert result[0][0] == ""
+
+
+class TestCountdownFinalCorrect:
+    def _make_env_response(
+        self, numbers: list[int], target: int
+    ) -> EnvResponse[Countdown]:
+        return EnvResponse(
+            is_done=True,
+            data=Countdown(prompt="", numbers=numbers, target=target),
+        )
+
+    def test_correct_final_cycle(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            extracted_model_output=["some intermediate", "10 + 5 = 15"],
+        )
+        assert result == 1.0
+
+    def test_incorrect_final_cycle(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            extracted_model_output=["10 + 5 = 99"],
+        )
+        assert result == 0.0
+
+    def test_single_cycle_correct(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([75, 2], 73),
+            extracted_model_output=["75 - 2 = 73"],
+        )
+        assert result == 1.0
+
+    def test_none_output(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([1], 1),
+            extracted_model_output=None,
+        )
+        assert result == 0.0
+
+    def test_empty_list(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([1], 1),
+            extracted_model_output=[],
+        )
+        assert result == 0.0
+
+    def test_wrong_numbers(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            extracted_model_output=["7 + 8 = 15"],
+        )
+        assert result == 0.0
+
+    def test_no_equals_sign(self):
+        result = countdown_final_correct(
+            env_response=self._make_env_response([10, 5], 15),
+            extracted_model_output=["garbage text"],
+        )
+        assert result == 0.0
+
+
+class TestCountdownIntermediateValid:
+    def test_valid_intermediates(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=["3 + 2 = 5", "5 * 4 = 20", "final"],
+        )
+        assert result == 1.0
+
+    def test_one_valid_one_invalid(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=["3 + 2 = 5", "bad equation", "final"],
+        )
+        assert result == 0.5
+
+    def test_no_valid_intermediates(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=["garbage", "also garbage", "final"],
+        )
+        assert result == 0.0
+
+    def test_no_intermediates_single_cycle(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=["only cycle"],
+        )
+        assert result == 0.0
+
+    def test_none_output(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=None,
+        )
+        assert result == 0.0
+
+    def test_empty_list(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=[],
+        )
+        assert result == 0.0
+
+    def test_wrong_arithmetic(self):
+        result = countdown_intermediate_valid(
+            extracted_model_output=["3 + 2 = 999", "final"],
+        )
+        assert result == 0.0
+
+
+class TestIsValidArithmeticEquation:
+    def test_valid_simple(self):
+        assert _is_valid_arithmetic_equation("3 + 2 = 5") is True
+
+    def test_valid_complex(self):
+        assert _is_valid_arithmetic_equation("(10 + 5) * 2 = 30") is True
+
+    def test_invalid_wrong_result(self):
+        assert _is_valid_arithmetic_equation("3 + 2 = 99") is False
+
+    def test_no_equals(self):
+        assert _is_valid_arithmetic_equation("3 + 2") is False
+
+    def test_empty_string(self):
+        assert _is_valid_arithmetic_equation("") is False
+
+    def test_non_arithmetic_lhs(self):
+        assert _is_valid_arithmetic_equation("hello = 5") is False
+
+    def test_empty_rhs(self):
+        assert _is_valid_arithmetic_equation("3 + 2 =") is False
+
+
+class TestPerCycleRewardIntegration:
+    def _make_env_response(
+        self, numbers: list[int], target: int
+    ) -> EnvResponse[Countdown]:
+        return EnvResponse(
+            is_done=True,
+            data=Countdown(prompt="", numbers=numbers, target=target),
+        )
+
+    def test_weighted_reward_with_per_cycle(self):
+        reward_fn = weighted_reward(
+            [
+                ("final_correct", 1.0, countdown_final_correct),
+                ("intermediate_valid", 0.05, countdown_intermediate_valid),
+            ]
+        )
+
+        result = reward_fn(
+            env_response=self._make_env_response([1, 2, 3], 6),
+            raw_model_output="1 + 2 = 3 | 3 + 3 = 6 | (1 + 2) + 3 = 6",
+            extracted_model_output=["1 + 2 = 3", "3 + 3 = 6", "(1 + 2) + 3 = 6"],
+        )
+
+        assert result.components["final_correct"] == 1.0
+        assert result.components["intermediate_valid"] == 1.0
+        assert abs(result.total - (1.0 + 0.05 * 1.0)) < 1e-6
+
+    def test_correct_final_no_valid_intermediates(self):
+        reward_fn = weighted_reward(
+            [
+                ("final_correct", 1.0, countdown_final_correct),
+                ("intermediate_valid", 0.05, countdown_intermediate_valid),
+            ]
+        )
+
+        result = reward_fn(
+            env_response=self._make_env_response([10, 5], 15),
+            raw_model_output="garbage | 10 + 5 = 15",
+            extracted_model_output=["garbage", "10 + 5 = 15"],
+        )
+
+        assert result.components["final_correct"] == 1.0
+        assert result.components["intermediate_valid"] == 0.0
+        assert abs(result.total - 1.0) < 1e-6
+
+    def test_wrong_final_with_valid_intermediates(self):
+        reward_fn = weighted_reward(
+            [
+                ("final_correct", 1.0, countdown_final_correct),
+                ("intermediate_valid", 0.05, countdown_intermediate_valid),
+            ]
+        )
+
+        result = reward_fn(
+            env_response=self._make_env_response([1, 2, 3], 6),
+            raw_model_output="1 + 2 = 3 | wrong",
+            extracted_model_output=["1 + 2 = 3", "wrong"],
+        )
+
+        assert result.components["final_correct"] == 0.0
+        assert result.components["intermediate_valid"] == 1.0
+        assert abs(result.total - 0.05) < 1e-6

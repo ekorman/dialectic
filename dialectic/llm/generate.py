@@ -1130,6 +1130,8 @@ def generate_variable_length_internal_reasoning_tokens(
         valid_mask = torch.full((net.vocab_size,), float("-inf"), device=device)
         valid_mask[valid_hard_token_ids] = 0.0
 
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
@@ -1154,13 +1156,34 @@ def generate_variable_length_internal_reasoning_tokens(
         ):
             if think_token_id is not None:
                 for _ in range(soft_block_size):
-                    h = net(think_embed, kv_caches=kv_caches, return_hidden_states=True)
+                    if attention_mask is not None:
+                        attention_mask = torch.cat([attention_mask, ones], dim=1)
+                    h = net(
+                        think_embed,
+                        kv_caches=kv_caches,
+                        attention_mask=attention_mask,
+                        return_hidden_states=True,
+                    )
             else:
                 for _ in range(soft_block_size):
-                    h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+                    if attention_mask is not None:
+                        attention_mask = torch.cat([attention_mask, ones], dim=1)
+                    h = net(
+                        h,
+                        kv_caches=kv_caches,
+                        attention_mask=attention_mask,
+                        return_hidden_states=True,
+                    )
                     h = net.apply_soft_projection(h)
 
-            h = net(h, kv_caches=kv_caches, return_hidden_states=True)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, ones], dim=1)
+            h = net(
+                h,
+                kv_caches=kv_caches,
+                attention_mask=attention_mask,
+                return_hidden_states=True,
+            )
             logits = net.lm_head(h)
 
         cycle_finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -1199,10 +1222,17 @@ def generate_variable_length_internal_reasoning_tokens(
             if cycle_finished.all() or finished.all():
                 break
 
-            with torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-            ):
-                logits = net(token.unsqueeze(1), kv_caches=kv_caches)
+            if t < max_tokens_per_cycle - 1:
+                if attention_mask is not None:
+                    attention_mask = torch.cat([attention_mask, ones], dim=1)
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+                ):
+                    logits = net(
+                        token.unsqueeze(1),
+                        kv_caches=kv_caches,
+                        attention_mask=attention_mask,
+                    )
 
         still_going = ~cycle_finished & ~finished
         hard_token_lengths[still_going, cycle] = max_tokens_per_cycle

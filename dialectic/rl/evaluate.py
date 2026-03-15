@@ -13,7 +13,7 @@ from dialectic.llm.generate import (
 from dialectic.rl.env import Env
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
-    decode_variable_length_gen_output,
+    decode_variable_length_gen_output_per_cycle,
     generate_internal_reasoning_rollout_batch,
     generate_rollout_batch,
     generate_variable_length_internal_reasoning_rollout_batch,
@@ -577,15 +577,21 @@ def _compute_pass_at_k(
                 valid_hard_token_ids=valid_hard_token_ids,
             )
 
-            output_strs = decode_variable_length_gen_output(
-                gen_output, current_batch_size, pad_token_id, eos_token_id, tokenizer
+            per_cycle_strs = decode_variable_length_gen_output_per_cycle(
+                gen_output,
+                current_batch_size,
+                pad_token_id,
+                eos_token_id,
+                separator_token_id,
+                tokenizer,
             )
+            output_strs = [" | ".join(cycles) for cycles in per_cycle_strs]
 
             for b in range(current_batch_size):
                 result = reward_fn(
                     env_response=env_responses[b],
                     raw_model_output=output_strs[b],
-                    extracted_model_output=output_strs[b],
+                    extracted_model_output=per_cycle_strs[b],
                 )
                 correct = result.total > 0.0
                 batch_per_sample[b].append(correct)

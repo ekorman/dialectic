@@ -110,6 +110,67 @@ def countdown_hybrid_correct(
         return 0.0
 
 
+def _is_valid_arithmetic_equation(s: str) -> bool:
+    s = s.strip()
+    if "=" not in s:
+        return False
+    try:
+        lhs, rhs = s.rsplit("=", 1)
+        lhs = lhs.strip()
+        rhs = rhs.strip()
+        if not rhs or not lhs:
+            return False
+        if not re.match(r"^[\d+\-*/()\s]+$", lhs):
+            return False
+        rhs_val = float(rhs)
+        lhs_val = eval(lhs, {"__builtins__": {}}, {})
+        return abs(lhs_val - rhs_val) < 1e-6
+    except Exception:
+        return False
+
+
+def countdown_final_correct(
+    *,
+    env_response: EnvResponse[Countdown],
+    extracted_model_output: list[str] | None,
+    **_,
+) -> float:
+    if not extracted_model_output:
+        return 0.0
+    last = extracted_model_output[-1].strip()
+    if "=" not in last:
+        return 0.0
+    try:
+        expr, stated_result_str = last.rsplit("=", 1)
+        expr = expr.strip()
+        stated_result_str = stated_result_str.strip()
+        if not stated_result_str:
+            return 0.0
+        stated_result = float(stated_result_str)
+        target = env_response.data.target
+        if abs(stated_result - target) > 1e-6:
+            return 0.0
+        return (
+            1.0
+            if _evaluate_and_verify_countdown(expr, env_response.data.numbers, target)
+            else 0.0
+        )
+    except Exception:
+        return 0.0
+
+
+def countdown_intermediate_valid(
+    *,
+    extracted_model_output: list[str] | None,
+    **_,
+) -> float:
+    if not extracted_model_output or len(extracted_model_output) <= 1:
+        return 0.0
+    intermediates = extracted_model_output[:-1]
+    count = sum(1.0 for s in intermediates if _is_valid_arithmetic_equation(s))
+    return count / len(intermediates)
+
+
 # --- Generic (environment-agnostic) ---
 
 

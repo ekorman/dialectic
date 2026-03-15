@@ -27,7 +27,12 @@ from dialectic.experiments.prompts import (
 from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
 from dialectic.rl.env import CountdownEnv, Env
 from dialectic.rl.maze import MazeConfig
-from dialectic.rl.reward import RewardFn, countdown_hybrid_correct, weighted_reward
+from dialectic.rl.reward import (
+    RewardFn,
+    countdown_final_correct,
+    countdown_intermediate_valid,
+    weighted_reward,
+)
 from dialectic.rl.train import (
     grpo_advantage,
     rloo_advantage,
@@ -250,7 +255,12 @@ def train_hybrid_reasoning_grpo_countdown(
         prompt_template=prompt_collection.env_prompt,
     )
 
-    reward_fn = weighted_reward([("correct", 1.0, countdown_hybrid_correct)])
+    reward_fn = weighted_reward(
+        [
+            ("correct", 1.0, countdown_final_correct),
+            ("intermediate_valid", 0.05, countdown_intermediate_valid),
+        ]
+    )
 
     val_envs = [
         CountdownEnv(
