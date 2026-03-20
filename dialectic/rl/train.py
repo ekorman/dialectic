@@ -2702,7 +2702,8 @@ def compute_variable_length_internal_reasoning_log_probs(
             cycle_lp = torch.zeros(BG, device=device)
 
             for t in range(max_t):
-                attn_mask = torch.cat([attn_mask, ones], dim=1)
+                pos_valid = (t < flat_lengths[:, cycle]).unsqueeze(1)
+                attn_mask = torch.cat([attn_mask, pos_valid], dim=1)
                 h_out = net(
                     h,
                     kv_caches=grad_kv_caches,
@@ -2733,6 +2734,14 @@ def compute_variable_length_internal_reasoning_log_probs(
         for gc in grad_kv_caches:
             assert isinstance(gc, GradSafeKVCache)
             gc.freeze()
+
+        if think_token_id is None and cycle < max_actual_cycles - 1:
+            last_valid_idx = (flat_lengths[:, cycle] - 1).clamp(min=0)
+            last_valid_tok = (
+                flat_hard[:, cycle].gather(1, last_valid_idx.unsqueeze(1)).squeeze(1)
+            )
+            with torch.no_grad():
+                h = net.embed_tokens(last_valid_tok.unsqueeze(1))
 
     log_probs = torch.stack(all_log_probs, dim=1)  # [BG, max_actual_cycles]
 
