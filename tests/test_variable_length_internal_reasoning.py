@@ -578,6 +578,136 @@ class TestComputeVariableLengthInternalReasoningLogProbs:
         assert has_grad
 
 
+class TestSoftBlockHUsesLastValidToken:
+    """Regression tests for two bugs in variable-length internal reasoning:
+
+    Bug 1: When think_token_id is None, the hidden state h entering the soft
+    block between cycles was embed(pad_token_id) for shorter sequences in
+    the batch instead of embed(last_valid_token).
+
+    Bug 2: Padding positions within cycles had attention_mask=True, so soft
+    tokens and subsequent cycles attended to meaningless pad embeddings.
+    """
+
+    def test_cycle1_sensitive_to_last_valid_token_of_cycle0(self, tiny_model):
+        """Bug 1: with think_token_id=None, changing the last valid token of
+        cycle 0 for a shorter sequence must change cycle 1 log probs (because
+        h entering the soft block depends on it)."""
+        torch.manual_seed(42)
+        tiny_model.eval()
+
+        B, G, C, T_max = 2, 1, 2, 5
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+
+        # Seq 0: cycle 0 has 2 tokens, cycle 1 has 2 tokens
+        # Seq 1: cycle 0 has 4 tokens, cycle 1 has 2 tokens
+        # Seq 0 has padding at cycle-0 positions 2,3 in the batch
+        hard_ids_a = torch.full((B, G, C, T_max), PAD_TOKEN_ID, dtype=torch.long)
+        hard_ids_a[0, 0, 0, :2] = torch.tensor([10, 20])
+        hard_ids_a[0, 0, 1, :2] = torch.tensor([30, 40])
+        hard_ids_a[1, 0, 0, :4] = torch.tensor([50, 60, 70, 80])
+        hard_ids_a[1, 0, 1, :2] = torch.tensor([90, 100])
+        hard_lengths = torch.tensor([[[2, 2]], [[4, 2]]])
+        n_cycles = torch.tensor([[2], [2]])
+
+        with torch.no_grad():
+            lp_a, _ = compute_variable_length_internal_reasoning_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                hard_token_ids=hard_ids_a,
+                hard_token_lengths=hard_lengths,
+                n_cycles=n_cycles,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                think_token_id=None,
+            )
+
+        # Change last valid token of cycle 0 for seq 0: 20 -> 99
+        hard_ids_b = hard_ids_a.clone()
+        hard_ids_b[0, 0, 0, 1] = 99
+
+        with torch.no_grad():
+            lp_b, _ = compute_variable_length_internal_reasoning_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                hard_token_ids=hard_ids_b,
+                hard_token_lengths=hard_lengths,
+                n_cycles=n_cycles,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                think_token_id=None,
+            )
+
+        assert not torch.allclose(lp_a[0, 0, 1], lp_b[0, 0, 1]), (
+            "Cycle 1 log probs for seq 0 must change when its last valid "
+            "token in cycle 0 changes — the soft block h should use "
+            "embed(last_valid_token), not embed(pad)"
+        )
+
+    def test_padding_token_value_does_not_affect_subsequent_cycles(self, tiny_model):
+        """Bug 2: changing a padding token (beyond the sequence length) must
+        NOT affect cycle 1 log probs, because padding positions should be
+        masked in the attention."""
+        torch.manual_seed(42)
+        tiny_model.eval()
+
+        B, G, C, T_max = 2, 1, 2, 5
+        L = 4
+        prompt_ids = torch.randint(0, 100, (B, L))
+        attention_mask = torch.ones(B, L, dtype=torch.bool)
+
+        THINK_TOKEN_ID = 42
+
+        # Seq 0: cycle 0 has 2 tokens, cycle 1 has 2 tokens
+        # Seq 1: cycle 0 has 4 tokens, cycle 1 has 2 tokens
+        hard_ids_a = torch.full((B, G, C, T_max), PAD_TOKEN_ID, dtype=torch.long)
+        hard_ids_a[0, 0, 0, :2] = torch.tensor([10, 20])
+        hard_ids_a[0, 0, 1, :2] = torch.tensor([30, 40])
+        hard_ids_a[1, 0, 0, :4] = torch.tensor([50, 60, 70, 80])
+        hard_ids_a[1, 0, 1, :2] = torch.tensor([90, 100])
+        hard_lengths = torch.tensor([[[2, 2]], [[4, 2]]])
+        n_cycles = torch.tensor([[2], [2]])
+
+        with torch.no_grad():
+            lp_a, _ = compute_variable_length_internal_reasoning_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                hard_token_ids=hard_ids_a,
+                hard_token_lengths=hard_lengths,
+                n_cycles=n_cycles,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                think_token_id=THINK_TOKEN_ID,
+            )
+
+        # Change a PADDING token in cycle 0 for seq 0 (position 2, beyond length)
+        hard_ids_b = hard_ids_a.clone()
+        hard_ids_b[0, 0, 0, 2] = 77  # was PAD_TOKEN_ID
+
+        with torch.no_grad():
+            lp_b, _ = compute_variable_length_internal_reasoning_log_probs(
+                net=tiny_model,
+                prompt_token_ids=prompt_ids,
+                attention_mask=attention_mask,
+                hard_token_ids=hard_ids_b,
+                hard_token_lengths=hard_lengths,
+                n_cycles=n_cycles,
+                soft_block_size=SOFT_BLOCK_SIZE,
+                think_token_id=THINK_TOKEN_ID,
+            )
+
+        torch.testing.assert_close(
+            lp_a[0, 0, 1],
+            lp_b[0, 0, 1],
+            atol=0.0,
+            rtol=0.0,
+            msg="Cycle 1 log probs must NOT change when a padding token "
+            "value changes — padding positions should be masked in attention",
+        )
+
+
 class TestMakeVariableLengthSFTPerCycleBackwardCallback:
     def test_normalizes_by_total_tokens(self):
         B = 2
