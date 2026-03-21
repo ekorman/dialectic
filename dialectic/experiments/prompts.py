@@ -26,6 +26,24 @@ ENV_PROMPT_WITHOUT_REASONING_TAGS = (
     "You can use basic arithmetic operations (+, -, *, /) and each number exactly once. Put your final"
     " equation in <answer></answer> tags, for example <answer> (1 + 2) / 3 </answer>. "
 )
+ENV_PROMPT_WITH_SCRATCH_TAGS = """Solve the Countdown problem by combining numbers to reach the target.
+
+Rules:
+- Combine two numbers at a time using +, -, *, /
+- Use <SCRATCH> tags for intermediate calculations
+- Numbers from scratch results can be used in later steps
+- Give your final answer in <answer> tags using all original numbers
+
+Example:
+Numbers: [5, 3, 2], Target: 13
+<SCRATCH> 5 + 2 = 7 </SCRATCH>
+<SCRATCH> 7 + 3 = 10 </SCRATCH>
+<SCRATCH> 5 * 3 = 15 </SCRATCH>
+<SCRATCH> 15 - 2 = 13 </SCRATCH>
+<answer> 5 * 3 - 2 </answer>
+
+Now solve:
+Numbers: {numbers}, Target: {target}"""
 
 
 @dataclass
@@ -69,6 +87,11 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
         PromptCollection(
             system_prompt=SIMPLE_SYSTEM_PROMPT,
             env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill="Let me solve this step by step.",
+        ),
+        PromptCollection(
+            system_prompt=SIMPLE_SYSTEM_PROMPT,
+            env_prompt=ENV_PROMPT_WITH_SCRATCH_TAGS,
             assistant_prefill="Let me solve this step by step.",
         ),
     ],

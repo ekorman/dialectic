@@ -56,6 +56,7 @@ def get_countdown_env_reward_fn_extractor_val_envs(
     reward_fn = get_countdown_reward_fn(
         answer_tags_weight=reward_params.answer_tags_weight,
         think_tags_weight=reward_params.think_tags_weight,
+        scratch_tags_weight=reward_params.scratch_tags_weight,
     )
     extractor = extract_from_answer_tags
 

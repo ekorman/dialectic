@@ -71,6 +71,7 @@ class HybridReasoningParams:
 class RewardParams:
     answer_tags_weight: float
     think_tags_weight: float
+    scratch_tags_weight: float = 0.0
 
 
 @dataclass

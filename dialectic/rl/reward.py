@@ -124,6 +124,16 @@ def answer_tags(*, raw_model_output: str | None, **_) -> float:
     return 0.0
 
 
+def scratch_tags(*, raw_model_output: str | None, **_) -> float:
+    if not raw_model_output:
+        return 0.0
+    n_open = raw_model_output.count("<SCRATCH>")
+    n_close = raw_model_output.count("</SCRATCH>")
+    if n_open >= 1 and n_open == n_close:
+        return 1.0
+    return 0.0
+
+
 def think_tags(
     tag_name: str = "think", prefilled_open: bool = False
 ) -> RewardComponentFn:
