@@ -45,6 +45,15 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
             msgs, gen, enable_thinking=False
         ),
     ),
+    "qwen3-0.6b-thinking": ModelInfo(
+        net_factory=load_qwen3_06b,
+        tokenizer="Qwen/Qwen3-0.6B",
+        eos_token_id=151645,
+        pad_token_id=151643,
+        format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
+            msgs, gen, enable_thinking=True
+        ),
+    ),
     "qwen3-1.7b": ModelInfo(
         net_factory=load_qwen3_17b,
         tokenizer="Qwen/Qwen3-1.7B",

@@ -96,6 +96,7 @@ def evaluate(
 
     n_episodes = 0
     while n_episodes < max_episodes:
+        print(f"Processing episode {n_episodes} / {max_episodes}")
         current_batch_size = min(batch_size, max_episodes - n_episodes)
 
         rollout = generate_rollout_batch(

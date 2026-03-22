@@ -332,6 +332,7 @@ class _SoftGenerator(_BaseTokenGenerator):
         prefill: PreFill | None = None,
         soft_token_noise_std: float | None = None,
         min_soft_steps: int = 0,
+        use_gumbel: bool = False,
     ):
         """soft token generator. The optional parameter `switch_to_hard_tokens_condition`
         determines when to switch from soft token generation to hard token generation: once
@@ -351,6 +352,7 @@ class _SoftGenerator(_BaseTokenGenerator):
         self.prefill = prefill
         self.soft_token_noise_std = soft_token_noise_std
         self.min_soft_steps = max(0, min_soft_steps)
+        self.use_gumbel = use_gumbel
 
     def init_state(
         self,
@@ -466,9 +468,13 @@ class _SoftGenerator(_BaseTokenGenerator):
                 # TODO: is there an issue that not replaying prefill through KV cache?
                 # probably negligible if any
                 self.on_max_tokens_reached()
-        scaled_logits = logits / self.temperature
-        probs = torch.softmax(scaled_logits.float(), dim=-1)
-        next_token = probs
+        logits = logits.float()
+        if self.use_gumbel:
+            next_token = torch.nn.functional.gumbel_softmax(
+                logits, tau=self.temperature, hard=True, dim=-1
+            )
+        else:
+            next_token = torch.softmax(logits / self.temperature, dim=-1)
 
         next_token = torch.where(
             self._finished.unsqueeze(-1).unsqueeze(-1),
@@ -686,6 +692,7 @@ def generate_soft_tokens(
     prefill: PreFill | None = None,
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
+    use_gumbel: bool = False,
 ) -> SoftTokenGeneratorOutput:
     if pad_token_id is None:
         pad_token_id = eos_token_id
@@ -701,6 +708,7 @@ def generate_soft_tokens(
         prefill=prefill,
         soft_token_noise_std=soft_token_noise_std,
         min_soft_steps=min_soft_steps,
+        use_gumbel=use_gumbel,
     ).generate(
         net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
     )

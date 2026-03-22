@@ -7,9 +7,7 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
 
 
-def load_model_and_opt(
-    *, train_params: TrainParams, **kwargs
-) -> tuple[BaseTransformer, torch.optim.Optimizer]:
+def load_model(*, train_params: TrainParams, **kwargs):
     model_info = MODEL_REGISTRY[train_params.model_name]
     net = model_info.load_net(
         **kwargs, pretrained_weights=train_params.start_ckpt_run is None
@@ -32,5 +30,12 @@ def load_model_and_opt(
     device = get_default_device()
     net = net.to(device)
     print(f"loaded net on device {device}")
+    return net
+
+
+def load_model_and_opt(
+    *, train_params: TrainParams, **kwargs
+) -> tuple[BaseTransformer, torch.optim.Optimizer]:
+    net = load_model(train_params=train_params, **kwargs)
     opt = torch.optim.AdamW(net.parameters(), lr=train_params.lr)
     return net, opt
