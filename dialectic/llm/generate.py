@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from jaxtyping import Bool, Float, Int
@@ -10,6 +12,9 @@ from torch import Tensor
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import KVCache
+
+if TYPE_CHECKING:
+    from dialectic.rl.grammar import Grammar, GrammarSpec
 from dialectic.llm.templates import (
     Message,
     get_llama_input_text_from_messages,
@@ -1258,4 +1263,312 @@ def generate_variable_length_internal_reasoning_tokens(
         hard_token_ids=hard_token_ids,
         hard_token_lengths=hard_token_lengths,
         n_cycles=n_cycles,
+    )
+
+
+@dataclass
+class SoftCyclingGeneratorOutput:
+    hard_token_ids: Int[torch.Tensor, "B C T_max"]
+    hard_token_lengths: Int[torch.Tensor, "B C"]
+    n_cycles: Int[torch.Tensor, " B"]
+    soft_lengths: Int[torch.Tensor, "B C"]
+    shadow_ids: Int[torch.Tensor, "B L"]
+
+
+@torch.inference_mode()
+def generate_soft_cycling_tokens(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    grammar_specs: list[GrammarSpec],
+    eos_token_id: int = 151645,
+    pad_token_id: int = 151643,
+    max_tokens_generated: int = 512,
+    max_cycles: int = 20,
+    max_tokens_per_cycle: int = 30,
+    temperature: float = 1.0,
+    attention_mask: Bool[Tensor, "B L"] | None = None,
+    use_bf16: bool = False,
+    use_gumbel: bool = False,
+    soft_token_noise_std: float | None = None,
+    min_soft_steps: int = 0,
+    max_soft_steps_per_cycle: int | None = None,
+) -> SoftCyclingGeneratorOutput:
+    """Generate tokens with alternating soft/hard cycles.
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    token_ids
+        Prompt token IDs [B, L].
+    grammar_specs
+        List of GrammarSpec defining trigger patterns and grammar factories.
+    eos_token_id
+        End-of-sequence token ID.
+    pad_token_id
+        Padding token ID.
+    max_tokens_generated
+        Maximum total tokens (soft + hard) to generate.
+    max_cycles
+        Maximum number of soft→hard cycles.
+    max_tokens_per_cycle
+        Maximum hard tokens per grammar phase.
+    temperature
+        Sampling temperature for both soft distributions and hard sampling.
+    attention_mask
+        Prompt attention mask [B, L].
+    use_bf16
+        Enable bf16 autocast.
+    use_gumbel
+        Use gumbel_softmax(hard=True) instead of softmax for soft distributions.
+    soft_token_noise_std
+        Gaussian noise std to add to soft embeddings. None = no noise.
+    min_soft_steps
+        Minimum soft steps per cycle before trigger matching.
+    max_soft_steps_per_cycle
+        Maximum soft steps per cycle. When reached, forces transition to the
+        first non-terminal grammar. None = unlimited (only trigger matching).
+
+    Returns
+    -------
+    SoftCyclingGeneratorOutput
+    """
+    device = token_ids.device
+    B = token_ids.shape[0]
+    W = net.embed_tokens.weight
+
+    max_seq_len = token_ids.shape[1] + max_tokens_generated + 16
+    kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    hard_token_ids = torch.full(
+        (B, max_cycles, max_tokens_per_cycle),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
+    soft_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
+    n_cycles_out = torch.full((B,), max_cycles, dtype=torch.long, device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    shadow_list: list[list[int]] = [[] for _ in range(B)]
+    current_cycle = torch.zeros(B, dtype=torch.long, device=device)
+    current_soft_steps = torch.zeros(B, dtype=torch.long, device=device)
+
+    in_hard_phase = torch.zeros(B, dtype=torch.bool, device=device)
+    active_grammars: list[Grammar | None] = [None for _ in range(B)]
+    active_terminal: list[bool] = [False] * B
+    hard_step_count = torch.zeros(B, dtype=torch.long, device=device)
+
+    ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        h: Float[Tensor, "B 1 D"] = net(
+            token_ids,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+            return_hidden_states=True,
+        )
+    h = h[:, -1:]
+
+    total_generated = 0
+
+    while total_generated < max_tokens_generated and not finished.all():
+        if attention_mask is not None:
+            attention_mask = torch.cat([attention_mask, ones], dim=1)
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            logits = net.lm_head(h).squeeze(1).float()
+
+        soft_mask = ~in_hard_phase & ~finished
+        hard_mask = in_hard_phase & ~finished
+
+        shadow_tokens = torch.full((B,), pad_token_id, dtype=torch.long, device=device)
+        next_emb = torch.zeros(B, 1, net.d, device=device)
+
+        if soft_mask.any():
+            soft_logits = logits[soft_mask]
+            if use_gumbel:
+                soft_dist = torch.nn.functional.gumbel_softmax(
+                    soft_logits, tau=temperature, hard=True, dim=-1
+                )
+            else:
+                soft_dist = torch.softmax(soft_logits / temperature, dim=-1)
+
+            soft_emb = (soft_dist @ W.float()).unsqueeze(1)
+            if soft_token_noise_std is not None:
+                noise = torch.normal(
+                    0.0,
+                    soft_token_noise_std,
+                    size=soft_emb.shape,
+                    device=device,
+                )
+                soft_emb = soft_emb + noise
+
+            next_emb[soft_mask] = soft_emb
+            soft_shadow = soft_dist.argmax(-1)
+            shadow_tokens[soft_mask] = soft_shadow
+
+        if hard_mask.any():
+            hard_logits = logits[hard_mask]
+            hard_indices = hard_mask.nonzero(as_tuple=True)[0]
+
+            grammar_mask = torch.full_like(hard_logits, float("-inf"))
+            for idx_in_subset, b_idx in enumerate(hard_indices.tolist()):
+                g = active_grammars[b_idx]
+                assert g is not None
+                valid_ids = g.valid_token_ids()
+                grammar_mask[idx_in_subset, valid_ids] = 0.0
+
+            constrained_logits = hard_logits + grammar_mask
+            if temperature > 0:
+                probs = torch.softmax(constrained_logits / temperature, dim=-1)
+                hard_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                hard_tokens = constrained_logits.argmax(dim=-1)
+
+            hard_emb = net.embed_tokens(hard_tokens).unsqueeze(1).float()
+            next_emb[hard_mask] = hard_emb.to(next_emb.dtype)
+            shadow_tokens[hard_mask] = hard_tokens
+
+            for idx_in_subset, b_idx in enumerate(hard_indices.tolist()):
+                tok = hard_tokens[idx_in_subset].item()
+                cycle = current_cycle[b_idx].item()
+                t = hard_step_count[b_idx].item()
+                if cycle < max_cycles and t < max_tokens_per_cycle:
+                    hard_token_ids[b_idx, cycle, t] = tok
+                g = active_grammars[b_idx]
+                assert g is not None
+                g.advance(tok)
+                hard_step_count[b_idx] += 1
+
+        for b in range(B):
+            if not finished[b]:
+                shadow_list[b].append(shadow_tokens[b].item())
+
+        for b in range(B):
+            if finished[b]:
+                continue
+
+            if in_hard_phase[b]:
+                g = active_grammars[b]
+                assert g is not None
+                cycle = current_cycle[b].item()
+                if g.is_complete():
+                    if cycle < max_cycles:
+                        hard_token_lengths[b, cycle] = hard_step_count[b].item()
+                    if active_terminal[b]:
+                        finished[b] = True
+                        n_cycles_out[b] = current_cycle[b] + 1
+                    else:
+                        in_hard_phase[b] = False
+                        active_grammars[b] = None
+                        active_terminal[b] = False
+                        current_cycle[b] += 1
+                        current_soft_steps[b] = 0
+                        hard_step_count[b] = 0
+                        if current_cycle[b] >= max_cycles:
+                            finished[b] = True
+                            n_cycles_out[b] = current_cycle[b]
+                elif hard_step_count[b] >= max_tokens_per_cycle:
+                    if cycle < max_cycles:
+                        hard_token_lengths[b, cycle] = hard_step_count[b].item()
+                    finished[b] = True
+                    n_cycles_out[b] = current_cycle[b] + 1
+            else:
+                current_soft_steps[b] += 1
+                cycle = current_cycle[b].item()
+                if cycle < max_cycles:
+                    soft_lengths[b, cycle] = current_soft_steps[b].item()
+
+                if shadow_tokens[b].item() == eos_token_id:
+                    finished[b] = True
+                    n_cycles_out[b] = current_cycle[b] + (
+                        1 if current_soft_steps[b] > 0 else 0
+                    )
+                elif current_soft_steps[b] >= min_soft_steps:
+                    triggered = False
+                    shadow = shadow_list[b]
+                    for spec in grammar_specs:
+                        trig = spec.trigger_token_ids
+                        if len(shadow) >= len(trig):
+                            if tuple(shadow[-len(trig) :]) == trig:
+                                in_hard_phase[b] = True
+                                active_grammars[b] = spec.grammar_factory()
+                                active_terminal[b] = spec.is_terminal
+                                hard_step_count[b] = 0
+                                triggered = True
+                                break
+
+                    if (
+                        not triggered
+                        and max_soft_steps_per_cycle is not None
+                        and current_soft_steps[b] >= max_soft_steps_per_cycle
+                    ):
+                        is_last_cycle = current_cycle[b] >= max_cycles - 1
+                        if is_last_cycle:
+                            fallback = next(
+                                (s for s in grammar_specs if s.is_terminal),
+                                grammar_specs[-1],
+                            )
+                        else:
+                            fallback = next(
+                                (s for s in grammar_specs if not s.is_terminal),
+                                grammar_specs[0],
+                            )
+                        in_hard_phase[b] = True
+                        active_grammars[b] = fallback.grammar_factory()
+                        active_terminal[b] = fallback.is_terminal
+                        hard_step_count[b] = 0
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                next_emb,
+                kv_caches=kv_caches,
+                attention_mask=attention_mask,
+                return_hidden_states=True,
+            )
+
+        total_generated += 1
+
+    still_going = ~finished
+    if still_going.any():
+        for b in range(B):
+            if still_going[b]:
+                n_cycles_out[b] = current_cycle[b] + (
+                    1 if in_hard_phase[b] or current_soft_steps[b] > 0 else 0
+                )
+                if in_hard_phase[b]:
+                    cycle = current_cycle[b].item()
+                    if cycle < max_cycles:
+                        hard_token_lengths[b, cycle] = hard_step_count[b].item()
+
+    max_shadow_len = max((len(s) for s in shadow_list), default=0)
+    shadow_ids = torch.full(
+        (B, max_shadow_len), pad_token_id, dtype=torch.long, device=device
+    )
+    for b in range(B):
+        sl = shadow_list[b]
+        shadow_ids[b, : len(sl)] = torch.tensor(sl, dtype=torch.long, device=device)
+
+    return SoftCyclingGeneratorOutput(
+        hard_token_ids=hard_token_ids,
+        hard_token_lengths=hard_token_lengths,
+        n_cycles=n_cycles_out,
+        soft_lengths=soft_lengths,
+        shadow_ids=shadow_ids,
     )

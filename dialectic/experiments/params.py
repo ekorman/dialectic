@@ -97,6 +97,16 @@ class MathEnvParams:
 
 
 @dataclass
+class SoftCyclingParams:
+    min_soft_steps: int = 0
+    use_gumbel: bool = False
+    soft_bptt_window: int | None = None
+    max_cycles: int = 20
+    max_tokens_per_cycle: int = 30
+    max_soft_steps_per_cycle: int | None = None
+
+
+@dataclass
 class SingleStepSFTParams:
     max_answer_tokens: int
     normalize_by_sequence_length: bool

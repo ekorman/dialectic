@@ -25,6 +25,7 @@ from dialectic.rl.rollout import (
     generate_grouped_variable_length_internal_reasoning_rollout_batch,
     generate_internal_reasoning_rollout_batch,
     generate_rollout_batch,
+    generate_soft_cycling_rollout_batch,
     generate_soft_rollout_batch,
 )
 from dialectic.rl.types import A, E, RewardResult, T
@@ -641,6 +642,24 @@ def create_grpo_step_fn(
                     / len(micro_batches),
                 }
                 if "hard_lp_mean" in micro_batches[0]
+                else {}
+            ),
+            **(
+                {
+                    "train/mean_soft_len": sum(
+                        mb["mean_soft_len"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/mean_n_cycles": sum(
+                        mb["mean_n_cycles"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                    "train/mean_hard_per_cycle": sum(
+                        mb["mean_hard_per_cycle"] for mb in micro_batches
+                    )
+                    / len(micro_batches),
+                }
+                if "mean_soft_len" in micro_batches[0]
                 else {}
             ),
             **{f"train/reward/{name}": mean for name, mean in component_means.items()},
@@ -3286,4 +3305,541 @@ def train_internal_reasoning_single_step_sft(
         train_step=train_step,
         val_envs=val_envs,
         val_fn=val_fn,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Soft cycling GRPO
+# ---------------------------------------------------------------------------
+
+
+def stack_and_pad_soft_cycling(
+    hard_token_ids: list[Integer[torch.Tensor, "B C T"]],
+    hard_token_lengths: list[Integer[torch.Tensor, "B C"]],
+    n_cycles: list[Integer[torch.Tensor, " B"]],
+    soft_lengths: list[Integer[torch.Tensor, "B C"]],
+    pad_token_id: int,
+) -> tuple[
+    Integer[torch.Tensor, "B G C T"],
+    Integer[torch.Tensor, "B G C"],
+    Integer[torch.Tensor, "B G"],
+    Integer[torch.Tensor, "B G C"],
+]:
+    stacked_ids, stacked_lengths, stacked_n = (
+        stack_and_pad_variable_length_internal_reasoning(
+            hard_token_ids, hard_token_lengths, n_cycles, pad_token_id
+        )
+    )
+
+    B = soft_lengths[0].shape[0]
+    G = len(soft_lengths)
+    device = soft_lengths[0].device
+    max_c = stacked_ids.shape[2]
+
+    stacked_soft = torch.zeros(B, G, max_c, dtype=torch.long, device=device)
+    for g, sl in enumerate(soft_lengths):
+        C_g = sl.shape[1]
+        stacked_soft[:, g, :C_g] = sl
+
+    return stacked_ids, stacked_lengths, stacked_n, stacked_soft
+
+
+def compute_soft_cycling_log_probs(
+    *,
+    net: BaseTransformer,
+    prompt_token_ids: Integer[torch.Tensor, "B L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+    hard_token_ids: Integer[torch.Tensor, "B G C T_max"],
+    hard_token_lengths: Integer[torch.Tensor, "B G C"],
+    n_cycles: Integer[torch.Tensor, "B G"],
+    soft_lengths: Integer[torch.Tensor, "B G C"],
+    temperature: float,
+    use_gumbel: bool = False,
+    grammar_logit_masks: list[torch.Tensor] | None = None,
+    use_bf16: bool = False,
+    soft_bptt_window: int | None = None,
+    cycle_callback: Callable[
+        [Float[torch.Tensor, " BG"], int], Float[torch.Tensor, " BG"]
+    ]
+    | None = None,
+) -> tuple[Float[torch.Tensor, "B G C"], Bool[torch.Tensor, "B G C"]]:
+    """Compute log probs for soft cycling trajectories with BPTT.
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    prompt_token_ids
+        Prompt token IDs [B, L].
+    attention_mask
+        Attention mask for prompt [B, L].
+    hard_token_ids
+        Known hard tokens per cycle [B, G, C, T_max].
+    hard_token_lengths
+        Number of actual hard tokens per cycle [B, G, C].
+    n_cycles
+        Actual number of cycles per sample [B, G].
+    soft_lengths
+        Number of soft steps per cycle [B, G, C].
+    temperature
+        Temperature for soft distribution computation.
+    use_gumbel
+        Use gumbel_softmax(hard=True) instead of softmax.
+    grammar_logit_masks
+        Optional per-grammar logit masks [V] to constrain hard token logits.
+    use_bf16
+        Whether to use bf16 autocast.
+    soft_bptt_window
+        Number of soft steps at end of each cycle to backpropagate through.
+        None means full BPTT through all soft steps.
+    cycle_callback
+        Optional callback for per-cycle backward.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        (log_probs [B, G, C], completion_mask [B, G, C])
+    """
+    B, G, C, T_max = hard_token_ids.shape
+    BG = B * G
+    device = prompt_token_ids.device
+
+    flat_prompt = prompt_token_ids.repeat_interleave(G, dim=0)
+    flat_mask = attention_mask.repeat_interleave(G, dim=0)
+    flat_hard = hard_token_ids.view(BG, C, T_max)
+    flat_lengths = hard_token_lengths.view(BG, C)
+    flat_n_cycles = n_cycles.view(BG)
+    flat_soft_lengths = soft_lengths.view(BG, C)
+
+    max_actual_cycles = int(flat_n_cycles.max().item())
+    max_soft = int(flat_soft_lengths.max().item()) if max_actual_cycles > 0 else 0
+    max_seq_len = flat_prompt.shape[1] + max_actual_cycles * (max_soft + T_max) + 16
+
+    std_kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    W = net.embed_tokens.weight
+
+    with torch.no_grad():
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            h = net(
+                flat_prompt,
+                kv_caches=std_kv_caches,
+                attention_mask=flat_mask,
+                return_hidden_states=True,
+            )
+    h = h[:, -1:]
+
+    grad_kv_caches: list[GradSafeKVCache | KVCache] = [
+        GradSafeKVCache.from_standard(c) for c in std_kv_caches
+    ]
+
+    attn_mask = flat_mask
+    ones = torch.ones(BG, 1, dtype=torch.bool, device=device)
+
+    all_log_probs = []
+    for cycle in range(max_actual_cycles):
+        h = h.detach()
+        cycle_soft_len = int(flat_soft_lengths[:, cycle].max().item())
+
+        if soft_bptt_window is None:
+            bptt_window = cycle_soft_len
+        else:
+            bptt_window = min(soft_bptt_window, cycle_soft_len)
+        n_no_grad_soft = cycle_soft_len - bptt_window
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            if n_no_grad_soft > 0:
+                with torch.no_grad():
+                    for _ in range(n_no_grad_soft):
+                        attn_mask = torch.cat([attn_mask, ones], dim=1)
+                        logits = net.lm_head(h).squeeze(1).float()
+                        if use_gumbel:
+                            soft_dist = torch.nn.functional.gumbel_softmax(
+                                logits, tau=temperature, hard=True, dim=-1
+                            )
+                        else:
+                            soft_dist = torch.softmax(logits / temperature, dim=-1)
+                        emb = (soft_dist @ W.float()).unsqueeze(1)
+                        h = net(
+                            emb,
+                            kv_caches=grad_kv_caches,
+                            attention_mask=attn_mask,
+                            return_hidden_states=True,
+                        )
+                h = h.detach()
+
+            for _ in range(bptt_window):
+                attn_mask = torch.cat([attn_mask, ones], dim=1)
+                logits = net.lm_head(h).squeeze(1).float()
+                if use_gumbel:
+                    soft_dist = torch.nn.functional.gumbel_softmax(
+                        logits, tau=temperature, hard=True, dim=-1
+                    )
+                else:
+                    soft_dist = torch.softmax(logits / temperature, dim=-1)
+                emb = (soft_dist @ W.float()).unsqueeze(1)
+                h = net(
+                    emb,
+                    kv_caches=grad_kv_caches,
+                    attention_mask=attn_mask,
+                    return_hidden_states=True,
+                )
+
+            max_t = int(flat_lengths[:, cycle].max().item())
+            cycle_lp = (h.sum(dim=-1).squeeze(1) * 0.0).float()
+
+            for t in range(max_t):
+                pos_valid = (t < flat_lengths[:, cycle]).unsqueeze(1)
+                attn_mask = torch.cat([attn_mask, pos_valid], dim=1)
+                h_out = net(
+                    h,
+                    kv_caches=grad_kv_caches,
+                    attention_mask=attn_mask,
+                    return_hidden_states=True,
+                )
+                logits_hard = net.lm_head(h_out)
+                logits_squeezed = logits_hard.squeeze(1).float()
+
+                lp_all = torch.log_softmax(logits_squeezed, dim=-1)
+                target_token = flat_hard[:, cycle, t]
+                lp = lp_all[torch.arange(BG, device=device), target_token]
+
+                token_mask = (t < flat_lengths[:, cycle]) & (cycle < flat_n_cycles)
+                lp = torch.where(token_mask, lp, torch.zeros_like(lp))
+                cycle_lp = cycle_lp + lp
+
+                with torch.no_grad():
+                    h = net.embed_tokens(target_token.unsqueeze(1))
+
+        if cycle_callback is not None:
+            cycle_lp = cycle_callback(cycle_lp, cycle)
+
+        all_log_probs.append(cycle_lp)
+
+        for gc in grad_kv_caches:
+            assert isinstance(gc, GradSafeKVCache)
+            gc.freeze()
+
+        if cycle < max_actual_cycles - 1:
+            last_valid_idx = (flat_lengths[:, cycle] - 1).clamp(min=0)
+            last_valid_tok = (
+                flat_hard[:, cycle].gather(1, last_valid_idx.unsqueeze(1)).squeeze(1)
+            )
+            with torch.no_grad():
+                h = net.embed_tokens(last_valid_tok.unsqueeze(1))
+
+    log_probs = torch.stack(all_log_probs, dim=1)
+
+    if max_actual_cycles < C:
+        pad_lp = torch.zeros(BG, C - max_actual_cycles, device=device)
+        log_probs = torch.cat([log_probs, pad_lp], dim=1)
+
+    log_probs = log_probs.view(B, G, C)
+
+    cycle_indices = (
+        torch.arange(C, device=device).unsqueeze(0).unsqueeze(0).expand(B, G, C)
+    )
+    completion_mask = cycle_indices < n_cycles.unsqueeze(-1)
+
+    return log_probs, completion_mask
+
+
+def collect_soft_cycling_micro_batch(
+    *,
+    net: BaseTransformer,
+    ref_net: BaseTransformer | None,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    extractor: Callable[[str], Any],
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_specs: list,
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    max_tokens_generated: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    collect_old_log_probs: bool,
+    use_bf16: bool = False,
+    use_gumbel: bool = False,
+    soft_token_noise_std: float | None = None,
+    min_soft_steps: int = 0,
+    max_soft_steps_per_cycle: int | None = None,
+    soft_bptt_window: int | None = None,
+) -> dict:
+    rollout = generate_soft_cycling_rollout_batch(
+        net=net,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        extractor=extractor,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        grammar_specs=grammar_specs,
+        batch_size=batch_size,
+        group_size=group_size,
+        temperature=temperature,
+        max_tokens_generated=max_tokens_generated,
+        max_cycles=max_cycles,
+        max_tokens_per_cycle=max_tokens_per_cycle,
+        use_bf16=use_bf16,
+        use_gumbel=use_gumbel,
+        soft_token_noise_std=soft_token_noise_std,
+        min_soft_steps=min_soft_steps,
+        max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+    )
+
+    stacked_hard_ids, stacked_lengths, stacked_n_cycles, stacked_soft_lengths = (
+        stack_and_pad_soft_cycling(
+            rollout.hard_token_ids,
+            rollout.hard_token_lengths,
+            rollout.n_cycles,
+            rollout.soft_lengths,
+            pad_token_id,
+        )
+    )
+
+    device = next(net.parameters()).device
+    t_logprobs_start = time.perf_counter()
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        if ref_net is not None:
+            with torch.no_grad():
+                ref_log_probs, _ = compute_soft_cycling_log_probs(
+                    net=ref_net,
+                    prompt_token_ids=rollout.prompt_token_ids,
+                    attention_mask=rollout.attention_mask,
+                    hard_token_ids=stacked_hard_ids,
+                    hard_token_lengths=stacked_lengths,
+                    n_cycles=stacked_n_cycles,
+                    soft_lengths=stacked_soft_lengths,
+                    temperature=temperature,
+                    use_gumbel=use_gumbel,
+                    use_bf16=use_bf16,
+                )
+        else:
+            ref_log_probs = None
+
+        if collect_old_log_probs:
+            with torch.no_grad():
+                old_log_probs, completion_mask = compute_soft_cycling_log_probs(
+                    net=net,
+                    prompt_token_ids=rollout.prompt_token_ids,
+                    attention_mask=rollout.attention_mask,
+                    hard_token_ids=stacked_hard_ids,
+                    hard_token_lengths=stacked_lengths,
+                    n_cycles=stacked_n_cycles,
+                    soft_lengths=stacked_soft_lengths,
+                    temperature=temperature,
+                    use_gumbel=use_gumbel,
+                    use_bf16=use_bf16,
+                )
+        else:
+            old_log_probs = None
+            C = stacked_hard_ids.shape[2]
+            cycle_indices = torch.arange(C, device=device)
+            cycle_indices = (
+                cycle_indices.unsqueeze(0)
+                .unsqueeze(0)
+                .expand(stacked_hard_ids.shape[0], stacked_hard_ids.shape[1], C)
+            )
+            completion_mask = cycle_indices < stacked_n_cycles.unsqueeze(-1)
+
+    t_logprobs = time.perf_counter() - t_logprobs_start
+
+    C = stacked_soft_lengths.shape[2]
+    valid_cycle_mask = torch.arange(
+        C, device=stacked_n_cycles.device
+    ) < stacked_n_cycles.unsqueeze(-1)
+    n_valid = valid_cycle_mask.sum().clamp(min=1).float()
+    mean_soft_len = (
+        stacked_soft_lengths.float() * valid_cycle_mask
+    ).sum().item() / n_valid.item()
+    mean_n_cycles = stacked_n_cycles.float().mean().item()
+    mean_hard_per_cycle = (
+        stacked_lengths.float() * valid_cycle_mask
+    ).sum().item() / n_valid.item()
+
+    return {
+        "prompts": rollout.prompts,
+        "env_responses": rollout.env_responses,
+        "prompt_token_ids": rollout.prompt_token_ids,
+        "attention_mask": rollout.attention_mask,
+        "hard_token_ids": stacked_hard_ids,
+        "hard_token_lengths": stacked_lengths,
+        "n_cycles": stacked_n_cycles,
+        "soft_lengths": stacked_soft_lengths,
+        "output_strs": rollout.output_strs,
+        "reward_results": rollout.reward_results,
+        "rewards": rollout.rewards,
+        "ref_log_probs": ref_log_probs,
+        "old_log_probs": old_log_probs,
+        "completion_mask": completion_mask,
+        "t_gen": rollout.t_generation,
+        "t_logprobs": t_logprobs,
+        "mean_soft_len": mean_soft_len,
+        "mean_n_cycles": mean_n_cycles,
+        "mean_hard_per_cycle": mean_hard_per_cycle,
+    }
+
+
+def train_soft_cycling_grpo(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    extractor: Callable[[str], Any],
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_specs: list,
+    temperature: float,
+    max_tokens_generated: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    beta: float,
+    eps: float | None,
+    mu: int = 1,
+    max_episodes: int,
+    update_ref_net_batch_cadence: int | None,
+    batch_size: int,
+    group_size: int,
+    use_gumbel: bool = False,
+    soft_token_noise_std: float | None = None,
+    min_soft_steps: int = 0,
+    max_soft_steps_per_cycle: int | None = None,
+    soft_bptt_window: int | None = None,
+    advantage_fn: Callable[
+        [Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]
+    ] = grpo_advantage,
+    normalize_by_sequence_length: bool = True,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    use_bf16: bool = False,
+    save_ckpt_freq: int = sys.maxsize,
+    val_freq: int = sys.maxsize,
+    val_episodes: int = 0,
+    val_envs: Sequence[Env] = (),
+    val_batch_size: int = 0,
+    clip_ratio_c: float = 3.0,
+    warmup_steps: int = 0,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    collect_old_log_probs = eps is not None
+
+    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
+        return collect_soft_cycling_micro_batch(
+            net=net,
+            ref_net=ref_net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            extractor=extractor,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            grammar_specs=grammar_specs,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            collect_old_log_probs=collect_old_log_probs,
+            use_bf16=use_bf16,
+            use_gumbel=use_gumbel,
+            soft_token_noise_std=soft_token_noise_std,
+            min_soft_steps=min_soft_steps,
+            max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            soft_bptt_window=soft_bptt_window,
+        )
+
+    def recompute_fn(
+        net: BaseTransformer, mb: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        callback = None
+        advs = mb.get("_advs_for_loss")
+        if advs is not None:
+            callback = make_variable_length_per_cycle_backward_callback(
+                B=mb["hard_token_ids"].shape[0],
+                G=mb["hard_token_ids"].shape[1],
+                advs=advs,
+                completion_mask=mb["completion_mask"],
+                hard_token_lengths=mb["hard_token_lengths"],
+                n_cycles=mb["n_cycles"],
+                old_log_probs=mb["old_log_probs"],
+                ref_log_probs=mb["ref_log_probs"],
+                beta=beta,
+                eps=eps,
+                normalize_by_sequence_length=normalize_by_sequence_length,
+                loss_scale=mb.get("_loss_scale", 1.0),
+                clip_ratio_c=clip_ratio_c,
+            )
+        log_probs, mask = compute_soft_cycling_log_probs(
+            net=net,
+            prompt_token_ids=mb["prompt_token_ids"],
+            attention_mask=mb["attention_mask"],
+            hard_token_ids=mb["hard_token_ids"],
+            hard_token_lengths=mb["hard_token_lengths"],
+            n_cycles=mb["n_cycles"],
+            soft_lengths=mb["soft_lengths"],
+            temperature=temperature,
+            use_gumbel=use_gumbel,
+            use_bf16=use_bf16,
+            soft_bptt_window=soft_bptt_window,
+            cycle_callback=callback,
+        )
+        if callback is not None:
+            log_probs = log_probs.detach().requires_grad_(True)
+        return log_probs, mask
+
+    _grpo_train_loop(
+        net=net,
+        opt=opt,
+        collect_fn=collect_fn,
+        recompute_log_probs_fn=recompute_fn,
+        beta=beta,
+        eps=eps,
+        mu=mu,
+        max_episodes=max_episodes,
+        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+        batch_size=batch_size,
+        group_size=group_size,
+        advantage_fn=advantage_fn,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        use_bf16=use_bf16,
+        save_ckpt_freq=save_ckpt_freq,
+        val_envs=val_envs,
+        val_freq=val_freq,
+        val_fn=lambda _env: (
+            type(
+                "R", (), {"reward_mean": 0.0, "reward_std": 0.0, "component_means": {}}
+            )(),
+            [],
+        ),
+        warmup_steps=warmup_steps,
     )

@@ -13,6 +13,7 @@ from dialectic.llm.generate import (
     VariableLengthInternalReasoningGeneratorOutput,
     generate_hard_tokens,
     generate_internal_reasoning_tokens,
+    generate_soft_cycling_tokens,
     generate_soft_tokens,
     generate_variable_length_internal_reasoning_tokens,
 )
@@ -673,6 +674,138 @@ def generate_grouped_variable_length_internal_reasoning_rollout_batch(
         hard_token_ids=hard_token_ids_list,
         hard_token_lengths=hard_token_lengths_list,
         n_cycles=n_cycles_list,
+        prompt_token_ids=token_ids,
+        attention_mask=attention_mask,
+        t_generation=t_generation,
+    )
+
+
+@dataclass
+class SoftCyclingRolloutBatch(Generic[T]):
+    env_responses: list[EnvResponse[T]]
+    prompts: list[str]
+    output_strs: list[list[str]]
+    reward_results: list[list[RewardResult]]
+    rewards: Float[torch.Tensor, "G B"]
+    hard_token_ids: list[Int[torch.Tensor, "B C T_max"]]
+    hard_token_lengths: list[Int[torch.Tensor, "B C"]]
+    n_cycles: list[Int[torch.Tensor, " B"]]
+    soft_lengths: list[Int[torch.Tensor, "B C"]]
+    prompt_token_ids: Int[torch.Tensor, "B L_prompt"]
+    attention_mask: Bool[torch.Tensor, "B L_prompt"]
+    t_generation: float
+
+
+@torch.no_grad()
+def generate_soft_cycling_rollout_batch(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    extractor: Callable[[str], E],
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_specs: list,
+    batch_size: int,
+    group_size: int,
+    temperature: float,
+    max_tokens_generated: int = 512,
+    max_cycles: int = 20,
+    max_tokens_per_cycle: int = 30,
+    use_bf16: bool = False,
+    use_gumbel: bool = False,
+    soft_token_noise_std: float | None = None,
+    min_soft_steps: int = 0,
+    max_soft_steps_per_cycle: int | None = None,
+) -> SoftCyclingRolloutBatch[T]:
+    env_responses = get_batch(env, batch_size)
+    prompts = [state_to_str(resp.data) for resp in env_responses]
+    device = next(net.parameters()).device
+
+    tokenizer.enable_padding(direction="left")
+    tokens = tokenizer.encode_batch(prompts)
+    attention_mask = torch.tensor(
+        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+    )
+    token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+    actual_noise_std = (
+        soft_token_noise_std * _embedding_rms_norm(net)
+        if soft_token_noise_std is not None
+        else None
+    )
+
+    hard_token_ids_list: list[Int[torch.Tensor, "B C T_max"]] = []
+    hard_token_lengths_list: list[Int[torch.Tensor, "B C"]] = []
+    n_cycles_list: list[Int[torch.Tensor, " B"]] = []
+    soft_lengths_list: list[Int[torch.Tensor, "B C"]] = []
+    all_shadow_ids: list[Int[torch.Tensor, "B L"]] = []
+
+    was_training = net.training
+    net.eval()
+    t_gen_start = time.perf_counter()
+
+    for _ in range(group_size):
+        gen_output = generate_soft_cycling_tokens(
+            net=net,
+            token_ids=token_ids,
+            grammar_specs=grammar_specs,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            max_tokens_generated=max_tokens_generated,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            temperature=temperature if temperature > 0 else 1.0,
+            attention_mask=attention_mask,
+            use_bf16=use_bf16,
+            use_gumbel=use_gumbel,
+            soft_token_noise_std=actual_noise_std,
+            min_soft_steps=min_soft_steps,
+            max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+        )
+        hard_token_ids_list.append(gen_output.hard_token_ids)
+        hard_token_lengths_list.append(gen_output.hard_token_lengths)
+        n_cycles_list.append(gen_output.n_cycles)
+        soft_lengths_list.append(gen_output.soft_lengths)
+        all_shadow_ids.append(gen_output.shadow_ids)
+
+    t_generation = time.perf_counter() - t_gen_start
+    if was_training:
+        net.train()
+
+    output_strs: list[list[str]] = [
+        tokenizer.decode_batch(s.tolist()) for s in all_shadow_ids
+    ]
+
+    reward_results: list[list[RewardResult]] = [
+        [
+            reward_fn(
+                env_response=env_response,
+                raw_model_output=s,
+                extracted_model_output=extractor(s),
+            )
+            for s, env_response in zip(group_batch, env_responses)
+        ]
+        for group_batch in output_strs
+    ]
+
+    rewards: Float[torch.Tensor, "G B"] = torch.tensor(
+        [[r.total for r in row] for row in reward_results],
+        device=device,
+    )
+
+    return SoftCyclingRolloutBatch(
+        env_responses=env_responses,
+        prompts=prompts,
+        output_strs=output_strs,
+        reward_results=reward_results,
+        rewards=rewards,
+        hard_token_ids=hard_token_ids_list,
+        hard_token_lengths=hard_token_lengths_list,
+        n_cycles=n_cycles_list,
+        soft_lengths=soft_lengths_list,
         prompt_token_ids=token_ids,
         attention_mask=attention_mask,
         t_generation=t_generation,
