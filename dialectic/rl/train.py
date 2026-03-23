@@ -3835,11 +3835,73 @@ def train_soft_cycling_grpo(
         save_ckpt_freq=save_ckpt_freq,
         val_envs=val_envs,
         val_freq=val_freq,
-        val_fn=lambda _env: (
-            type(
-                "R", (), {"reward_mean": 0.0, "reward_std": 0.0, "component_means": {}}
-            )(),
-            [],
+        val_fn=_create_soft_cycling_val_fn(
+            net=net,
+            reward_fn=reward_fn,
+            extractor=extractor,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            grammar_specs=grammar_specs,
+            max_tokens_generated=max_tokens_generated,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            val_episodes=val_episodes,
+            val_batch_size=val_batch_size,
+            use_bf16=use_bf16,
+            use_gumbel=use_gumbel,
+            min_soft_steps=min_soft_steps,
+            max_soft_steps_per_cycle=max_soft_steps_per_cycle,
         ),
         warmup_steps=warmup_steps,
     )
+
+
+def _create_soft_cycling_val_fn(
+    *,
+    net: BaseTransformer,
+    reward_fn: RewardFn,
+    extractor: Callable[[str], Any],
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_specs: list,
+    max_tokens_generated: int,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    val_episodes: int,
+    val_batch_size: int,
+    use_bf16: bool,
+    use_gumbel: bool,
+    min_soft_steps: int,
+    max_soft_steps_per_cycle: int | None,
+):
+    from dialectic.rl.evaluate import evaluate_soft_cycling
+
+    def _val(env: Env):
+        return evaluate_soft_cycling(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            extractor=extractor,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            grammar_specs=grammar_specs,
+            max_tokens_generated=max_tokens_generated,
+            max_cycles=max_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
+            use_gumbel=use_gumbel,
+            min_soft_steps=min_soft_steps,
+            max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+        )
+
+    return _val
