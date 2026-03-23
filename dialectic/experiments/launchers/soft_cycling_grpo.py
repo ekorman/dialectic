@@ -9,6 +9,7 @@ from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     CountdownParams,
     GRPOParams,
+    RewardParams,
     SoftCyclingParams,
     TrainParams,
 )
@@ -17,7 +18,12 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.grammar import build_countdown_grammar_specs
-from dialectic.rl.reward import countdown_correct, weighted_reward
+from dialectic.rl.reward import (
+    answer_tags,
+    countdown_correct,
+    scratch_tags,
+    weighted_reward,
+)
 from dialectic.rl.train import grpo_advantage, rloo_advantage, train_soft_cycling_grpo
 
 COUNTDOWN_SOFT_CYCLING_PROMPT = PromptCollection(
@@ -31,6 +37,7 @@ COUNTDOWN_SOFT_CYCLING_PROMPT = PromptCollection(
 def train_soft_cycling_grpo_countdown(
     train_params: TrainParams,
     grpo_params: GRPOParams,
+    reward_params: RewardParams,
     soft_cycling_params: SoftCyclingParams,
     countdown_params: CountdownParams,
 ):
@@ -74,7 +81,16 @@ def train_soft_cycling_grpo_countdown(
         prompt_template=prompt_collection.env_prompt,
     )
 
-    reward_fn = weighted_reward([("correct", 1.0, countdown_correct)])
+    reward_components = [("correct", 1.0, countdown_correct)]
+    if reward_params.answer_tags_weight > 0:
+        reward_components.append(
+            ("answer_tags", reward_params.answer_tags_weight, answer_tags)
+        )
+    if reward_params.scratch_tags_weight > 0:
+        reward_components.append(
+            ("scratch_tags", reward_params.scratch_tags_weight, scratch_tags)
+        )
+    reward_fn = weighted_reward(reward_components)
 
     grammar_specs = build_countdown_grammar_specs(tokenizer)
 
