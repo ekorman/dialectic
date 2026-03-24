@@ -489,3 +489,163 @@ def build_countdown_cycle_grammar_factory(
         )
 
     return factory
+
+
+class _SimpleCycleState(IntEnum):
+    ROUTE = auto()
+    STEP_SPACE1 = auto()
+    STEP_NUM1 = auto()
+    STEP_SPACE2 = auto()
+    STEP_NUM2 = auto()
+    STEP_SPACE3 = auto()
+    STEP_RESULT = auto()
+    STEP_NEWLINE = auto()
+    ANS_BODY = auto()
+    ANS_NEWLINE = auto()
+    COMPLETE = auto()
+
+
+class CountdownSimpleCycleGrammar:
+    """Simplified grammar with single-token routing: S (scratch) or A (answer).
+
+    Format:
+        S 5 + 3 = 8\\n
+        A (5 + 3) * 2\\n
+    """
+
+    def __init__(
+        self,
+        *,
+        s_id: int,
+        a_id: int,
+        space_op_ids: list[int],
+        space_eq_id: int,
+        newline_id: int,
+        body_token_ids: list[int],
+        answer_body_token_ids: list[int],
+        space_id: int = 220,
+        allow_answer: bool = True,
+        force_answer: bool = False,
+    ):
+        self._s_id = s_id
+        self._a_id = a_id
+        self._space_op_ids = space_op_ids
+        self._space_eq_id = space_eq_id
+        self._newline_id = newline_id
+        self._space_id = space_id
+        self._state = _SimpleCycleState.ROUTE
+        self._took_answer_route = False
+
+        if force_answer:
+            route_ids = [a_id]
+        elif allow_answer:
+            route_ids = [s_id, a_id]
+        else:
+            route_ids = [s_id]
+
+        self._valid: dict[_SimpleCycleState, list[int]] = {
+            _SimpleCycleState.ROUTE: route_ids,
+            _SimpleCycleState.STEP_SPACE1: [space_id],
+            _SimpleCycleState.STEP_NUM1: DIGIT_TOKEN_IDS + space_op_ids,
+            _SimpleCycleState.STEP_SPACE2: [space_id],
+            _SimpleCycleState.STEP_NUM2: DIGIT_TOKEN_IDS + [space_eq_id],
+            _SimpleCycleState.STEP_SPACE3: [space_id],
+            _SimpleCycleState.STEP_RESULT: DIGIT_TOKEN_IDS + [newline_id],
+            _SimpleCycleState.ANS_BODY: answer_body_token_ids + [newline_id],
+        }
+
+    def valid_token_ids(self) -> list[int]:
+        return self._valid[self._state]
+
+    def advance(self, token_id: int) -> None:
+        s = self._state
+        if s == _SimpleCycleState.ROUTE:
+            if token_id == self._s_id:
+                self._state = _SimpleCycleState.STEP_SPACE1
+            elif token_id == self._a_id:
+                self._took_answer_route = True
+                self._state = _SimpleCycleState.ANS_BODY
+        elif s == _SimpleCycleState.STEP_SPACE1:
+            self._state = _SimpleCycleState.STEP_NUM1
+        elif s == _SimpleCycleState.STEP_NUM1:
+            if token_id in self._space_op_ids:
+                self._state = _SimpleCycleState.STEP_SPACE2
+        elif s == _SimpleCycleState.STEP_SPACE2:
+            self._state = _SimpleCycleState.STEP_NUM2
+        elif s == _SimpleCycleState.STEP_NUM2:
+            if token_id == self._space_eq_id:
+                self._state = _SimpleCycleState.STEP_SPACE3
+        elif s == _SimpleCycleState.STEP_SPACE3:
+            self._state = _SimpleCycleState.STEP_RESULT
+        elif s == _SimpleCycleState.STEP_RESULT:
+            if token_id == self._newline_id:
+                self._state = _SimpleCycleState.COMPLETE
+        elif s == _SimpleCycleState.ANS_BODY:
+            if token_id == self._newline_id:
+                self._state = _SimpleCycleState.COMPLETE
+
+    def is_complete(self) -> bool:
+        return self._state == _SimpleCycleState.COMPLETE
+
+    def is_terminal(self) -> bool:
+        return self._state == _SimpleCycleState.COMPLETE and self._took_answer_route
+
+    def reset(self) -> None:
+        self._state = _SimpleCycleState.ROUTE
+        self._took_answer_route = False
+
+
+def build_countdown_simple_cycle_grammar_factory(
+    tokenizer: Tokenizer,
+) -> Callable[[bool, bool], CountdownSimpleCycleGrammar]:
+    """Build a factory for CountdownSimpleCycleGrammar.
+
+    Parameters
+    ----------
+    tokenizer
+        Qwen tokenizer for resolving token IDs.
+
+    Returns
+    -------
+    Callable[[bool, bool], CountdownSimpleCycleGrammar]
+        Factory taking (allow_answer, force_answer).
+    """
+
+    def _ids(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False).ids
+
+    s_id = _ids("S")[0]
+    a_id = _ids("A")[0]
+    space_op_ids = [_ids(" +")[0], _ids(" -")[0], _ids(" *")[0], _ids(" /")[0]]
+    space_eq_id = _ids(" =")[0]
+    space_id = _ids(" ")[0]
+    newline_id = _ids("\n")[0]
+    space_paren_id = _ids(" (")[0]
+    close_paren_id = _ids(")")[0]
+
+    body_token_ids = (
+        DIGIT_TOKEN_IDS
+        + space_op_ids
+        + [space_eq_id, space_paren_id, close_paren_id, space_id]
+    )
+    answer_body_token_ids = (
+        DIGIT_TOKEN_IDS + space_op_ids + [space_paren_id, close_paren_id, space_id]
+    )
+
+    def factory(
+        allow_answer: bool = True, force_answer: bool = False
+    ) -> CountdownSimpleCycleGrammar:
+        return CountdownSimpleCycleGrammar(
+            s_id=s_id,
+            a_id=a_id,
+            space_op_ids=space_op_ids,
+            space_eq_id=space_eq_id,
+            newline_id=newline_id,
+            body_token_ids=body_token_ids,
+            answer_body_token_ids=answer_body_token_ids,
+            space_id=space_id,
+            allow_answer=allow_answer,
+            force_answer=force_answer,
+        )
+
+    return factory

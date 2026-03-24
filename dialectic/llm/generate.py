@@ -1665,6 +1665,7 @@ class NoiseReasoningGeneratorOutput:
     n_cycles: Int[torch.Tensor, " B"]
     noise_vectors: Float[torch.Tensor, "B C k D"]
     cycle_is_terminal: Bool[torch.Tensor, "B C"]
+    noise_shadow_ids: Int[torch.Tensor, "B C k"]
 
 
 @torch.inference_mode()
@@ -1681,6 +1682,7 @@ def generate_noise_reasoning_tokens(
     temperature: float = 1.0,
     attention_mask: Bool[Tensor, "B L"] | None = None,
     use_bf16: bool = False,
+    evict_noise_kv: bool = False,
 ) -> NoiseReasoningGeneratorOutput:
     """Generate tokens with noise injection + grammar-constrained hard decoding.
 
@@ -1732,6 +1734,9 @@ def generate_noise_reasoning_tokens(
     )
     hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
     noise_vectors = torch.zeros(B, max_cycles, n_noise_per_cycle, D, device=device)
+    noise_shadow_ids = torch.zeros(
+        B, max_cycles, n_noise_per_cycle, dtype=torch.long, device=device
+    )
     cycle_is_terminal = torch.zeros(B, max_cycles, dtype=torch.bool, device=device)
     n_cycles_out = torch.full((B,), max_cycles, dtype=torch.long, device=device)
     finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -1759,6 +1764,8 @@ def generate_noise_reasoning_tokens(
         noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
         noise_vectors[:, cycle] = noise
 
+        noise_kv_start = kv_caches[0].get_position_offset() if evict_noise_kv else -1
+
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
@@ -1771,6 +1778,8 @@ def generate_noise_reasoning_tokens(
                     attention_mask=attention_mask,
                     return_hidden_states=True,
                 )
+                shadow_logits = net.lm_head(h).squeeze(1)
+                noise_shadow_ids[:, cycle, ni] = shadow_logits.argmax(-1)
 
         cycle_finished = torch.zeros(B, dtype=torch.bool, device=device)
 
@@ -1831,6 +1840,18 @@ def generate_noise_reasoning_tokens(
                 if still_in_cycle[b]:
                     hard_token_lengths[b, cycle] = max_tokens_per_cycle
 
+        if evict_noise_kv and noise_kv_start >= 0:
+            for kv in kv_caches:
+                kv.evict_range(noise_kv_start, n_noise_per_cycle)
+            if attention_mask is not None:
+                attention_mask = torch.cat(
+                    [
+                        attention_mask[:, :noise_kv_start],
+                        attention_mask[:, noise_kv_start + n_noise_per_cycle :],
+                    ],
+                    dim=1,
+                )
+
         if not finished.all() and attention_mask is not None:
             last_mask = (~finished).unsqueeze(1)
             attention_mask = torch.cat([attention_mask, last_mask], dim=1)
@@ -1861,4 +1882,5 @@ def generate_noise_reasoning_tokens(
         n_cycles=n_cycles_out,
         noise_vectors=noise_vectors,
         cycle_is_terminal=cycle_is_terminal,
+        noise_shadow_ids=noise_shadow_ids,
     )

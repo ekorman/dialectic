@@ -45,6 +45,11 @@ Numbers: [5, 3, 2], Target: 13
 Now solve:
 Numbers: {numbers}, Target: {target}"""
 
+ENV_PROMPT_COUNTDOWN_MINIMAL = (
+    "Combine numbers to reach the target using +, -, *, /.\n\n"
+    "Numbers: {numbers}, Target: {target}"
+)
+
 
 @dataclass
 class PromptCollection:

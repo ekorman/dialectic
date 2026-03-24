@@ -934,6 +934,7 @@ def generate_noise_reasoning_rollout_batch(
     min_cycles: int = 0,
     max_tokens_per_cycle: int = 30,
     use_bf16: bool = False,
+    evict_noise_kv: bool = False,
 ) -> NoiseReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -971,6 +972,7 @@ def generate_noise_reasoning_rollout_batch(
             temperature=temperature if temperature > 0 else 1.0,
             attention_mask=attention_mask,
             use_bf16=use_bf16,
+            evict_noise_kv=evict_noise_kv,
         )
         hard_token_ids_list.append(gen_output.hard_token_ids)
         hard_token_lengths_list.append(gen_output.hard_token_lengths)

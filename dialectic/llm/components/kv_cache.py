@@ -51,6 +51,20 @@ class KVCache:
     def get_position_offset(self) -> int:
         return self._seq_len
 
+    def evict_range(self, start: int, count: int) -> None:
+        if self._keys is None or count <= 0:
+            return
+        end = start + count
+        tail_len = self._seq_len - end
+        if tail_len > 0:
+            self._keys[:, :, start : start + tail_len] = self._keys[
+                :, :, end : self._seq_len
+            ].clone()
+            self._values[:, :, start : start + tail_len] = self._values[
+                :, :, end : self._seq_len
+            ].clone()
+        self._seq_len -= count
+
 
 class GradSafeKVCache:
     """KV cache using list-based concatenation instead of in-place buffer writes.
@@ -86,6 +100,18 @@ class GradSafeKVCache:
 
     def get_position_offset(self) -> int:
         return self._seq_len
+
+    def evict_range(self, start: int, count: int) -> None:
+        if count <= 0:
+            return
+        end = start + count
+        k = torch.cat(self._keys_list, dim=2)
+        v = torch.cat(self._values_list, dim=2)
+        k = torch.cat([k[:, :, :start], k[:, :, end:]], dim=2)
+        v = torch.cat([v[:, :, :start], v[:, :, end:]], dim=2)
+        self._keys_list = [k]
+        self._values_list = [v]
+        self._seq_len -= count
 
     def freeze(self) -> None:
         """Detach and consolidate all cached K/V into a single tensor."""

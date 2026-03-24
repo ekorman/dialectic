@@ -13,11 +13,18 @@ from dialectic.experiments.params import (
     RewardParams,
     TrainParams,
 )
-from dialectic.experiments.prompts import ENV_PROMPT_WITH_SCRATCH_TAGS, PromptCollection
+from dialectic.experiments.prompts import (
+    ENV_PROMPT_COUNTDOWN_MINIMAL,
+    ENV_PROMPT_WITH_SCRATCH_TAGS,
+    PromptCollection,
+)
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.rl.env import CountdownEnv
-from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.grammar import build_countdown_cycle_grammar_factory
+from dialectic.rl.extractors import extract_countdown_answer
+from dialectic.rl.grammar import (
+    build_countdown_cycle_grammar_factory,
+    build_countdown_simple_cycle_grammar_factory,
+)
 from dialectic.rl.reward import (
     answer_tags,
     countdown_correct,
@@ -30,11 +37,18 @@ from dialectic.rl.train import (
     train_noise_reasoning_grpo,
 )
 
-COUNTDOWN_NOISE_REASONING_PROMPT = PromptCollection(
-    system_prompt=None,
-    env_prompt=ENV_PROMPT_WITH_SCRATCH_TAGS,
-    assistant_prefill=None,
-)
+PROMPT_STYLES = {
+    "scratch_tags": PromptCollection(
+        system_prompt=None,
+        env_prompt=ENV_PROMPT_WITH_SCRATCH_TAGS,
+        assistant_prefill=None,
+    ),
+    "minimal": PromptCollection(
+        system_prompt=None,
+        env_prompt=ENV_PROMPT_COUNTDOWN_MINIMAL,
+        assistant_prefill=None,
+    ),
+}
 
 
 @extty.experiment(project="noise-reasoning-grpo-countdown")
@@ -70,9 +84,13 @@ def train_noise_reasoning_grpo_countdown(
     net, opt = load_model_and_opt(train_params=train_params)
     tokenizer = model_info.load_tokenizer()
 
-    grammar_factory = build_countdown_cycle_grammar_factory(tokenizer)
+    prompt_style = noise_reasoning_params.prompt_style
+    if prompt_style == "minimal":
+        grammar_factory = build_countdown_simple_cycle_grammar_factory(tokenizer)
+    else:
+        grammar_factory = build_countdown_cycle_grammar_factory(tokenizer)
 
-    prompt_collection = COUNTDOWN_NOISE_REASONING_PROMPT
+    prompt_collection = PROMPT_STYLES[prompt_style]
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,
         system_prompt=prompt_collection.system_prompt,
@@ -116,7 +134,7 @@ def train_noise_reasoning_grpo_countdown(
         reward_fn=reward_fn,
         state_to_str=state_to_str,
         tokenizer=tokenizer,
-        extractor=extract_from_answer_tags,
+        extractor=extract_countdown_answer,
         eos_token_id=model_info.eos_token_id,
         pad_token_id=model_info.pad_token_id,
         grammar_factory=grammar_factory,
@@ -126,6 +144,7 @@ def train_noise_reasoning_grpo_countdown(
         max_cycles=noise_reasoning_params.max_cycles,
         min_cycles=noise_reasoning_params.min_cycles,
         max_tokens_per_cycle=noise_reasoning_params.max_tokens_per_cycle,
+        evict_noise_kv=noise_reasoning_params.evict_noise_kv,
         beta=grpo_params.beta,
         eps=grpo_params.eps,
         mu=grpo_params.mu,

@@ -3964,6 +3964,42 @@ def stack_and_pad_noise_reasoning(
     return stacked_ids, stacked_lengths, stacked_n, stacked_noise
 
 
+def _build_noise_eviction_mask(
+    L: int,
+    L_prompt: int,
+    k: int,
+    cycle_hard_lengths: list[int],
+    n_cycles: int,
+    device: torch.device,
+) -> Bool[torch.Tensor, "1 L L"]:
+    """Build a 2D attention mask that blocks hard tokens from attending to
+    previous cycles' noise positions.
+
+    Noise positions in the CURRENT cycle are visible. Noise positions from
+    earlier cycles are masked out for hard token queries (but visible to
+    other noise queries via standard causal masking).
+    """
+    mask = torch.ones(1, L, L, dtype=torch.bool, device=device).tril()
+
+    pos = L_prompt
+    noise_ranges: list[tuple[int, int]] = []
+    for c in range(n_cycles):
+        noise_start = pos
+        noise_end = pos + k
+        noise_ranges.append((noise_start, noise_end))
+        pos = noise_end + cycle_hard_lengths[c]
+
+    for c in range(n_cycles):
+        hard_start = noise_ranges[c][1]
+        hard_end = hard_start + cycle_hard_lengths[c]
+
+        for prev_c in range(c):
+            prev_noise_start, prev_noise_end = noise_ranges[prev_c]
+            mask[0, hard_start:hard_end, prev_noise_start:prev_noise_end] = False
+
+    return mask
+
+
 def compute_noise_reasoning_log_probs(
     *,
     net: BaseTransformer,
@@ -3974,8 +4010,9 @@ def compute_noise_reasoning_log_probs(
     n_cycles: Integer[torch.Tensor, "B G"],
     noise_vectors: Float[torch.Tensor, "B G C k D"],
     use_bf16: bool = False,
+    evict_noise_kv: bool = False,
 ) -> tuple[Float[torch.Tensor, "B G C"], Bool[torch.Tensor, "B G C"]]:
-    """Compute log probs for noise reasoning trajectories (single forward pass).
+    """Compute log probs for noise reasoning trajectories.
 
     Parameters
     ----------
@@ -4018,6 +4055,7 @@ def compute_noise_reasoning_log_probs(
     emb_parts: list[torch.Tensor] = []
     hard_positions: list[list[int]] = []
     hard_targets: list[list[int]] = []
+    cycle_hard_lengths: list[int] = []
 
     prompt_emb = net.embed_tokens(prompt_token_ids).float()
     flat_prompt_emb = prompt_emb.repeat_interleave(G, dim=0)
@@ -4029,6 +4067,7 @@ def compute_noise_reasoning_log_probs(
         pos += k
 
         max_t = int(flat_lengths[:, cycle].max().item())
+        cycle_hard_lengths.append(max_t)
         if max_t > 0:
             cycle_hard_ids = flat_hard[:, cycle, :max_t]
             cycle_hard_emb = net.embed_tokens(cycle_hard_ids).float()
@@ -4040,10 +4079,27 @@ def compute_noise_reasoning_log_probs(
             pos += max_t
 
     full_emb = torch.cat(emb_parts, dim=1)
+    L_total = full_emb.shape[1]
 
     flat_attn = attention_mask.repeat_interleave(G, dim=0)
-    full_mask = torch.ones(BG, full_emb.shape[1], dtype=torch.bool, device=device)
-    full_mask[:, :L_prompt] = flat_attn
+
+    if evict_noise_kv:
+        full_mask = _build_noise_eviction_mask(
+            L=L_total,
+            L_prompt=L_prompt,
+            k=k,
+            cycle_hard_lengths=cycle_hard_lengths,
+            n_cycles=max_actual_cycles,
+            device=device,
+        )
+        full_mask = full_mask.expand(BG, -1, -1).unsqueeze(1)
+        prompt_mask_2d = flat_attn.unsqueeze(1).unsqueeze(1)
+        full_mask = full_mask.clone()
+        full_mask[:, :, :, :L_prompt] &= prompt_mask_2d
+    else:
+        full_mask_1d = torch.ones(BG, L_total, dtype=torch.bool, device=device)
+        full_mask_1d[:, :L_prompt] = flat_attn
+        full_mask = full_mask_1d
 
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -4057,7 +4113,7 @@ def compute_noise_reasoning_log_probs(
     all_cycle_lps = []
     hp_idx = 0
     for cycle in range(max_actual_cycles):
-        max_t = int(flat_lengths[:, cycle].max().item())
+        max_t = cycle_hard_lengths[cycle]
         cycle_lp = torch.zeros(BG, device=device)
 
         for t in range(max_t):
@@ -4116,6 +4172,7 @@ def collect_noise_reasoning_micro_batch(
     max_tokens_per_cycle: int,
     collect_old_log_probs: bool,
     use_bf16: bool = False,
+    evict_noise_kv: bool = False,
 ) -> dict:
     rollout = generate_noise_reasoning_rollout_batch(
         net=net,
@@ -4136,6 +4193,7 @@ def collect_noise_reasoning_micro_batch(
         min_cycles=min_cycles,
         max_tokens_per_cycle=max_tokens_per_cycle,
         use_bf16=use_bf16,
+        evict_noise_kv=evict_noise_kv,
     )
 
     stacked_hard_ids, stacked_lengths, stacked_n_cycles, stacked_noise = (
@@ -4165,6 +4223,7 @@ def collect_noise_reasoning_micro_batch(
                     n_cycles=stacked_n_cycles,
                     noise_vectors=stacked_noise,
                     use_bf16=use_bf16,
+                    evict_noise_kv=evict_noise_kv,
                 )
         else:
             ref_log_probs = None
@@ -4180,6 +4239,7 @@ def collect_noise_reasoning_micro_batch(
                     n_cycles=stacked_n_cycles,
                     noise_vectors=stacked_noise,
                     use_bf16=use_bf16,
+                    evict_noise_kv=evict_noise_kv,
                 )
         else:
             old_log_probs = None
@@ -4235,6 +4295,7 @@ def train_noise_reasoning_grpo(
     max_cycles: int,
     min_cycles: int,
     max_tokens_per_cycle: int,
+    evict_noise_kv: bool = False,
     beta: float,
     eps: float | None,
     mu: int = 1,
@@ -4284,6 +4345,7 @@ def train_noise_reasoning_grpo(
             max_tokens_per_cycle=max_tokens_per_cycle,
             collect_old_log_probs=collect_old_log_probs,
             use_bf16=use_bf16,
+            evict_noise_kv=evict_noise_kv,
         )
 
     def recompute_fn(
@@ -4298,6 +4360,7 @@ def train_noise_reasoning_grpo(
             n_cycles=mb["n_cycles"],
             noise_vectors=mb["noise_vectors"],
             use_bf16=use_bf16,
+            evict_noise_kv=evict_noise_kv,
         )
 
     _grpo_train_loop(

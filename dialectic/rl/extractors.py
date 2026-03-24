@@ -21,6 +21,26 @@ def extract_from_answer_tags(text: str) -> str | None:
     return None
 
 
+def extract_from_a_line(text: str) -> str | None:
+    """Extract the expression from the last line starting with 'A '.
+
+    For the simplified grammar format where answer lines are ``A expr``.
+    """
+    for line in reversed(text.split("\n")):
+        line = line.strip()
+        if line.startswith("A "):
+            return line[2:].strip()
+    return None
+
+
+def extract_countdown_answer(text: str) -> str | None:
+    """Extract countdown answer from either tag or simplified format."""
+    result = extract_from_answer_tags(text)
+    if result is not None:
+        return result
+    return extract_from_a_line(text)
+
+
 _MOVE_ALIASES: dict[str, str] = {
     "u": "up",
     "d": "down",

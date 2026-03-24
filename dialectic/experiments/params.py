@@ -116,6 +116,8 @@ class NoiseReasoningParams:
     min_cycles: int = 0
     max_cycles: int = 10
     max_tokens_per_cycle: int = 30
+    evict_noise_kv: bool = False
+    prompt_style: str = "scratch_tags"
 
 
 @dataclass
