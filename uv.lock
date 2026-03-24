@@ -318,7 +318,7 @@ modal = [
 
 [package.metadata]
 requires-dist = [
-    { name = "extty", specifier = ">=0.13.0" },
+    { name = "extty", specifier = ">=0.14.0" },
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "requests", specifier = ">=2.31.0" },
@@ -347,16 +347,16 @@ wheels = [
 
 [[package]]
 name = "extty"
-version = "0.13.0"
+version = "0.14.0"
 source = { registry = "https://pypi.pols.ai/" }
 dependencies = [
     { name = "boto3" },
     { name = "nvidia-ml-py" },
     { name = "psutil" },
 ]
-sdist = { url = "https://pypi.pols.ai/packages/extty-0.13.0.tar.gz", hash = "sha256:27f908dfeba6bbb782d36910b7563f6f827dad3f2e6d103a427d0b87ee948a52" }
+sdist = { url = "https://pypi.pols.ai/packages/extty-0.14.0.tar.gz", hash = "sha256:29144459c413e7bd7053d0ba9312e48c09a6a4d59911c75f142f94683a624e9f" }
 wheels = [
-    { url = "https://pypi.pols.ai/packages/extty-0.13.0-py3-none-any.whl", hash = "sha256:5ed27870be26dd3ad09012cee144562a5e3e969510061fdb8bf49dbee4d066f4" },
+    { url = "https://pypi.pols.ai/packages/extty-0.14.0-py3-none-any.whl", hash = "sha256:03759dda61aedce592d217239c36289c219c4cf7c5f3003919e122a48d395c7f" },
 ]
 
 [[package]]
