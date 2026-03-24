@@ -24,6 +24,7 @@ from dialectic.rl.reward import RewardFn
 from dialectic.rl.rollout import (
     generate_grouped_variable_length_internal_reasoning_rollout_batch,
     generate_internal_reasoning_rollout_batch,
+    generate_noise_reasoning_rollout_batch,
     generate_rollout_batch,
     generate_soft_cycling_rollout_batch,
     generate_soft_rollout_batch,
@@ -3920,6 +3921,466 @@ def _create_soft_cycling_val_fn(
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
             min_cycles=min_cycles,
             evict_soft_kv=evict_soft_kv,
+        )
+
+    return _val
+
+
+# ---------------------------------------------------------------------------
+# Noise reasoning GRPO
+# ---------------------------------------------------------------------------
+
+
+def stack_and_pad_noise_reasoning(
+    hard_token_ids: list[Integer[torch.Tensor, "B C T"]],
+    hard_token_lengths: list[Integer[torch.Tensor, "B C"]],
+    n_cycles: list[Integer[torch.Tensor, " B"]],
+    noise_vectors: list[Float[torch.Tensor, "B C k D"]],
+    pad_token_id: int,
+) -> tuple[
+    Integer[torch.Tensor, "B G C T"],
+    Integer[torch.Tensor, "B G C"],
+    Integer[torch.Tensor, "B G"],
+    Float[torch.Tensor, "B G C k D"],
+]:
+    stacked_ids, stacked_lengths, stacked_n = (
+        stack_and_pad_variable_length_internal_reasoning(
+            hard_token_ids, hard_token_lengths, n_cycles, pad_token_id
+        )
+    )
+
+    B = noise_vectors[0].shape[0]
+    G = len(noise_vectors)
+    device = noise_vectors[0].device
+    max_c = stacked_ids.shape[2]
+    k = noise_vectors[0].shape[2]
+    D = noise_vectors[0].shape[3]
+
+    stacked_noise = torch.zeros(B, G, max_c, k, D, device=device)
+    for g, nv in enumerate(noise_vectors):
+        C_g = nv.shape[1]
+        stacked_noise[:, g, :C_g] = nv
+
+    return stacked_ids, stacked_lengths, stacked_n, stacked_noise
+
+
+def compute_noise_reasoning_log_probs(
+    *,
+    net: BaseTransformer,
+    prompt_token_ids: Integer[torch.Tensor, "B L"],
+    attention_mask: Bool[torch.Tensor, "B L"],
+    hard_token_ids: Integer[torch.Tensor, "B G C T_max"],
+    hard_token_lengths: Integer[torch.Tensor, "B G C"],
+    n_cycles: Integer[torch.Tensor, "B G"],
+    noise_vectors: Float[torch.Tensor, "B G C k D"],
+    use_bf16: bool = False,
+) -> tuple[Float[torch.Tensor, "B G C"], Bool[torch.Tensor, "B G C"]]:
+    """Compute log probs for noise reasoning trajectories (single forward pass).
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    prompt_token_ids
+        Prompt token IDs [B, L].
+    attention_mask
+        Attention mask for prompt [B, L].
+    hard_token_ids
+        Hard tokens per cycle [B, G, C, T_max].
+    hard_token_lengths
+        Hard token count per cycle [B, G, C].
+    n_cycles
+        Cycles per sample [B, G].
+    noise_vectors
+        Stored noise vectors [B, G, C, k, D].
+    use_bf16
+        Whether to use bf16 autocast.
+
+    Returns
+    -------
+    tuple[Tensor, Tensor]
+        (log_probs [B, G, C], completion_mask [B, G, C])
+    """
+    B, G, C, T_max = hard_token_ids.shape
+    k = noise_vectors.shape[3]
+    D = noise_vectors.shape[4]
+    BG = B * G
+    device = prompt_token_ids.device
+
+    flat_hard = hard_token_ids.view(BG, C, T_max)
+    flat_lengths = hard_token_lengths.view(BG, C)
+    flat_n_cycles = n_cycles.view(BG)
+    flat_noise = noise_vectors.view(BG, C, k, D)
+
+    L_prompt = prompt_token_ids.shape[1]
+    max_actual_cycles = int(flat_n_cycles.max().item())
+
+    emb_parts: list[torch.Tensor] = []
+    hard_positions: list[list[int]] = []
+    hard_targets: list[list[int]] = []
+
+    prompt_emb = net.embed_tokens(prompt_token_ids).float()
+    flat_prompt_emb = prompt_emb.repeat_interleave(G, dim=0)
+    emb_parts.append(flat_prompt_emb)
+    pos = L_prompt
+
+    for cycle in range(max_actual_cycles):
+        emb_parts.append(flat_noise[:, cycle].float())
+        pos += k
+
+        max_t = int(flat_lengths[:, cycle].max().item())
+        if max_t > 0:
+            cycle_hard_ids = flat_hard[:, cycle, :max_t]
+            cycle_hard_emb = net.embed_tokens(cycle_hard_ids).float()
+            emb_parts.append(cycle_hard_emb)
+
+            for t in range(max_t):
+                hard_positions.append([pos + t] * BG)
+                hard_targets.append(flat_hard[:, cycle, t].tolist())
+            pos += max_t
+
+    full_emb = torch.cat(emb_parts, dim=1)
+
+    flat_attn = attention_mask.repeat_interleave(G, dim=0)
+    full_mask = torch.ones(BG, full_emb.shape[1], dtype=torch.bool, device=device)
+    full_mask[:, :L_prompt] = flat_attn
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        all_logits = net(
+            full_emb,
+            return_all_logits=True,
+            attention_mask=full_mask,
+        )
+
+    all_cycle_lps = []
+    hp_idx = 0
+    for cycle in range(max_actual_cycles):
+        max_t = int(flat_lengths[:, cycle].max().item())
+        cycle_lp = torch.zeros(BG, device=device)
+
+        for t in range(max_t):
+            positions = hard_positions[hp_idx]
+            targets = torch.tensor(
+                hard_targets[hp_idx], dtype=torch.long, device=device
+            )
+            logits_t = all_logits[
+                torch.arange(BG, device=device),
+                torch.tensor(positions, device=device) - 1,
+            ].float()
+            lp_all = torch.log_softmax(logits_t, dim=-1)
+            lp = lp_all[torch.arange(BG, device=device), targets]
+
+            token_mask = (t < flat_lengths[:, cycle]) & (cycle < flat_n_cycles)
+            lp = torch.where(token_mask, lp, torch.zeros_like(lp))
+            cycle_lp = cycle_lp + lp
+            hp_idx += 1
+
+        all_cycle_lps.append(cycle_lp)
+
+    log_probs = torch.stack(all_cycle_lps, dim=1)
+    if max_actual_cycles < C:
+        pad_lp_nr = torch.zeros(BG, C - max_actual_cycles, device=device)
+        log_probs = torch.cat([log_probs, pad_lp_nr], dim=1)
+
+    log_probs = log_probs.view(B, G, C)
+
+    cycle_indices_nr = (
+        torch.arange(C, device=device).unsqueeze(0).unsqueeze(0).expand(B, G, C)
+    )
+    completion_mask = cycle_indices_nr < n_cycles.unsqueeze(-1)
+
+    return log_probs, completion_mask
+
+
+def collect_noise_reasoning_micro_batch(
+    *,
+    net: BaseTransformer,
+    ref_net: BaseTransformer | None,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    extractor: Callable[[str], Any],
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_factory: Callable,
+    batch_size: int,
+    group_size: int,
+    n_noise_per_cycle: int,
+    noise_std: float,
+    temperature: float,
+    max_cycles: int,
+    min_cycles: int,
+    max_tokens_per_cycle: int,
+    collect_old_log_probs: bool,
+    use_bf16: bool = False,
+) -> dict:
+    rollout = generate_noise_reasoning_rollout_batch(
+        net=net,
+        env=env,
+        reward_fn=reward_fn,
+        state_to_str=state_to_str,
+        tokenizer=tokenizer,
+        extractor=extractor,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        grammar_factory=grammar_factory,
+        batch_size=batch_size,
+        group_size=group_size,
+        n_noise_per_cycle=n_noise_per_cycle,
+        noise_std=noise_std,
+        temperature=temperature,
+        max_cycles=max_cycles,
+        min_cycles=min_cycles,
+        max_tokens_per_cycle=max_tokens_per_cycle,
+        use_bf16=use_bf16,
+    )
+
+    stacked_hard_ids, stacked_lengths, stacked_n_cycles, stacked_noise = (
+        stack_and_pad_noise_reasoning(
+            rollout.hard_token_ids,
+            rollout.hard_token_lengths,
+            rollout.n_cycles,
+            rollout.noise_vectors,
+            pad_token_id,
+        )
+    )
+
+    device = next(net.parameters()).device
+    t_logprobs_start = time.perf_counter()
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        if ref_net is not None:
+            with torch.no_grad():
+                ref_log_probs, _ = compute_noise_reasoning_log_probs(
+                    net=ref_net,
+                    prompt_token_ids=rollout.prompt_token_ids,
+                    attention_mask=rollout.attention_mask,
+                    hard_token_ids=stacked_hard_ids,
+                    hard_token_lengths=stacked_lengths,
+                    n_cycles=stacked_n_cycles,
+                    noise_vectors=stacked_noise,
+                    use_bf16=use_bf16,
+                )
+        else:
+            ref_log_probs = None
+
+        if collect_old_log_probs:
+            with torch.no_grad():
+                old_log_probs, completion_mask = compute_noise_reasoning_log_probs(
+                    net=net,
+                    prompt_token_ids=rollout.prompt_token_ids,
+                    attention_mask=rollout.attention_mask,
+                    hard_token_ids=stacked_hard_ids,
+                    hard_token_lengths=stacked_lengths,
+                    n_cycles=stacked_n_cycles,
+                    noise_vectors=stacked_noise,
+                    use_bf16=use_bf16,
+                )
+        else:
+            old_log_probs = None
+            C = stacked_hard_ids.shape[2]
+            ci = torch.arange(C, device=device)
+            ci = (
+                ci.unsqueeze(0)
+                .unsqueeze(0)
+                .expand(stacked_hard_ids.shape[0], stacked_hard_ids.shape[1], C)
+            )
+            completion_mask = ci < stacked_n_cycles.unsqueeze(-1)
+
+    t_logprobs = time.perf_counter() - t_logprobs_start
+
+    mean_n_cycles = stacked_n_cycles.float().mean().item()
+
+    return {
+        "prompts": rollout.prompts,
+        "env_responses": rollout.env_responses,
+        "prompt_token_ids": rollout.prompt_token_ids,
+        "attention_mask": rollout.attention_mask,
+        "hard_token_ids": stacked_hard_ids,
+        "hard_token_lengths": stacked_lengths,
+        "n_cycles": stacked_n_cycles,
+        "noise_vectors": stacked_noise,
+        "output_strs": rollout.output_strs,
+        "reward_results": rollout.reward_results,
+        "rewards": rollout.rewards,
+        "ref_log_probs": ref_log_probs,
+        "old_log_probs": old_log_probs,
+        "completion_mask": completion_mask,
+        "t_gen": rollout.t_generation,
+        "t_logprobs": t_logprobs,
+        "mean_n_cycles": mean_n_cycles,
+    }
+
+
+def train_noise_reasoning_grpo(
+    *,
+    net: BaseTransformer,
+    opt: torch.optim.Optimizer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    extractor: Callable[[str], Any],
+    eos_token_id: int,
+    pad_token_id: int,
+    grammar_factory: Callable,
+    n_noise_per_cycle: int,
+    noise_std: float,
+    temperature: float,
+    max_cycles: int,
+    min_cycles: int,
+    max_tokens_per_cycle: int,
+    beta: float,
+    eps: float | None,
+    mu: int = 1,
+    max_episodes: int,
+    update_ref_net_batch_cadence: int | None,
+    batch_size: int,
+    group_size: int,
+    advantage_fn: Callable[
+        [Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]
+    ] = grpo_advantage,
+    normalize_by_sequence_length: bool = True,
+    accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    use_bf16: bool = False,
+    save_ckpt_freq: int = sys.maxsize,
+    val_freq: int = sys.maxsize,
+    val_episodes: int = 0,
+    val_envs: Sequence[Env] = (),
+    val_batch_size: int = 0,
+    clip_ratio_c: float = 3.0,
+    warmup_steps: int = 0,
+) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
+    collect_old_log_probs = eps is not None
+
+    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
+        return collect_noise_reasoning_micro_batch(
+            net=net,
+            ref_net=ref_net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            extractor=extractor,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            grammar_factory=grammar_factory,
+            batch_size=batch_size,
+            group_size=group_size,
+            n_noise_per_cycle=n_noise_per_cycle,
+            noise_std=noise_std,
+            temperature=temperature,
+            max_cycles=max_cycles,
+            min_cycles=min_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            collect_old_log_probs=collect_old_log_probs,
+            use_bf16=use_bf16,
+        )
+
+    def recompute_fn(
+        net: BaseTransformer, mb: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return compute_noise_reasoning_log_probs(
+            net=net,
+            prompt_token_ids=mb["prompt_token_ids"],
+            attention_mask=mb["attention_mask"],
+            hard_token_ids=mb["hard_token_ids"],
+            hard_token_lengths=mb["hard_token_lengths"],
+            n_cycles=mb["n_cycles"],
+            noise_vectors=mb["noise_vectors"],
+            use_bf16=use_bf16,
+        )
+
+    _grpo_train_loop(
+        net=net,
+        opt=opt,
+        collect_fn=collect_fn,
+        recompute_log_probs_fn=recompute_fn,
+        beta=beta,
+        eps=eps,
+        mu=mu,
+        max_episodes=max_episodes,
+        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
+        batch_size=batch_size,
+        group_size=group_size,
+        advantage_fn=advantage_fn,
+        normalize_by_sequence_length=normalize_by_sequence_length,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        use_bf16=use_bf16,
+        save_ckpt_freq=save_ckpt_freq,
+        val_envs=val_envs,
+        val_freq=val_freq,
+        val_fn=_create_noise_reasoning_val_fn(
+            net=net,
+            reward_fn=reward_fn,
+            extractor=extractor,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=pad_token_id,
+            grammar_factory=grammar_factory,
+            n_noise_per_cycle=n_noise_per_cycle,
+            noise_std=noise_std,
+            max_cycles=max_cycles,
+            min_cycles=min_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            val_episodes=val_episodes,
+            val_batch_size=val_batch_size,
+            use_bf16=use_bf16,
+        ),
+        warmup_steps=warmup_steps,
+    )
+
+
+def _create_noise_reasoning_val_fn(
+    *,
+    net: BaseTransformer,
+    reward_fn: RewardFn,
+    extractor: Callable[[str], Any],
+    state_to_str: Callable,
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    grammar_factory: Callable,
+    n_noise_per_cycle: int,
+    noise_std: float,
+    max_cycles: int,
+    min_cycles: int,
+    max_tokens_per_cycle: int,
+    val_episodes: int,
+    val_batch_size: int,
+    use_bf16: bool,
+):
+    from dialectic.rl.evaluate import evaluate_noise_reasoning
+
+    def _val(env: Env):
+        return evaluate_noise_reasoning(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            extractor=extractor,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            pad_token_id=pad_token_id,
+            grammar_factory=grammar_factory,
+            n_noise_per_cycle=n_noise_per_cycle,
+            noise_std=noise_std,
+            max_cycles=max_cycles,
+            min_cycles=min_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            max_episodes=val_episodes,
+            batch_size=val_batch_size,
+            temperature=0.0,
+            use_bf16=use_bf16,
+            n_examples=val_episodes,
         )
 
     return _val

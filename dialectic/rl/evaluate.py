@@ -7,6 +7,7 @@ from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import (
+    generate_noise_reasoning_tokens,
     generate_soft_cycling_tokens,
     generate_variable_length_internal_reasoning_tokens,
     generate_with_soft_prefill,
@@ -724,5 +725,116 @@ def evaluate_soft_cycling(
         n_episodes=n_episodes,
         reward_mean=reward_mean,
         reward_std=reward_std,
+        component_means=component_means,
+    ), examples
+
+
+@torch.no_grad()
+def evaluate_noise_reasoning(
+    *,
+    net: BaseTransformer,
+    env: Env[T, A],
+    reward_fn: RewardFn[T, E],
+    extractor: Callable[[str], E],
+    state_to_str: Callable[[T], str],
+    tokenizer: Tokenizer,
+    pad_token_id: int,
+    grammar_factory: Callable,
+    n_noise_per_cycle: int,
+    noise_std: float,
+    max_cycles: int,
+    min_cycles: int,
+    max_tokens_per_cycle: int,
+    max_episodes: int,
+    batch_size: int = 1,
+    temperature: float = 0.0,
+    n_examples: int = 10,
+    use_bf16: bool = False,
+) -> tuple[EvaluationResult, list[extty.Example]]:
+    all_rewards: list[float] = []
+    all_reward_results: list[dict[str, float]] = []
+    all_prompts: list[str] = []
+    all_output_strs: list[str] = []
+
+    n_episodes = 0
+    while n_episodes < max_episodes:
+        current_batch_size = min(batch_size, max_episodes - n_episodes)
+
+        env_responses = get_batch(env, current_batch_size)
+        prompts = [state_to_str(resp.data) for resp in env_responses]
+        device = next(net.parameters()).device
+
+        tokenizer.enable_padding(direction="left")
+        tokens = tokenizer.encode_batch(prompts)
+        attention_mask = torch.tensor(
+            [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+        )
+        token_ids = torch.tensor([t.ids for t in tokens], device=device)
+
+        gen_output = generate_noise_reasoning_tokens(
+            net=net,
+            token_ids=token_ids,
+            grammar_factory=grammar_factory,
+            n_noise_per_cycle=n_noise_per_cycle,
+            noise_std=noise_std,
+            max_cycles=max_cycles,
+            min_cycles=min_cycles,
+            max_tokens_per_cycle=max_tokens_per_cycle,
+            pad_token_id=pad_token_id,
+            temperature=temperature if temperature > 0 else 1.0,
+            attention_mask=attention_mask,
+            use_bf16=use_bf16,
+        )
+
+        for b in range(current_batch_size):
+            nc = gen_output.n_cycles[b].item()
+            parts: list[str] = []
+            for c in range(nc):
+                hl = gen_output.hard_token_lengths[b, c].item()
+                if hl > 0:
+                    toks = gen_output.hard_token_ids[b, c, :hl].tolist()
+                    parts.append(tokenizer.decode(toks))
+            out_str = "\n".join(parts)
+
+            result = reward_fn(
+                env_response=env_responses[b],
+                raw_model_output=out_str,
+                extracted_model_output=extractor(out_str),
+            )
+            all_rewards.append(result.total)
+            all_prompts.append(prompts[b])
+            all_output_strs.append(out_str)
+            all_reward_results.append(result.components)
+
+        n_episodes += current_batch_size
+
+    reward_tensor = torch.tensor(all_rewards)
+    nr_mean = reward_tensor.mean().item() if all_rewards else 0.0
+    nr_std = reward_tensor.std().item() if len(all_rewards) > 1 else 0.0
+
+    component_means: dict[str, float] = {}
+    if all_reward_results:
+        all_components: dict[str, list[float]] = {}
+        for r in all_reward_results:
+            for name, value in r.items():
+                all_components.setdefault(name, []).append(value)
+        component_means = {
+            name: sum(vals) / len(vals) for name, vals in all_components.items()
+        }
+
+    sample_idxs = range(min(n_examples, len(all_prompts)))
+    examples = [
+        extty.Example(
+            prompt=all_prompts[i],
+            responses=[all_output_strs[i]],
+            rewards=[all_reward_results[i]],
+        )
+        for i in sample_idxs
+    ]
+
+    return EvaluationResult(
+        n_episodes=n_episodes,
+        reward_mean=nr_mean,
+        reward_std=nr_std,
         component_means=component_means,
     ), examples

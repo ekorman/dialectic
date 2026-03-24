@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import torch
 from jaxtyping import Bool, Float, Int
@@ -15,6 +15,7 @@ from dialectic.llm.components import KVCache
 
 if TYPE_CHECKING:
     from dialectic.rl.grammar import Grammar, GrammarSpec
+
 from dialectic.llm.templates import (
     Message,
     get_llama_input_text_from_messages,
@@ -1654,4 +1655,210 @@ def generate_soft_cycling_tokens(
         soft_lengths=soft_lengths,
         shadow_ids=shadow_ids,
         cycle_is_terminal=cycle_is_terminal_out,
+    )
+
+
+@dataclass
+class NoiseReasoningGeneratorOutput:
+    hard_token_ids: Int[torch.Tensor, "B C T_max"]
+    hard_token_lengths: Int[torch.Tensor, "B C"]
+    n_cycles: Int[torch.Tensor, " B"]
+    noise_vectors: Float[torch.Tensor, "B C k D"]
+    cycle_is_terminal: Bool[torch.Tensor, "B C"]
+
+
+@torch.inference_mode()
+def generate_noise_reasoning_tokens(
+    net: BaseTransformer,
+    token_ids: Int[Tensor, "B L"],
+    grammar_factory: Callable[[bool], Any],
+    n_noise_per_cycle: int,
+    noise_std: float,
+    max_cycles: int = 10,
+    min_cycles: int = 0,
+    max_tokens_per_cycle: int = 30,
+    pad_token_id: int = 151643,
+    temperature: float = 1.0,
+    attention_mask: Bool[Tensor, "B L"] | None = None,
+    use_bf16: bool = False,
+) -> NoiseReasoningGeneratorOutput:
+    """Generate tokens with noise injection + grammar-constrained hard decoding.
+
+    Parameters
+    ----------
+    net
+        Transformer model.
+    token_ids
+        Prompt token IDs [B, L].
+    grammar_factory
+        Callable(allow_answer) → Grammar with is_terminal() method.
+    n_noise_per_cycle
+        Number of noise vectors (k) per cycle.
+    noise_std
+        Standard deviation for noise sampling.
+    max_cycles
+        Maximum number of cycles.
+    min_cycles
+        Minimum non-terminal cycles before answer is allowed.
+    max_tokens_per_cycle
+        Maximum hard tokens per cycle.
+    temperature
+        Sampling temperature for hard tokens.
+    """
+    device = token_ids.device
+    B = token_ids.shape[0]
+    D = net.d
+
+    max_seq_len = (
+        token_ids.shape[1]
+        + max_cycles * (n_noise_per_cycle + max_tokens_per_cycle)
+        + 16
+    )
+    kv_caches = [
+        KVCache(
+            max_seq_len=max_seq_len,
+            num_heads=net.attn_num_kv_heads,
+            head_dim=net.attn_head_d,
+            device=device,
+        )
+        for _ in range(len(net.layers))
+    ]
+
+    hard_token_ids_out = torch.full(
+        (B, max_cycles, max_tokens_per_cycle),
+        pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+    hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
+    noise_vectors = torch.zeros(B, max_cycles, n_noise_per_cycle, D, device=device)
+    cycle_is_terminal = torch.zeros(B, max_cycles, dtype=torch.bool, device=device)
+    n_cycles_out = torch.full((B,), max_cycles, dtype=torch.long, device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    if attention_mask is not None:
+        ones = torch.ones(B, 1, dtype=torch.bool, device=device)
+
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        net(
+            token_ids,
+            kv_caches=kv_caches,
+            attention_mask=attention_mask,
+        )
+
+    for cycle in range(max_cycles):
+        if finished.all():
+            break
+
+        allow_answer = cycle >= min_cycles
+        force_answer = cycle == max_cycles - 1 and allow_answer
+        grammars = [grammar_factory(allow_answer, force_answer) for _ in range(B)]
+
+        noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
+        noise_vectors[:, cycle] = noise
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            for ni in range(n_noise_per_cycle):
+                if attention_mask is not None:
+                    attention_mask = torch.cat([attention_mask, ones], dim=1)
+                h = net(
+                    noise[:, ni : ni + 1],
+                    kv_caches=kv_caches,
+                    attention_mask=attention_mask,
+                    return_hidden_states=True,
+                )
+
+        cycle_finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for t in range(max_tokens_per_cycle):
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                logits = net.lm_head(h).squeeze(1).float()
+
+            grammar_mask = torch.full_like(logits, float("-inf"))
+            for b in range(B):
+                if finished[b] or cycle_finished[b]:
+                    grammar_mask[b, pad_token_id] = 0.0
+                else:
+                    valid = grammars[b].valid_token_ids()
+                    grammar_mask[b, valid] = 0.0
+
+            constrained_logits = logits + grammar_mask
+            if temperature > 0:
+                probs = torch.softmax(constrained_logits / temperature, dim=-1)
+                token = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                token = constrained_logits.argmax(dim=-1)
+
+            hard_token_ids_out[:, cycle, t] = token
+
+            for b in range(B):
+                if not finished[b] and not cycle_finished[b]:
+                    grammars[b].advance(token[b].item())
+                    if grammars[b].is_complete():
+                        hard_token_lengths[b, cycle] = t + 1
+                        if grammars[b].is_terminal():
+                            cycle_is_terminal[b, cycle] = True
+                            finished[b] = True
+                            n_cycles_out[b] = cycle + 1
+                        cycle_finished[b] = True
+
+            if cycle_finished.all() or finished.all():
+                break
+
+            if attention_mask is not None:
+                pos_valid = (~(cycle_finished | finished)).unsqueeze(1)
+                attention_mask = torch.cat([attention_mask, pos_valid], dim=1)
+
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                h = net(
+                    token.unsqueeze(1),
+                    kv_caches=kv_caches,
+                    attention_mask=attention_mask,
+                    return_hidden_states=True,
+                )
+
+        still_in_cycle = ~cycle_finished & ~finished
+        if still_in_cycle.any():
+            for b in range(B):
+                if still_in_cycle[b]:
+                    hard_token_lengths[b, cycle] = max_tokens_per_cycle
+
+        if not finished.all() and attention_mask is not None:
+            last_mask = (~finished).unsqueeze(1)
+            attention_mask = torch.cat([attention_mask, last_mask], dim=1)
+            last_tok_idx = (hard_token_lengths[:, cycle] - 1).clamp(min=0)
+            last_tok = (
+                hard_token_ids_out[:, cycle]
+                .gather(1, last_tok_idx.unsqueeze(1))
+                .squeeze(1)
+            )
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                h = net(
+                    last_tok.unsqueeze(1),
+                    kv_caches=kv_caches,
+                    attention_mask=attention_mask,
+                    return_hidden_states=True,
+                )
+
+    still_going = ~finished
+    for b in range(B):
+        if still_going[b]:
+            n_cycles_out[b] = max_cycles
+
+    return NoiseReasoningGeneratorOutput(
+        hard_token_ids=hard_token_ids_out,
+        hard_token_lengths=hard_token_lengths,
+        n_cycles=n_cycles_out,
+        noise_vectors=noise_vectors,
+        cycle_is_terminal=cycle_is_terminal,
     )

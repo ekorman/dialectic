@@ -283,3 +283,209 @@ def countdown_solution_to_hard_tokens(
         hard_token_lengths[c] = length
 
     return hard_token_ids, hard_token_lengths, min(n_cycles, max_cycles)
+
+
+class _CycleState(IntEnum):
+    OPEN = auto()
+    ROUTE = auto()
+    SCR_ATCH = auto()
+    SCR_GT = auto()
+    STEP_SPACE1 = auto()
+    STEP_NUM1 = auto()
+    STEP_SPACE2 = auto()
+    STEP_NUM2 = auto()
+    STEP_SPACE3 = auto()
+    STEP_RESULT = auto()
+    STEP_CLOSE1 = auto()
+    STEP_CLOSE2 = auto()
+    STEP_CLOSE3 = auto()
+    ANS_GT = auto()
+    ANS_BODY = auto()
+    ANS_CLOSE1 = auto()
+    ANS_CLOSE2 = auto()
+    COMPLETE = auto()
+
+
+class CountdownCycleGrammar:
+    """Grammar for a full cycle including opening tag with SCRATCH/answer routing.
+
+    The model chooses at the ROUTE state whether to generate a SCRATCH step
+    or an answer. ``allow_answer`` controls whether the answer route is available.
+    """
+
+    def __init__(
+        self,
+        *,
+        open_id: int,
+        scr_id: int,
+        atch_id: int,
+        answer_id: int,
+        gt_id: int,
+        space_op_ids: list[int],
+        space_eq_id: int,
+        space_close_id: int,
+        scratch_close_tag_ids: tuple[int, ...],
+        answer_close_tag_ids: tuple[int, ...],
+        body_token_ids: list[int],
+        space_id: int = 220,
+        allow_answer: bool = True,
+        force_answer: bool = False,
+    ):
+        self._open_id = open_id
+        self._scr_id = scr_id
+        self._answer_id = answer_id
+        self._space_op_ids = space_op_ids
+        self._space_eq_id = space_eq_id
+        self._space_close_id = space_close_id
+        self._scratch_close_tag_ids = scratch_close_tag_ids
+        self._answer_close_tag_ids = answer_close_tag_ids
+        self._space_id = space_id
+        self._state = _CycleState.OPEN
+        self._took_answer_route = False
+
+        if force_answer:
+            route_ids = [answer_id]
+        elif allow_answer:
+            route_ids = [scr_id, answer_id]
+        else:
+            route_ids = [scr_id]
+
+        self._valid: dict[_CycleState, list[int]] = {
+            _CycleState.OPEN: [open_id],
+            _CycleState.ROUTE: route_ids,
+            _CycleState.SCR_ATCH: [atch_id],
+            _CycleState.SCR_GT: [gt_id],
+            _CycleState.STEP_SPACE1: [space_id],
+            _CycleState.STEP_NUM1: DIGIT_TOKEN_IDS + space_op_ids,
+            _CycleState.STEP_SPACE2: [space_id],
+            _CycleState.STEP_NUM2: DIGIT_TOKEN_IDS + [space_eq_id],
+            _CycleState.STEP_SPACE3: [space_id],
+            _CycleState.STEP_RESULT: DIGIT_TOKEN_IDS + [space_close_id],
+            _CycleState.STEP_CLOSE1: [scratch_close_tag_ids[0]],
+            _CycleState.STEP_CLOSE2: [scratch_close_tag_ids[1]],
+            _CycleState.STEP_CLOSE3: [scratch_close_tag_ids[2]],
+            _CycleState.ANS_GT: [gt_id],
+            _CycleState.ANS_BODY: body_token_ids + [space_close_id],
+            _CycleState.ANS_CLOSE1: [answer_close_tag_ids[0]],
+            _CycleState.ANS_CLOSE2: [answer_close_tag_ids[1]],
+        }
+
+    def valid_token_ids(self) -> list[int]:
+        return self._valid[self._state]
+
+    def advance(self, token_id: int) -> None:
+        s = self._state
+        if s == _CycleState.OPEN:
+            self._state = _CycleState.ROUTE
+        elif s == _CycleState.ROUTE:
+            if token_id == self._scr_id:
+                self._state = _CycleState.SCR_ATCH
+            elif token_id == self._answer_id:
+                self._took_answer_route = True
+                self._state = _CycleState.ANS_GT
+        elif s == _CycleState.SCR_ATCH:
+            self._state = _CycleState.SCR_GT
+        elif s == _CycleState.SCR_GT:
+            self._state = _CycleState.STEP_SPACE1
+        elif s == _CycleState.STEP_SPACE1:
+            self._state = _CycleState.STEP_NUM1
+        elif s == _CycleState.STEP_NUM1:
+            if token_id in self._space_op_ids:
+                self._state = _CycleState.STEP_SPACE2
+        elif s == _CycleState.STEP_SPACE2:
+            self._state = _CycleState.STEP_NUM2
+        elif s == _CycleState.STEP_NUM2:
+            if token_id == self._space_eq_id:
+                self._state = _CycleState.STEP_SPACE3
+        elif s == _CycleState.STEP_SPACE3:
+            self._state = _CycleState.STEP_RESULT
+        elif s == _CycleState.STEP_RESULT:
+            if token_id == self._space_close_id:
+                self._state = _CycleState.STEP_CLOSE1
+        elif s == _CycleState.STEP_CLOSE1:
+            self._state = _CycleState.STEP_CLOSE2
+        elif s == _CycleState.STEP_CLOSE2:
+            self._state = _CycleState.STEP_CLOSE3
+        elif s == _CycleState.STEP_CLOSE3:
+            self._state = _CycleState.COMPLETE
+        elif s == _CycleState.ANS_GT:
+            self._state = _CycleState.ANS_BODY
+        elif s == _CycleState.ANS_BODY:
+            if token_id == self._space_close_id:
+                self._state = _CycleState.ANS_CLOSE1
+        elif s == _CycleState.ANS_CLOSE1:
+            self._state = _CycleState.ANS_CLOSE2
+        elif s == _CycleState.ANS_CLOSE2:
+            self._state = _CycleState.COMPLETE
+
+    def is_complete(self) -> bool:
+        return self._state == _CycleState.COMPLETE
+
+    def is_terminal(self) -> bool:
+        return self._state == _CycleState.COMPLETE and self._took_answer_route
+
+    def reset(self) -> None:
+        self._state = _CycleState.OPEN
+        self._took_answer_route = False
+
+
+def build_countdown_cycle_grammar_factory(
+    tokenizer: Tokenizer,
+) -> Callable[[bool], CountdownCycleGrammar]:
+    """Build a factory that creates CountdownCycleGrammar instances.
+
+    Parameters
+    ----------
+    tokenizer
+        Qwen tokenizer for resolving token IDs.
+
+    Returns
+    -------
+    Callable[[bool], CountdownCycleGrammar]
+        Factory taking ``allow_answer`` and returning a grammar instance.
+    """
+
+    def _ids(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False).ids
+
+    open_id = _ids("<")[0]
+    scr_id = _ids("SCR")[0]
+    atch_id = _ids("ATCH")[0]
+    answer_id = _ids("answer")[0]
+    gt_id = _ids(">")[0]
+    space_close_id = _ids(" </")[0]
+    scratch_close_tag = tuple(_ids("</SCRATCH>")[1:])
+    answer_close_tag = tuple(_ids("</answer>")[1:])
+    space_op_ids = [_ids(" +")[0], _ids(" -")[0], _ids(" *")[0], _ids(" /")[0]]
+    space_eq_id = _ids(" =")[0]
+    space_id = _ids(" ")[0]
+    space_paren_id = _ids(" (")[0]
+    close_paren_id = _ids(")")[0]
+
+    body_token_ids = (
+        DIGIT_TOKEN_IDS
+        + space_op_ids
+        + [space_eq_id, space_paren_id, close_paren_id, space_id]
+    )
+
+    def factory(
+        allow_answer: bool = True, force_answer: bool = False
+    ) -> CountdownCycleGrammar:
+        return CountdownCycleGrammar(
+            open_id=open_id,
+            scr_id=scr_id,
+            atch_id=atch_id,
+            answer_id=answer_id,
+            gt_id=gt_id,
+            space_op_ids=space_op_ids,
+            space_eq_id=space_eq_id,
+            space_close_id=space_close_id,
+            scratch_close_tag_ids=scratch_close_tag,
+            answer_close_tag_ids=answer_close_tag,
+            body_token_ids=body_token_ids,
+            space_id=space_id,
+            allow_answer=allow_answer,
+            force_answer=force_answer,
+        )
+
+    return factory

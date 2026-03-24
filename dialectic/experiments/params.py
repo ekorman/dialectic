@@ -110,6 +110,15 @@ class SoftCyclingParams:
 
 
 @dataclass
+class NoiseReasoningParams:
+    n_noise_per_cycle: int = 8
+    noise_std: float = 1.0
+    min_cycles: int = 0
+    max_cycles: int = 10
+    max_tokens_per_cycle: int = 30
+
+
+@dataclass
 class SingleStepSFTParams:
     max_answer_tokens: int
     normalize_by_sequence_length: bool
