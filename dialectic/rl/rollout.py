@@ -900,6 +900,7 @@ class NoiseReasoningRolloutBatch(Generic[T]):
     env_responses: list[EnvResponse[T]]
     prompts: list[str]
     output_strs: list[list[str]]
+    display_strs: list[list[str]]
     reward_results: list[list[RewardResult]]
     rewards: Float[torch.Tensor, "G B"]
     hard_token_ids: list[Int[torch.Tensor, "B C T_max"]]
@@ -950,6 +951,7 @@ def generate_noise_reasoning_rollout_batch(
     n_cycles_list: list[Int[torch.Tensor, " B"]] = []
     noise_vectors_list: list[Float[torch.Tensor, "B C k D"]] = []
     cycle_is_terminal_list: list[Bool[torch.Tensor, "B C"]] = []
+    noise_shadow_ids_list: list[Int[torch.Tensor, "B C k"]] = []
 
     was_training = net.training
     net.eval()
@@ -975,24 +977,38 @@ def generate_noise_reasoning_rollout_batch(
         n_cycles_list.append(gen_output.n_cycles)
         noise_vectors_list.append(gen_output.noise_vectors)
         cycle_is_terminal_list.append(gen_output.cycle_is_terminal)
+        noise_shadow_ids_list.append(gen_output.noise_shadow_ids)
 
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
         net.train()
 
     output_strs: list[list[str]] = []
+    display_strs: list[list[str]] = []
     for g_idx in range(group_size):
         group_strs: list[str] = []
+        group_display: list[str] = []
         for b in range(batch_size):
             nc = n_cycles_list[g_idx][b].item()
             parts: list[str] = []
+            display_parts: list[str] = []
             for c in range(nc):
+                noise_toks = noise_shadow_ids_list[g_idx][b, c].tolist()
+                noise_text = tokenizer.decode(noise_toks)
+
                 hl = hard_token_lengths_list[g_idx][b, c].item()
+                hard_text = ""
                 if hl > 0:
                     toks = hard_token_ids_list[g_idx][b, c, :hl].tolist()
-                    parts.append(tokenizer.decode(toks))
+                    hard_text = tokenizer.decode(toks)
+                    parts.append(hard_text)
+
+                display_parts.append(f"[noise: {noise_text}]\n{hard_text}")
+
             group_strs.append("\n".join(parts))
+            group_display.append("\n".join(display_parts))
         output_strs.append(group_strs)
+        display_strs.append(group_display)
 
     reward_results: list[list[RewardResult]] = [
         [
@@ -1015,6 +1031,7 @@ def generate_noise_reasoning_rollout_batch(
         env_responses=env_responses,
         prompts=prompts,
         output_strs=output_strs,
+        display_strs=display_strs,
         reward_results=reward_results,
         rewards=rewards,
         hard_token_ids=hard_token_ids_list,

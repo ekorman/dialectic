@@ -4205,7 +4205,7 @@ def collect_noise_reasoning_micro_batch(
         "hard_token_lengths": stacked_lengths,
         "n_cycles": stacked_n_cycles,
         "noise_vectors": stacked_noise,
-        "output_strs": rollout.output_strs,
+        "output_strs": rollout.display_strs,
         "reward_results": rollout.reward_results,
         "rewards": rollout.rewards,
         "ref_log_probs": ref_log_probs,
