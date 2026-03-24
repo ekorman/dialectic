@@ -3580,6 +3580,9 @@ def collect_soft_cycling_micro_batch(
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
     max_soft_steps_per_cycle: int | None = None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
+    n_expert_trajectories: int = 0,
     soft_bptt_window: int | None = None,
 ) -> dict:
     rollout = generate_soft_cycling_rollout_batch(
@@ -3603,6 +3606,9 @@ def collect_soft_cycling_micro_batch(
         soft_token_noise_std=soft_token_noise_std,
         min_soft_steps=min_soft_steps,
         max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+        min_cycles=min_cycles,
+        evict_soft_kv=evict_soft_kv,
+        n_expert_trajectories=n_expert_trajectories,
     )
 
     stacked_hard_ids, stacked_lengths, stacked_n_cycles, stacked_soft_lengths = (
@@ -3728,6 +3734,9 @@ def train_soft_cycling_grpo(
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
     max_soft_steps_per_cycle: int | None = None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
+    n_expert_trajectories: int = 0,
     soft_bptt_window: int | None = None,
     advantage_fn: Callable[
         [Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]
@@ -3773,6 +3782,9 @@ def train_soft_cycling_grpo(
             soft_token_noise_std=soft_token_noise_std,
             min_soft_steps=min_soft_steps,
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            min_cycles=min_cycles,
+            evict_soft_kv=evict_soft_kv,
+            n_expert_trajectories=n_expert_trajectories,
             soft_bptt_window=soft_bptt_window,
         )
 
@@ -3826,7 +3838,7 @@ def train_soft_cycling_grpo(
         max_episodes=max_episodes,
         update_ref_net_batch_cadence=update_ref_net_batch_cadence,
         batch_size=batch_size,
-        group_size=group_size,
+        group_size=group_size + n_expert_trajectories,
         advantage_fn=advantage_fn,
         normalize_by_sequence_length=normalize_by_sequence_length,
         accumulation_steps=accumulation_steps,
@@ -3853,6 +3865,8 @@ def train_soft_cycling_grpo(
             use_gumbel=use_gumbel,
             min_soft_steps=min_soft_steps,
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            min_cycles=min_cycles,
+            evict_soft_kv=evict_soft_kv,
         ),
         warmup_steps=warmup_steps,
     )
@@ -3877,6 +3891,8 @@ def _create_soft_cycling_val_fn(
     use_gumbel: bool,
     min_soft_steps: int,
     max_soft_steps_per_cycle: int | None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
 ):
     from dialectic.rl.evaluate import evaluate_soft_cycling
 
@@ -3902,6 +3918,8 @@ def _create_soft_cycling_val_fn(
             use_gumbel=use_gumbel,
             min_soft_steps=min_soft_steps,
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            min_cycles=min_cycles,
+            evict_soft_kv=evict_soft_kv,
         )
 
     return _val

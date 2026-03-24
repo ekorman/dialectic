@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Callable, Protocol
 
+import torch
 from tokenizers import Tokenizer
+
+from dialectic.rl.env import CountdownStep, build_countdown_equation
 
 
 class Grammar(Protocol):
@@ -217,3 +220,66 @@ def build_countdown_grammar_specs(tokenizer: Tokenizer) -> list[GrammarSpec]:
             is_terminal=True,
         ),
     ]
+
+
+def countdown_solution_to_hard_tokens(
+    solution: list[CountdownStep],
+    numbers: list[int],
+    target: int,
+    tokenizer: Tokenizer,
+    max_cycles: int,
+    max_tokens_per_cycle: int,
+    pad_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Convert an expert countdown solution to per-cycle hard token tensors.
+
+    Parameters
+    ----------
+    solution
+        List of CountdownStep from the environment solver.
+    numbers
+        Original problem numbers.
+    target
+        Target value.
+    tokenizer
+        Tokenizer for encoding.
+    max_cycles
+        Maximum cycles dimension.
+    max_tokens_per_cycle
+        Maximum tokens per cycle dimension.
+    pad_token_id
+        Padding token ID.
+
+    Returns
+    -------
+    tuple[Tensor, Tensor, int]
+        (hard_token_ids [C, T_max], hard_token_lengths [C], n_cycles)
+    """
+    cycle_token_ids: list[list[int]] = []
+
+    for step in solution:
+        text = f" {step.left} {step.op} {step.right} = {step.result} </SCRATCH>"
+        ids = tokenizer.encode(text, add_special_tokens=False).ids
+        cycle_token_ids.append(list(ids))
+
+    equation = build_countdown_equation(numbers, solution, target)
+    expr = equation.rsplit(" = ", 1)[0]
+    answer_text = f" {expr} </answer>"
+    answer_ids = tokenizer.encode(answer_text, add_special_tokens=False).ids
+    cycle_token_ids.append(list(answer_ids))
+
+    n_cycles = len(cycle_token_ids)
+
+    hard_token_ids = torch.full(
+        (max_cycles, max_tokens_per_cycle), pad_token_id, dtype=torch.long
+    )
+    hard_token_lengths = torch.zeros(max_cycles, dtype=torch.long)
+
+    for c, ids in enumerate(cycle_token_ids):
+        if c >= max_cycles:
+            break
+        length = min(len(ids), max_tokens_per_cycle)
+        hard_token_ids[c, :length] = torch.tensor(ids[:length], dtype=torch.long)
+        hard_token_lengths[c] = length
+
+    return hard_token_ids, hard_token_lengths, min(n_cycles, max_cycles)

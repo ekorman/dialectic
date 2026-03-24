@@ -104,6 +104,9 @@ class SoftCyclingParams:
     max_cycles: int = 20
     max_tokens_per_cycle: int = 30
     max_soft_steps_per_cycle: int | None = None
+    min_cycles: int = 0
+    evict_soft_kv: bool = False
+    n_expert_trajectories: int = 0
 
 
 @dataclass

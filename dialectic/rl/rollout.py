@@ -719,6 +719,9 @@ def generate_soft_cycling_rollout_batch(
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
     max_soft_steps_per_cycle: int | None = None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
+    n_expert_trajectories: int = 0,
 ) -> SoftCyclingRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -742,6 +745,7 @@ def generate_soft_cycling_rollout_batch(
     n_cycles_list: list[Int[torch.Tensor, " B"]] = []
     soft_lengths_list: list[Int[torch.Tensor, "B C"]] = []
     all_shadow_ids: list[Int[torch.Tensor, "B L"]] = []
+    cycle_is_terminal_list: list[Bool[torch.Tensor, "B C"]] = []
 
     was_training = net.training
     net.eval()
@@ -764,20 +768,98 @@ def generate_soft_cycling_rollout_batch(
             soft_token_noise_std=actual_noise_std,
             min_soft_steps=min_soft_steps,
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            min_cycles=min_cycles,
+            evict_soft_kv=evict_soft_kv,
         )
         hard_token_ids_list.append(gen_output.hard_token_ids)
         hard_token_lengths_list.append(gen_output.hard_token_lengths)
         n_cycles_list.append(gen_output.n_cycles)
         soft_lengths_list.append(gen_output.soft_lengths)
         all_shadow_ids.append(gen_output.shadow_ids)
+        cycle_is_terminal_list.append(gen_output.cycle_is_terminal)
+
+    if n_expert_trajectories > 0:
+        from dialectic.rl.grammar import countdown_solution_to_hard_tokens
+
+        forced_ids_batch = []
+        forced_lens_batch = []
+        forced_nc_batch = []
+        for resp in env_responses:
+            if resp.data.solution is not None:
+                f_ids, f_lens, f_nc = countdown_solution_to_hard_tokens(
+                    solution=resp.data.solution,
+                    numbers=resp.data.numbers,
+                    target=resp.data.target,
+                    tokenizer=tokenizer,
+                    max_cycles=max_cycles,
+                    max_tokens_per_cycle=max_tokens_per_cycle,
+                    pad_token_id=pad_token_id,
+                )
+            else:
+                f_ids = torch.full(
+                    (max_cycles, max_tokens_per_cycle),
+                    pad_token_id,
+                    dtype=torch.long,
+                )
+                f_lens = torch.zeros(max_cycles, dtype=torch.long)
+                f_nc = 1
+            forced_ids_batch.append(f_ids)
+            forced_lens_batch.append(f_lens)
+            forced_nc_batch.append(f_nc)
+
+        forced_ids_t = torch.stack(forced_ids_batch).to(device)
+        forced_lens_t = torch.stack(forced_lens_batch).to(device)
+        forced_nc_t = torch.tensor(forced_nc_batch, dtype=torch.long, device=device)
+
+        for _ in range(n_expert_trajectories):
+            gen_output = generate_soft_cycling_tokens(
+                net=net,
+                token_ids=token_ids,
+                grammar_specs=grammar_specs,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                max_tokens_generated=max_tokens_generated,
+                max_cycles=max_cycles,
+                max_tokens_per_cycle=max_tokens_per_cycle,
+                temperature=temperature if temperature > 0 else 1.0,
+                attention_mask=attention_mask,
+                use_bf16=use_bf16,
+                use_gumbel=use_gumbel,
+                soft_token_noise_std=actual_noise_std,
+                min_soft_steps=min_soft_steps,
+                max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+                forced_hard_token_ids=forced_ids_t,
+                forced_hard_token_lengths=forced_lens_t,
+                forced_n_cycles=forced_nc_t,
+            )
+            hard_token_ids_list.append(gen_output.hard_token_ids)
+            hard_token_lengths_list.append(gen_output.hard_token_lengths)
+            n_cycles_list.append(gen_output.n_cycles)
+            soft_lengths_list.append(gen_output.soft_lengths)
+            all_shadow_ids.append(gen_output.shadow_ids)
+            cycle_is_terminal_list.append(gen_output.cycle_is_terminal)
 
     t_generation = time.perf_counter() - t_gen_start
     if was_training:
         net.train()
 
-    output_strs: list[list[str]] = [
-        tokenizer.decode_batch(s.tolist()) for s in all_shadow_ids
-    ]
+    output_strs: list[list[str]] = []
+    for g_idx in range(len(hard_token_ids_list)):
+        group_strs: list[str] = []
+        for b in range(batch_size):
+            nc = n_cycles_list[g_idx][b].item()
+            parts: list[str] = []
+            for c in range(nc):
+                hl = hard_token_lengths_list[g_idx][b, c].item()
+                if hl == 0:
+                    continue
+                hard_toks = hard_token_ids_list[g_idx][b, c, :hl].tolist()
+                decoded_hard = tokenizer.decode(hard_toks)
+                is_term = cycle_is_terminal_list[g_idx][b, c].item()
+                tag = "<answer>" if is_term else "<SCRATCH>"
+                parts.append(tag + decoded_hard)
+            group_strs.append("\n".join(parts))
+        output_strs.append(group_strs)
 
     reward_results: list[list[RewardResult]] = [
         [

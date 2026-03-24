@@ -1273,6 +1273,7 @@ class SoftCyclingGeneratorOutput:
     n_cycles: Int[torch.Tensor, " B"]
     soft_lengths: Int[torch.Tensor, "B C"]
     shadow_ids: Int[torch.Tensor, "B L"]
+    cycle_is_terminal: Bool[torch.Tensor, "B C"]
 
 
 @torch.inference_mode()
@@ -1292,6 +1293,11 @@ def generate_soft_cycling_tokens(
     soft_token_noise_std: float | None = None,
     min_soft_steps: int = 0,
     max_soft_steps_per_cycle: int | None = None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
+    forced_hard_token_ids: Int[Tensor, "B C T_max"] | None = None,
+    forced_hard_token_lengths: Int[Tensor, "B C"] | None = None,
+    forced_n_cycles: Int[Tensor, " B"] | None = None,
 ) -> SoftCyclingGeneratorOutput:
     """Generate tokens with alternating soft/hard cycles.
 
@@ -1356,6 +1362,7 @@ def generate_soft_cycling_tokens(
     )
     hard_token_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
     soft_lengths = torch.zeros(B, max_cycles, dtype=torch.long, device=device)
+    cycle_is_terminal_out = torch.zeros(B, max_cycles, dtype=torch.bool, device=device)
     n_cycles_out = torch.full((B,), max_cycles, dtype=torch.long, device=device)
     finished = torch.zeros(B, dtype=torch.bool, device=device)
 
@@ -1367,6 +1374,19 @@ def generate_soft_cycling_tokens(
     active_grammars: list[Grammar | None] = [None for _ in range(B)]
     active_terminal: list[bool] = [False] * B
     hard_step_count = torch.zeros(B, dtype=torch.long, device=device)
+
+    forced = forced_hard_token_ids is not None
+    if forced:
+        assert forced_hard_token_lengths is not None
+        assert forced_n_cycles is not None
+        forced_hard_token_ids = forced_hard_token_ids.to(device)
+        forced_hard_token_lengths = forced_hard_token_lengths.to(device)
+        forced_n_cycles = forced_n_cycles.to(device)
+
+    if evict_soft_kv and B > 1:
+        raise ValueError("evict_soft_kv only supports batch_size=1")
+    soft_kv_start: int = token_ids.shape[1]
+    kv_len: int = token_ids.shape[1]
 
     ones = torch.ones(B, 1, dtype=torch.bool, device=device)
 
@@ -1422,22 +1442,31 @@ def generate_soft_cycling_tokens(
             shadow_tokens[soft_mask] = soft_shadow
 
         if hard_mask.any():
-            hard_logits = logits[hard_mask]
             hard_indices = hard_mask.nonzero(as_tuple=True)[0]
 
-            grammar_mask = torch.full_like(hard_logits, float("-inf"))
-            for idx_in_subset, b_idx in enumerate(hard_indices.tolist()):
-                g = active_grammars[b_idx]
-                assert g is not None
-                valid_ids = g.valid_token_ids()
-                grammar_mask[idx_in_subset, valid_ids] = 0.0
-
-            constrained_logits = hard_logits + grammar_mask
-            if temperature > 0:
-                probs = torch.softmax(constrained_logits / temperature, dim=-1)
-                hard_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            if forced:
+                hard_tokens = torch.zeros(
+                    hard_indices.shape[0], dtype=torch.long, device=device
+                )
+                for idx_in_subset, b_idx in enumerate(hard_indices.tolist()):
+                    cycle = current_cycle[b_idx].item()
+                    t = hard_step_count[b_idx].item()
+                    hard_tokens[idx_in_subset] = forced_hard_token_ids[b_idx, cycle, t]
             else:
-                hard_tokens = constrained_logits.argmax(dim=-1)
+                hard_logits = logits[hard_mask]
+                grammar_mask = torch.full_like(hard_logits, float("-inf"))
+                for idx_in_subset, b_idx in enumerate(hard_indices.tolist()):
+                    g = active_grammars[b_idx]
+                    assert g is not None
+                    valid_ids = g.valid_token_ids()
+                    grammar_mask[idx_in_subset, valid_ids] = 0.0
+
+                constrained_logits = hard_logits + grammar_mask
+                if temperature > 0:
+                    probs = torch.softmax(constrained_logits / temperature, dim=-1)
+                    hard_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    hard_tokens = constrained_logits.argmax(dim=-1)
 
             hard_emb = net.embed_tokens(hard_tokens).unsqueeze(1).float()
             next_emb[hard_mask] = hard_emb.to(next_emb.dtype)
@@ -1449,9 +1478,10 @@ def generate_soft_cycling_tokens(
                 t = hard_step_count[b_idx].item()
                 if cycle < max_cycles and t < max_tokens_per_cycle:
                     hard_token_ids[b_idx, cycle, t] = tok
-                g = active_grammars[b_idx]
-                assert g is not None
-                g.advance(tok)
+                if not forced:
+                    g = active_grammars[b_idx]
+                    assert g is not None
+                    g.advance(tok)
                 hard_step_count[b_idx] += 1
 
         for b in range(B):
@@ -1463,15 +1493,30 @@ def generate_soft_cycling_tokens(
                 continue
 
             if in_hard_phase[b]:
-                g = active_grammars[b]
-                assert g is not None
                 cycle = current_cycle[b].item()
-                if g.is_complete():
+                if forced:
+                    cycle_complete = (
+                        hard_step_count[b] >= forced_hard_token_lengths[b, cycle]
+                    )
+                else:
+                    g = active_grammars[b]
+                    assert g is not None
+                    cycle_complete = g.is_complete()
+
+                cycle_done = False
+                if cycle_complete:
                     if cycle < max_cycles:
                         hard_token_lengths[b, cycle] = hard_step_count[b].item()
-                    if active_terminal[b]:
+                    if forced:
+                        is_terminal = current_cycle[b] >= forced_n_cycles[b] - 1
+                    else:
+                        is_terminal = active_terminal[b]
+                    if cycle < max_cycles:
+                        cycle_is_terminal_out[b, cycle] = is_terminal
+                    if is_terminal:
                         finished[b] = True
                         n_cycles_out[b] = current_cycle[b] + 1
+                        cycle_done = True
                     else:
                         in_hard_phase[b] = False
                         active_grammars[b] = None
@@ -1479,6 +1524,7 @@ def generate_soft_cycling_tokens(
                         current_cycle[b] += 1
                         current_soft_steps[b] = 0
                         hard_step_count[b] = 0
+                        cycle_done = True
                         if current_cycle[b] >= max_cycles:
                             finished[b] = True
                             n_cycles_out[b] = current_cycle[b]
@@ -1487,50 +1533,85 @@ def generate_soft_cycling_tokens(
                         hard_token_lengths[b, cycle] = hard_step_count[b].item()
                     finished[b] = True
                     n_cycles_out[b] = current_cycle[b] + 1
+                    cycle_done = True
+
+                if cycle_done and evict_soft_kv:
+                    soft_count = int(soft_lengths[b, cycle].item())
+                    if soft_count > 0:
+                        for kv in kv_caches:
+                            kv.evict_range(soft_kv_start, soft_count)
+                        if attention_mask is not None:
+                            attention_mask = torch.cat(
+                                [
+                                    attention_mask[:, :soft_kv_start],
+                                    attention_mask[:, soft_kv_start + soft_count :],
+                                ],
+                                dim=1,
+                            )
+                        kv_len -= soft_count
+                    soft_kv_start = kv_len
             else:
                 current_soft_steps[b] += 1
                 cycle = current_cycle[b].item()
                 if cycle < max_cycles:
                     soft_lengths[b, cycle] = current_soft_steps[b].item()
 
-                if shadow_tokens[b].item() == eos_token_id:
+                if shadow_tokens[b].item() == eos_token_id and not forced:
                     finished[b] = True
                     n_cycles_out[b] = current_cycle[b] + (
                         1 if current_soft_steps[b] > 0 else 0
                     )
                 elif current_soft_steps[b] >= min_soft_steps:
                     triggered = False
-                    shadow = shadow_list[b]
-                    for spec in grammar_specs:
-                        trig = spec.trigger_token_ids
-                        if len(shadow) >= len(trig):
-                            if tuple(shadow[-len(trig) :]) == trig:
-                                in_hard_phase[b] = True
-                                active_grammars[b] = spec.grammar_factory()
-                                active_terminal[b] = spec.is_terminal
-                                hard_step_count[b] = 0
-                                triggered = True
-                                break
+
+                    if forced:
+                        should_force = (
+                            max_soft_steps_per_cycle is not None
+                            and current_soft_steps[b] >= max_soft_steps_per_cycle
+                        )
+                        if should_force:
+                            in_hard_phase[b] = True
+                            hard_step_count[b] = 0
+                            triggered = True
+                    else:
+                        below_min = current_cycle[b] < min_cycles
+                        shadow = shadow_list[b]
+                        for spec in grammar_specs:
+                            if spec.is_terminal and below_min:
+                                continue
+                            trig = spec.trigger_token_ids
+                            if len(shadow) >= len(trig):
+                                if tuple(shadow[-len(trig) :]) == trig:
+                                    in_hard_phase[b] = True
+                                    active_grammars[b] = spec.grammar_factory()
+                                    active_terminal[b] = spec.is_terminal
+                                    hard_step_count[b] = 0
+                                    triggered = True
+                                    break
 
                     if (
                         not triggered
                         and max_soft_steps_per_cycle is not None
                         and current_soft_steps[b] >= max_soft_steps_per_cycle
                     ):
-                        is_last_cycle = current_cycle[b] >= max_cycles - 1
-                        if is_last_cycle:
-                            fallback = next(
-                                (s for s in grammar_specs if s.is_terminal),
-                                grammar_specs[-1],
+                        if not forced:
+                            allow_terminal = (
+                                current_cycle[b] >= max_cycles - 1
+                                and current_cycle[b] >= min_cycles
                             )
-                        else:
-                            fallback = next(
-                                (s for s in grammar_specs if not s.is_terminal),
-                                grammar_specs[0],
-                            )
+                            if allow_terminal:
+                                fallback = next(
+                                    (s for s in grammar_specs if s.is_terminal),
+                                    grammar_specs[-1],
+                                )
+                            else:
+                                fallback = next(
+                                    (s for s in grammar_specs if not s.is_terminal),
+                                    grammar_specs[0],
+                                )
+                            active_grammars[b] = fallback.grammar_factory()
+                            active_terminal[b] = fallback.is_terminal
                         in_hard_phase[b] = True
-                        active_grammars[b] = fallback.grammar_factory()
-                        active_terminal[b] = fallback.is_terminal
                         hard_step_count[b] = 0
 
         with torch.autocast(
@@ -1544,6 +1625,7 @@ def generate_soft_cycling_tokens(
             )
 
         total_generated += 1
+        kv_len += 1
 
     still_going = ~finished
     if still_going.any():
@@ -1571,4 +1653,5 @@ def generate_soft_cycling_tokens(
         n_cycles=n_cycles_out,
         soft_lengths=soft_lengths,
         shadow_ids=shadow_ids,
+        cycle_is_terminal=cycle_is_terminal_out,
     )

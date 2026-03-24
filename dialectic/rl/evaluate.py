@@ -629,6 +629,8 @@ def evaluate_soft_cycling(
     use_gumbel: bool = False,
     min_soft_steps: int = 0,
     max_soft_steps_per_cycle: int | None = None,
+    min_cycles: int = 0,
+    evict_soft_kv: bool = False,
 ) -> tuple[EvaluationResult, list[extty.Example]]:
     all_rewards: list[float] = []
     all_reward_results: list[dict[str, float]] = []
@@ -665,12 +667,23 @@ def evaluate_soft_cycling(
             use_gumbel=use_gumbel,
             min_soft_steps=min_soft_steps,
             max_soft_steps_per_cycle=max_soft_steps_per_cycle,
+            min_cycles=min_cycles,
+            evict_soft_kv=evict_soft_kv,
         )
 
-        decoded = tokenizer.decode_batch(gen_output.shadow_ids.tolist())
-
         for b in range(current_batch_size):
-            out_str = decoded[b]
+            nc = gen_output.n_cycles[b].item()
+            parts: list[str] = []
+            for c in range(nc):
+                hl = gen_output.hard_token_lengths[b, c].item()
+                if hl == 0:
+                    continue
+                hard_toks = gen_output.hard_token_ids[b, c, :hl].tolist()
+                decoded_hard = tokenizer.decode(hard_toks)
+                is_term = gen_output.cycle_is_terminal[b, c].item()
+                tag = "<answer>" if is_term else "<SCRATCH>"
+                parts.append(tag + decoded_hard)
+            out_str = "\n".join(parts)
             result = reward_fn(
                 env_response=env_responses[b],
                 raw_model_output=out_str,
