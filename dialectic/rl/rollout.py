@@ -935,6 +935,7 @@ def generate_noise_reasoning_rollout_batch(
     max_tokens_per_cycle: int = 30,
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
+    noise_adapter: "torch.nn.Module | None" = None,
 ) -> NoiseReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -973,6 +974,7 @@ def generate_noise_reasoning_rollout_batch(
             attention_mask=attention_mask,
             use_bf16=use_bf16,
             evict_noise_kv=evict_noise_kv,
+            noise_adapter=noise_adapter,
         )
         hard_token_ids_list.append(gen_output.hard_token_ids)
         hard_token_lengths_list.append(gen_output.hard_token_lengths)

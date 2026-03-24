@@ -118,6 +118,10 @@ class NoiseReasoningParams:
     max_tokens_per_cycle: int = 30
     evict_noise_kv: bool = False
     prompt_style: str = "scratch_tags"
+    use_noise_adapter: bool = False
+    adapter_d_ff: int = 256
+    adapter_n_heads: int = 4
+    freeze_base_model: bool = False
 
 
 @dataclass

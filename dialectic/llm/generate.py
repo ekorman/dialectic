@@ -1683,6 +1683,7 @@ def generate_noise_reasoning_tokens(
     attention_mask: Bool[Tensor, "B L"] | None = None,
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
+    noise_adapter: "torch.nn.Module | None" = None,
 ) -> NoiseReasoningGeneratorOutput:
     """Generate tokens with noise injection + grammar-constrained hard decoding.
 
@@ -1764,6 +1765,17 @@ def generate_noise_reasoning_tokens(
         noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
         noise_vectors[:, cycle] = noise
 
+        if noise_adapter is not None:
+            ctx_ids = [token_ids]
+            for prev_c in range(cycle):
+                prev_len = int(hard_token_lengths[:, prev_c].max().item())
+                if prev_len > 0:
+                    ctx_ids.append(hard_token_ids_out[:, prev_c, :prev_len])
+            ctx_emb = net.embed_tokens(torch.cat(ctx_ids, dim=1)).float()
+            inject_noise = noise_adapter(noise, ctx_emb)
+        else:
+            inject_noise = noise
+
         noise_kv_start = kv_caches[0].get_position_offset() if evict_noise_kv else -1
 
         with torch.autocast(
@@ -1773,7 +1785,7 @@ def generate_noise_reasoning_tokens(
                 if attention_mask is not None:
                     attention_mask = torch.cat([attention_mask, ones], dim=1)
                 h = net(
-                    noise[:, ni : ni + 1],
+                    inject_noise[:, ni : ni + 1],
                     kv_caches=kv_caches,
                     attention_mask=attention_mask,
                     return_hidden_states=True,
