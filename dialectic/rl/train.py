@@ -4064,21 +4064,22 @@ def compute_noise_reasoning_log_probs(
     pos = L_prompt
 
     for cycle in range(max_actual_cycles):
-        cycle_noise = flat_noise[:, cycle].float()
+        if k > 0:
+            cycle_noise = flat_noise[:, cycle].float()
 
-        if noise_adapter is not None:
-            ctx_parts = [flat_prompt_emb]
-            for prev_c in range(cycle):
-                prev_len = int(flat_lengths[:, prev_c].max().item())
-                if prev_len > 0:
-                    ctx_parts.append(
-                        net.embed_tokens(flat_hard[:, prev_c, :prev_len]).float()
-                    )
-            ctx_emb = torch.cat(ctx_parts, dim=1)
-            cycle_noise = noise_adapter(cycle_noise, ctx_emb)
+            if noise_adapter is not None:
+                ctx_parts = [flat_prompt_emb]
+                for prev_c in range(cycle):
+                    prev_len = int(flat_lengths[:, prev_c].max().item())
+                    if prev_len > 0:
+                        ctx_parts.append(
+                            net.embed_tokens(flat_hard[:, prev_c, :prev_len]).float()
+                        )
+                ctx_emb = torch.cat(ctx_parts, dim=1)
+                cycle_noise = noise_adapter(cycle_noise, ctx_emb)
 
-        emb_parts.append(cycle_noise)
-        pos += k
+            emb_parts.append(cycle_noise)
+            pos += k
 
         max_t = int(flat_lengths[:, cycle].max().item())
         cycle_hard_lengths.append(max_t)

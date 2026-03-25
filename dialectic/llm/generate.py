@@ -1748,11 +1748,13 @@ def generate_noise_reasoning_tokens(
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
     ):
-        net(
+        h = net(
             token_ids,
             kv_caches=kv_caches,
             attention_mask=attention_mask,
+            return_hidden_states=True,
         )
+    h = h[:, -1:]
 
     for cycle in range(max_cycles):
         if finished.all():
@@ -1762,36 +1764,39 @@ def generate_noise_reasoning_tokens(
         force_answer = cycle == max_cycles - 1 and allow_answer
         grammars = [grammar_factory(allow_answer, force_answer) for _ in range(B)]
 
-        noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
-        noise_vectors[:, cycle] = noise
+        if n_noise_per_cycle > 0:
+            noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
+            noise_vectors[:, cycle] = noise
 
-        if noise_adapter is not None:
-            ctx_ids = [token_ids]
-            for prev_c in range(cycle):
-                prev_len = int(hard_token_lengths[:, prev_c].max().item())
-                if prev_len > 0:
-                    ctx_ids.append(hard_token_ids_out[:, prev_c, :prev_len])
-            ctx_emb = net.embed_tokens(torch.cat(ctx_ids, dim=1)).float()
-            inject_noise = noise_adapter(noise, ctx_emb)
-        else:
-            inject_noise = noise
+            if noise_adapter is not None:
+                ctx_ids = [token_ids]
+                for prev_c in range(cycle):
+                    prev_len = int(hard_token_lengths[:, prev_c].max().item())
+                    if prev_len > 0:
+                        ctx_ids.append(hard_token_ids_out[:, prev_c, :prev_len])
+                ctx_emb = net.embed_tokens(torch.cat(ctx_ids, dim=1)).float()
+                inject_noise = noise_adapter(noise, ctx_emb)
+            else:
+                inject_noise = noise
 
-        noise_kv_start = kv_caches[0].get_position_offset() if evict_noise_kv else -1
+            noise_kv_start = (
+                kv_caches[0].get_position_offset() if evict_noise_kv else -1
+            )
 
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-        ):
-            for ni in range(n_noise_per_cycle):
-                if attention_mask is not None:
-                    attention_mask = torch.cat([attention_mask, ones], dim=1)
-                h = net(
-                    inject_noise[:, ni : ni + 1],
-                    kv_caches=kv_caches,
-                    attention_mask=attention_mask,
-                    return_hidden_states=True,
-                )
-                shadow_logits = net.lm_head(h).squeeze(1)
-                noise_shadow_ids[:, cycle, ni] = shadow_logits.argmax(-1)
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                for ni in range(n_noise_per_cycle):
+                    if attention_mask is not None:
+                        attention_mask = torch.cat([attention_mask, ones], dim=1)
+                    h = net(
+                        inject_noise[:, ni : ni + 1],
+                        kv_caches=kv_caches,
+                        attention_mask=attention_mask,
+                        return_hidden_states=True,
+                    )
+                    shadow_logits = net.lm_head(h).squeeze(1)
+                    noise_shadow_ids[:, cycle, ni] = shadow_logits.argmax(-1)
 
         cycle_finished = torch.zeros(B, dtype=torch.bool, device=device)
 
@@ -1852,7 +1857,7 @@ def generate_noise_reasoning_tokens(
                 if still_in_cycle[b]:
                     hard_token_lengths[b, cycle] = max_tokens_per_cycle
 
-        if evict_noise_kv and noise_kv_start >= 0:
+        if evict_noise_kv and n_noise_per_cycle > 0 and noise_kv_start >= 0:
             for kv in kv_caches:
                 kv.evict_range(noise_kv_start, n_noise_per_cycle)
             if attention_mask is not None:
