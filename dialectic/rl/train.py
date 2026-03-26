@@ -4012,6 +4012,7 @@ def compute_noise_reasoning_log_probs(
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
+    registers: "torch.nn.Parameter | None" = None,
 ) -> tuple[Float[torch.Tensor, "B G C"], Bool[torch.Tensor, "B G C"]]:
     """Compute log probs for noise reasoning trajectories.
 
@@ -4067,7 +4068,9 @@ def compute_noise_reasoning_log_probs(
         if k > 0:
             cycle_noise = flat_noise[:, cycle].float()
 
-            if noise_adapter is not None:
+            if registers is not None:
+                cycle_noise = registers.unsqueeze(0).expand(BG, -1, -1) + cycle_noise
+            elif noise_adapter is not None:
                 ctx_parts = [flat_prompt_emb]
                 for prev_c in range(cycle):
                     prev_len = int(flat_lengths[:, prev_c].max().item())
@@ -4148,6 +4151,8 @@ def compute_noise_reasoning_log_probs(
             cycle_lp = cycle_lp + lp
             hp_idx += 1
 
+        cycle_token_counts = flat_lengths[:, cycle].clamp(min=1).float()
+        cycle_lp = cycle_lp / cycle_token_counts
         all_cycle_lps.append(cycle_lp)
 
     log_probs = torch.stack(all_cycle_lps, dim=1)
@@ -4189,6 +4194,7 @@ def collect_noise_reasoning_micro_batch(
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
+    registers: "torch.nn.Parameter | None" = None,
 ) -> dict:
     rollout = generate_noise_reasoning_rollout_batch(
         net=net,
@@ -4242,6 +4248,7 @@ def collect_noise_reasoning_micro_batch(
                     use_bf16=use_bf16,
                     evict_noise_kv=evict_noise_kv,
                     noise_adapter=noise_adapter,
+                    registers=registers,
                 )
         else:
             ref_log_probs = None
@@ -4259,6 +4266,7 @@ def collect_noise_reasoning_micro_batch(
                     use_bf16=use_bf16,
                     evict_noise_kv=evict_noise_kv,
                     noise_adapter=noise_adapter,
+                    registers=registers,
                 )
         else:
             old_log_probs = None
@@ -4316,6 +4324,7 @@ def train_noise_reasoning_grpo(
     max_tokens_per_cycle: int,
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
+    registers: "torch.nn.Parameter | None" = None,
     beta: float,
     eps: float | None,
     mu: int = 1,
@@ -4367,6 +4376,7 @@ def train_noise_reasoning_grpo(
             use_bf16=use_bf16,
             evict_noise_kv=evict_noise_kv,
             noise_adapter=noise_adapter,
+            registers=registers,
         )
 
     def recompute_fn(
@@ -4383,6 +4393,7 @@ def train_noise_reasoning_grpo(
             use_bf16=use_bf16,
             evict_noise_kv=evict_noise_kv,
             noise_adapter=noise_adapter,
+            registers=registers,
         )
 
     _grpo_train_loop(

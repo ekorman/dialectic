@@ -936,6 +936,7 @@ def generate_noise_reasoning_rollout_batch(
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
+    registers: "torch.nn.Parameter | None" = None,
 ) -> NoiseReasoningRolloutBatch[T]:
     env_responses = get_batch(env, batch_size)
     prompts = [state_to_str(resp.data) for resp in env_responses]
@@ -975,6 +976,7 @@ def generate_noise_reasoning_rollout_batch(
             use_bf16=use_bf16,
             evict_noise_kv=evict_noise_kv,
             noise_adapter=noise_adapter,
+            registers=registers,
         )
         hard_token_ids_list.append(gen_output.hard_token_ids)
         hard_token_lengths_list.append(gen_output.hard_token_lengths)

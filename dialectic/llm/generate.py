@@ -1684,6 +1684,7 @@ def generate_noise_reasoning_tokens(
     use_bf16: bool = False,
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
+    registers: "torch.nn.Parameter | None" = None,
 ) -> NoiseReasoningGeneratorOutput:
     """Generate tokens with noise injection + grammar-constrained hard decoding.
 
@@ -1768,7 +1769,9 @@ def generate_noise_reasoning_tokens(
             noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
             noise_vectors[:, cycle] = noise
 
-            if noise_adapter is not None:
+            if registers is not None:
+                inject_noise = registers.unsqueeze(0).expand(B, -1, -1) + noise
+            elif noise_adapter is not None:
                 ctx_ids = [token_ids]
                 for prev_c in range(cycle):
                     prev_len = int(hard_token_lengths[:, prev_c].max().item())

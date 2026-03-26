@@ -122,6 +122,7 @@ class NoiseReasoningParams:
     adapter_d_ff: int = 256
     adapter_n_heads: int = 4
     freeze_base_model: bool = False
+    use_registers: bool = False
 
 
 @dataclass
