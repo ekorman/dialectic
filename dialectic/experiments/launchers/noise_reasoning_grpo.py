@@ -118,10 +118,14 @@ def train_noise_reasoning_grpo_countdown(
 
         deq_module = DEQReasoning(
             d_model=net.d,
+            n_heads=noise_reasoning_params.deq_n_heads,
+            d_ff=noise_reasoning_params.deq_d_ff,
             alpha=noise_reasoning_params.deq_alpha,
             max_iter=noise_reasoning_params.deq_max_iter,
             tol=noise_reasoning_params.deq_tol,
             neumann_terms=noise_reasoning_params.deq_neumann_terms,
+            anderson_m=noise_reasoning_params.deq_anderson_m,
+            noise_std=noise_reasoning_params.deq_noise_std,
         ).to(next(net.parameters()).device)
         extra_params.extend(deq_module.parameters())
 

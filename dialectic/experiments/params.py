@@ -125,9 +125,13 @@ class NoiseReasoningParams:
     use_registers: bool = False
     use_deq: bool = False
     deq_alpha: float = 0.1
-    deq_max_iter: int = 20
+    deq_max_iter: int = 50
     deq_tol: float = 1e-3
     deq_neumann_terms: int = 5
+    deq_anderson_m: int = 5
+    deq_n_heads: int = 4
+    deq_d_ff: int = 256
+    deq_noise_std: float = 1.0
 
 
 @dataclass
