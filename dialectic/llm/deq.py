@@ -35,7 +35,6 @@ class DEQReasoning(nn.Module):
         neumann_terms: int = 5,
     ):
         super().__init__()
-        self.z0 = nn.Parameter(torch.randn(d_model) * 0.02)
         self.w_proj = nn.utils.spectral_norm(nn.Linear(d_model, d_model))
         self.alpha = alpha
         self.max_iter = max_iter
@@ -63,7 +62,7 @@ class DEQReasoning(nn.Module):
         ):
             h = net(inp, return_hidden_states=True, attention_mask=mask)
         h_last = h[:, -1]
-        return (1 - self.alpha) * z + self.alpha * self.w_proj(h_last.to(z.dtype))
+        return (1 - self.alpha) * z + self.alpha * self.w_proj(h_last.float())
 
     def _find_fixed_point(
         self,
@@ -71,8 +70,15 @@ class DEQReasoning(nn.Module):
         context_emb: Float[torch.Tensor, "B L D"],
         attention_mask: torch.Tensor | None,
     ) -> tuple[Float[torch.Tensor, "B D"], int, float]:
-        B = context_emb.shape[0]
-        z = self.z0.unsqueeze(0).expand(B, -1).clone()
+        with torch.autocast(
+            device_type=context_emb.device.type,
+            dtype=torch.bfloat16,
+            enabled=context_emb.is_cuda,
+        ):
+            h_prompt = net(
+                context_emb, return_hidden_states=True, attention_mask=attention_mask
+            )
+        z = h_prompt[:, -1].float()
 
         diff = float("inf")
         n_iter = self.max_iter

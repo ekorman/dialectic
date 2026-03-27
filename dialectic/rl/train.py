@@ -4390,8 +4390,6 @@ def train_noise_reasoning_grpo(
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
-        if deq is not None:
-            deq = deq.to(dtype=torch.bfloat16)
 
     collect_old_log_probs = eps is not None
 
