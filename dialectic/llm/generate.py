@@ -1685,6 +1685,7 @@ def generate_noise_reasoning_tokens(
     evict_noise_kv: bool = False,
     noise_adapter: "torch.nn.Module | None" = None,
     registers: "torch.nn.Parameter | None" = None,
+    deq: "torch.nn.Module | None" = None,
 ) -> NoiseReasoningGeneratorOutput:
     """Generate tokens with noise injection + grammar-constrained hard decoding.
 
@@ -1765,7 +1766,28 @@ def generate_noise_reasoning_tokens(
         force_answer = cycle == max_cycles - 1 and allow_answer
         grammars = [grammar_factory(allow_answer, force_answer) for _ in range(B)]
 
-        if n_noise_per_cycle > 0:
+        if deq is not None:
+            ctx_ids = [token_ids]
+            for prev_c in range(cycle):
+                prev_len = int(hard_token_lengths[:, prev_c].max().item())
+                if prev_len > 0:
+                    ctx_ids.append(hard_token_ids_out[:, prev_c, :prev_len])
+            ctx_emb = net.embed_tokens(torch.cat(ctx_ids, dim=1))
+            z_star, _, _ = deq(net, ctx_emb, attention_mask)
+
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, ones], dim=1)
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+            ):
+                h = net(
+                    z_star.unsqueeze(1),
+                    kv_caches=kv_caches,
+                    attention_mask=attention_mask,
+                    return_hidden_states=True,
+                )
+
+        elif n_noise_per_cycle > 0:
             noise = torch.randn(B, n_noise_per_cycle, D, device=device) * noise_std
             noise_vectors[:, cycle] = noise
 

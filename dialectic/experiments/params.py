@@ -123,6 +123,11 @@ class NoiseReasoningParams:
     adapter_n_heads: int = 4
     freeze_base_model: bool = False
     use_registers: bool = False
+    use_deq: bool = False
+    deq_alpha: float = 0.1
+    deq_max_iter: int = 20
+    deq_tol: float = 1e-3
+    deq_neumann_terms: int = 5
 
 
 @dataclass

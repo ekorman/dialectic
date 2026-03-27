@@ -112,6 +112,19 @@ def train_noise_reasoning_grpo_countdown(
         )
         extra_params.append(registers)
 
+    deq_module = None
+    if noise_reasoning_params.use_deq:
+        from dialectic.llm.deq import DEQReasoning
+
+        deq_module = DEQReasoning(
+            d_model=net.d,
+            alpha=noise_reasoning_params.deq_alpha,
+            max_iter=noise_reasoning_params.deq_max_iter,
+            tol=noise_reasoning_params.deq_tol,
+            neumann_terms=noise_reasoning_params.deq_neumann_terms,
+        ).to(next(net.parameters()).device)
+        extra_params.extend(deq_module.parameters())
+
     if extra_params or noise_reasoning_params.freeze_base_model:
         if noise_reasoning_params.freeze_base_model:
             net.requires_grad_(False)
@@ -185,6 +198,7 @@ def train_noise_reasoning_grpo_countdown(
         evict_noise_kv=noise_reasoning_params.evict_noise_kv,
         noise_adapter=adapter,
         registers=registers,
+        deq=deq_module,
         beta=grpo_params.beta,
         eps=grpo_params.eps,
         mu=grpo_params.mu,
