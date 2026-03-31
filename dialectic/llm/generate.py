@@ -1772,8 +1772,26 @@ def generate_noise_reasoning_tokens(
                 prev_len = int(hard_token_lengths[:, prev_c].max().item())
                 if prev_len > 0:
                     ctx_ids.append(hard_token_ids_out[:, prev_c, :prev_len])
-            ctx_emb = net.embed_tokens(torch.cat(ctx_ids, dim=1))
-            z_star, _, _ = deq(net, ctx_emb, attention_mask)
+            cat_ids = torch.cat(ctx_ids, dim=1)
+            if (cat_ids < 0).any() or (cat_ids >= net.vocab_size).any():
+                raise RuntimeError(
+                    f"DEQ: invalid token ids, min={cat_ids.min()}, max={cat_ids.max()}, vocab={net.vocab_size}"
+                )
+            ctx_emb = net.embed_tokens(cat_ids)
+            if torch.isnan(ctx_emb).any() or torch.isinf(ctx_emb).any():
+                raise RuntimeError(f"DEQ: NaN/Inf in ctx_emb at cycle {cycle}")
+            z_star, _, deq_diff = deq(net, ctx_emb, attention_mask)
+            if torch.isnan(z_star).any() or torch.isinf(z_star).any():
+                raise RuntimeError(
+                    f"DEQ: NaN/Inf in z_star at cycle {cycle}, diff={deq_diff}"
+                )
+            z_norm = z_star.norm(dim=-1).max().item()
+            z_absmax = z_star.abs().max().item()
+            if z_absmax > 1e3:
+                raise RuntimeError(
+                    f"DEQ: z_star too large at cycle {cycle}, "
+                    f"norm={z_norm:.2f}, absmax={z_absmax:.2f}, diff={deq_diff:.4f}"
+                )
 
             if attention_mask is not None:
                 attention_mask = torch.cat([attention_mask, ones], dim=1)
@@ -1785,6 +1803,12 @@ def generate_noise_reasoning_tokens(
                     kv_caches=kv_caches,
                     attention_mask=attention_mask,
                     return_hidden_states=True,
+                )
+            if torch.isnan(h).any() or torch.isinf(h).any():
+                raise RuntimeError(
+                    f"DEQ: NaN/Inf in h after z* injection at cycle {cycle}, "
+                    f"z_star norm={z_star.norm(dim=-1).max().item():.2f}, "
+                    f"z_star absmax={z_star.abs().max().item():.2f}"
                 )
 
         elif n_noise_per_cycle > 0:
@@ -1840,6 +1864,15 @@ def generate_noise_reasoning_tokens(
                     grammar_mask[b, valid] = 0.0
 
             constrained_logits = logits + grammar_mask
+            if (
+                torch.isnan(constrained_logits).any()
+                or torch.isinf(constrained_logits).all(dim=-1).any()
+            ):
+                raise RuntimeError(
+                    f"NaN/Inf in constrained_logits at cycle={cycle} t={t}, "
+                    f"logits nan={torch.isnan(logits).any()}, "
+                    f"logits range=[{logits.min():.2f}, {logits.max():.2f}]"
+                )
             if temperature > 0:
                 probs = torch.softmax(constrained_logits / temperature, dim=-1)
                 token = torch.multinomial(probs, num_samples=1).squeeze(1)

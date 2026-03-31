@@ -55,6 +55,7 @@ class DEQReasoning(nn.Module):
         self.out_proj = nn.utils.spectral_norm(nn.Linear(d_model, d_model))
         self.ff1 = nn.utils.spectral_norm(nn.Linear(d_model, d_ff))
         self.ff2 = nn.utils.spectral_norm(nn.Linear(d_ff, d_model))
+        self.context_norm = nn.LayerNorm(d_model)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -76,10 +77,11 @@ class DEQReasoning(nn.Module):
         context: Float[torch.Tensor, "B L D"],
     ) -> Float[torch.Tensor, "B D"]:
         z_in = z.unsqueeze(1)
+        ctx = context
 
         q = self.q_proj(z_in)
-        k = self.k_proj(context)
-        v = self.v_proj(context)
+        k = self.k_proj(ctx)
+        v = self.v_proj(ctx)
 
         B, _, D = q.shape
         L = k.shape[1]
@@ -91,8 +93,8 @@ class DEQReasoning(nn.Module):
         attn = attn.transpose(1, 2).reshape(B, 1, D)
         h = self.out_proj(attn).squeeze(1)
 
-        h = self.norm1(z + h)
-        h = self.norm2(h + self.ff2(torch.nn.functional.gelu(self.ff1(h))))
+        h = self.norm1(h)
+        h = self.norm2(self.ff2(torch.nn.functional.gelu(self.ff1(h))))
         return h
 
     def _f(
