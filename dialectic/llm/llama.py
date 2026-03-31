@@ -54,9 +54,6 @@ def create_llama(
     mlp_hidden_d: int,
     tie_weights: bool,
     rope_base_value: int = 500000,
-    soft_projection: bool = False,
-    soft_projection_alpha_init: float = 1e-3,
-    soft_projection_rank: int | None = None,
 ):
     return BaseTransformer(
         d=d,
@@ -70,9 +67,6 @@ def create_llama(
         rope_base_value=rope_base_value,
         tie_weights=tie_weights,
         decoder_layer_factory=create_llama_decoder_layer,
-        soft_projection=soft_projection,
-        soft_projection_alpha_init=soft_projection_alpha_init,
-        soft_projection_rank=soft_projection_rank,
     )
 
 
@@ -102,12 +96,7 @@ LLAMA_32_TOKENIZER = Artifact(
 )
 
 
-def load_llama_32_1b_instruct(
-    pretrained_weights: bool = False,
-    soft_projection: bool = False,
-    soft_projection_alpha_init: float = 1e-3,
-    soft_projection_rank: int | None = None,
-) -> BaseTransformer:
+def load_llama_32_1b_instruct(pretrained_weights: bool = False) -> BaseTransformer:
     net = create_llama(
         d=2048,
         vocab_size=128256,
@@ -118,26 +107,18 @@ def load_llama_32_1b_instruct(
         mlp_hidden_d=8192,
         rope_base_value=500000,
         tie_weights=True,
-        soft_projection=soft_projection,
-        soft_projection_alpha_init=soft_projection_alpha_init,
-        soft_projection_rank=soft_projection_rank,
     )
 
     if pretrained_weights:
         sd = load_state_dict_from_artifact(
             LLAMA_32_1B_INSTRUCT_WEIGHTS, convert_keys=True, tied_weights=True
         )
-        net.load_state_dict(sd, strict=not soft_projection)
+        net.load_state_dict(sd)
 
     return net
 
 
-def load_llama_32_3b_instruct(
-    pretrained_weights: bool = False,
-    soft_projection: bool = False,
-    soft_projection_alpha_init: float = 1e-3,
-    soft_projection_rank: int | None = None,
-) -> BaseTransformer:
+def load_llama_32_3b_instruct(pretrained_weights: bool = False) -> BaseTransformer:
     net = create_llama(
         d=3072,
         vocab_size=128256,
@@ -148,15 +129,12 @@ def load_llama_32_3b_instruct(
         mlp_hidden_d=8192,
         rope_base_value=500000,
         tie_weights=True,
-        soft_projection=soft_projection,
-        soft_projection_alpha_init=soft_projection_alpha_init,
-        soft_projection_rank=soft_projection_rank,
     )
 
     if pretrained_weights:
         sd = load_state_dict_from_artifact(
             LLAMA_32_3B_INSTRUCT_WEIGHTS, convert_keys=True, tied_weights=True
         )
-        net.load_state_dict(sd, strict=not soft_projection)
+        net.load_state_dict(sd)
 
     return net

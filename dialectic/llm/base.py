@@ -21,9 +21,6 @@ class BaseTransformer(nn.Module):
         rope_base_value: float,
         decoder_layer_factory: Callable,
         tie_weights: bool = False,
-        soft_projection: bool = False,
-        soft_projection_alpha_init: float = 1e-3,
-        soft_projection_rank: int | None = None,
     ):
         super().__init__()
         self.d = d
@@ -48,39 +45,9 @@ class BaseTransformer(nn.Module):
         )
         self.norm = RMSNorm(d, rms_norm_eps)
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
-        if soft_projection_rank is not None and not soft_projection:
-            raise ValueError("soft_projection_rank requires soft_projection=True")
-        if soft_projection_rank is not None and soft_projection_rank <= 0:
-            raise ValueError(
-                f"soft_projection_rank must be positive, got {soft_projection_rank}"
-            )
-        if soft_projection:
-            if soft_projection_rank is not None:
-                down = nn.Linear(d, soft_projection_rank, bias=False)
-                up = nn.Linear(soft_projection_rank, d, bias=False)
-                nn.init.kaiming_uniform_(down.weight)
-                nn.init.zeros_(up.weight)
-                proj: nn.Module = nn.Sequential(down, up)
-            else:
-                proj = nn.Linear(d, d, bias=False)
-                nn.init.kaiming_uniform_(proj.weight)
-            self.soft_projection: nn.Module | None = proj
-            self.soft_projection_alpha: nn.Parameter | None = nn.Parameter(
-                torch.tensor(soft_projection_alpha_init)
-            )
-        else:
-            self.soft_projection = None
-            self.soft_projection_alpha = None
+
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
-
-    def apply_soft_projection(
-        self, h: Float[torch.Tensor, "B 1 D"]
-    ) -> Float[torch.Tensor, "B 1 D"]:
-        """Apply residual soft projection: h + alpha * proj(h)."""
-        if self.soft_projection is None:
-            return h
-        return h + self.soft_projection_alpha.abs() * self.soft_projection(h)
 
     def forward(
         self,
@@ -99,8 +66,6 @@ class BaseTransformer(nn.Module):
             x = x @ self.embed_tokens.weight  # soft-tokens: [B, L, V] -> [B, L, D]
             if soft_token_noise is not None:
                 x += soft_token_noise
-        else:
-            pass  # D-dim embeddings (noise already folded in)
 
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
