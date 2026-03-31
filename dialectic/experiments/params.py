@@ -45,29 +45,6 @@ class SoftGRPOParams:
 
 
 @dataclass
-class InternalReasoningParams:
-    soft_block_size: int
-    soft_bptt_window: int
-    soft_projection: bool = False
-    soft_projection_alpha_init: float | None = None
-    soft_projection_rank: int | None = None
-
-
-@dataclass
-class HybridReasoningParams:
-    soft_block_size: int
-    soft_bptt_window: int
-    max_cycles: int
-    soft_projection: bool = False
-    soft_projection_alpha_init: float | None = None
-    soft_projection_rank: int | None = None
-    max_tokens_per_cycle: int = 20
-    think_token_id: int | None = None
-    pass_at_k_samples: int = 0
-    pass_at_k_temperature: float = 0.7
-
-
-@dataclass
 class RewardParams:
     answer_tags_weight: float
     think_tags_weight: float

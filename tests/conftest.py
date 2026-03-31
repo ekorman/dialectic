@@ -57,18 +57,6 @@ def tiny_model():
 
 
 @pytest.fixture
-def tiny_model_with_soft_projection():
-    torch.manual_seed(1000)
-    return create_qwen(**TINY_QWEN_KWARGS, soft_projection=True)
-
-
-@pytest.fixture
-def tiny_model_with_low_rank_projection():
-    torch.manual_seed(1000)
-    return create_qwen(**TINY_QWEN_KWARGS, soft_projection=True, soft_projection_rank=8)
-
-
-@pytest.fixture
 def env():
     return CountdownEnv()
 
