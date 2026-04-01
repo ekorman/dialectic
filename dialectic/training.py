@@ -48,7 +48,7 @@ def train_loop(
                     state_dict=net.state_dict(),
                     optimizer_state_dict=opt.state_dict(),
                 )
-            if val_freq > 0 and step % val_freq == 0:
+            if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
                 was_training = net.training
                 net.eval()
                 val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
