@@ -71,6 +71,11 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
             env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill="Let me solve this step by step.",
         ),
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill=None,
+        ),
     ],
     "maze": [
         PromptCollection(
