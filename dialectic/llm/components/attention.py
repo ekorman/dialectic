@@ -21,10 +21,12 @@ def attention(
 ) -> Float[Tensor, "B NH L DHead"]:
     sdpa_mask = None
     if attention_mask is not None:
-        # reshape to (B, 1, 1, L) for broadcasting
-        sdpa_mask = attention_mask.view(
-            attention_mask.shape[0], 1, 1, attention_mask.shape[1]
-        )
+        if attention_mask.ndim == 2:
+            sdpa_mask = attention_mask.view(
+                attention_mask.shape[0], 1, 1, attention_mask.shape[1]
+            )
+        else:
+            sdpa_mask = attention_mask
 
     use_sdpa_causal = False
 

@@ -81,3 +81,8 @@ class SingleStepSFTParams:
 @dataclass
 class MultiStepSFTParams:
     normalize_by_sequence_length: bool
+
+
+@dataclass
+class InverseCotParams:
+    normalize_by_sequence_length: bool
