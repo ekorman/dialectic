@@ -159,10 +159,10 @@ class _BaseTokenGenerator(ABC):
 
         input_tokens = token_ids
 
-        while self.n_generated < max_tokens_generated:
-            with torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-            ):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            while self.n_generated < max_tokens_generated:
                 logits: Float[torch.Tensor, "B 1 V"] = self.net_forward(
                     net=net,
                     input_tokens=input_tokens,
@@ -170,29 +170,26 @@ class _BaseTokenGenerator(ABC):
                     attention_mask=self.attention_mask,
                 )
 
-            prev_len = self.all_tokens.shape[1]
-            is_done = self.get_next_inputs(logits)
+                prev_len = self.all_tokens.shape[1]
+                is_done = self.get_next_inputs(logits)
 
-            if is_done:
-                break
+                if is_done:
+                    break
 
-            if use_kv_cache:
-                # When get_next_inputs adds >1 token (e.g. prefill), process
-                # the intermediate ones through the model to keep the KV cache
-                # in sync. Note: in batched generation, non-triggering elements
-                # get pad tokens here which shifts their RoPE positions. This is
-                # negligible for small fill lengths since the relative distances
-                # between the element's own real tokens are preserved.
-                n_new = self.all_tokens.shape[1] - prev_len
-                for i in range(n_new - 1):
-                    mask = (
-                        self.attention_mask[:, : prev_len + i + 1]
-                        if self.attention_mask is not None
-                        else None
-                    )
-                    with torch.autocast(
-                        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-                    ):
+                if use_kv_cache:
+                    # When get_next_inputs adds >1 token (e.g. prefill), process
+                    # the intermediate ones through the model to keep the KV cache
+                    # in sync. Note: in batched generation, non-triggering elements
+                    # get pad tokens here which shifts their RoPE positions. This is
+                    # negligible for small fill lengths since the relative distances
+                    # between the element's own real tokens are preserved.
+                    n_new = self.all_tokens.shape[1] - prev_len
+                    for i in range(n_new - 1):
+                        mask = (
+                            self.attention_mask[:, : prev_len + i + 1]
+                            if self.attention_mask is not None
+                            else None
+                        )
                         self.net_forward(
                             net=net,
                             input_tokens=self.all_tokens[
@@ -201,11 +198,11 @@ class _BaseTokenGenerator(ABC):
                             kv_caches=kv_caches,
                             attention_mask=mask,
                         )
-                input_tokens = self.all_tokens[:, -1:]
-            else:
-                input_tokens = self.all_tokens
+                    input_tokens = self.all_tokens[:, -1:]
+                else:
+                    input_tokens = self.all_tokens
 
-            self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
+                self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
 
         # If we hit the generation limit before finishing, allow generators to
         # append forced tokens (e.g., to trigger a hard-token switch).
