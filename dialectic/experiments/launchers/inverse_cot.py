@@ -1,5 +1,6 @@
 import re
-from typing import Callable
+import time
+from typing import Any, Callable
 
 import extty
 import torch
@@ -22,7 +23,7 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.rollout import get_batch
-from dialectic.training import StepFunctionReturn, train_loop
+from dialectic.training import StepFunctionReturn
 
 
 def _parse_cot_and_answer(text: str) -> tuple[str, str] | None:
@@ -32,9 +33,7 @@ def _parse_cot_and_answer(text: str) -> tuple[str, str] | None:
     answer is everything after). Falls back to splitting at <answer> tags.
     Returns None if neither format is found.
     """
-    think_match = re.search(
-        r"<think>(.*?)</think>(.*)", text, re.DOTALL
-    )
+    think_match = re.search(r"<think>(.*?)</think>(.*)", text, re.DOTALL)
     if think_match is not None:
         cot = think_match.group(1).strip()
         answer = think_match.group(2).strip()
@@ -133,25 +132,24 @@ def _generate_training_data(
     if not valid_prompt_strs:
         return None
 
-    eos_str = tokenizer.decode([eos_token_id])
-
     # tokenize prefix and cot separately, then concatenate
     # this avoids cross-boundary tokenization issues and gives exact prefix lengths
     prefix_strs = [
         prompt + " " + answer
         for prompt, answer in zip(valid_prompt_strs, valid_answer_strs)
     ]
-    cot_strs = [cot + eos_str for cot in valid_cot_strs]
 
     prefix_encodings = [tokenizer.encode(s) for s in prefix_strs]
-    cot_encodings = [tokenizer.encode(s) for s in cot_strs]
+    cot_encodings = [tokenizer.encode(cot) for cot in valid_cot_strs]
 
     prefix_lengths = torch.tensor(
         [len(enc.ids) for enc in prefix_encodings], dtype=torch.long, device=device
     )
 
+    # append EOS token ID directly (not via string round-trip which may not
+    # re-encode special tokens correctly)
     all_ids = [
-        p_enc.ids + c_enc.ids
+        p_enc.ids + c_enc.ids + [eos_token_id]
         for p_enc, c_enc in zip(prefix_encodings, cot_encodings)
     ]
     max_len = max(len(ids) for ids in all_ids)
@@ -176,13 +174,17 @@ def _compute_nll_loss(
     prefix_lengths: torch.Tensor,
     loss_mask: torch.Tensor,
     normalize_by_sequence_length: bool,
+    use_bf16: bool = False,
 ) -> tuple[torch.Tensor, float]:
     """Forward through q and compute NLL loss on CoT tokens."""
     seq_len = input_ids.shape[1]
     device = input_ids.device
 
     attention_mask = create_prefix_lm_mask(prefix_lengths, seq_len, device)
-    logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
 
     # shift: predict next token from current position
     shift_logits = logits[:, :-1]
@@ -304,6 +306,7 @@ def train_inverse_cot_countdown(
                 prefix_lengths,
                 loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
+                use_bf16=train_params.use_bf16,
             )
             (loss / train_params.accumulation_steps).backward()
             total_loss += loss.item()
@@ -325,7 +328,7 @@ def train_inverse_cot_countdown(
         )
 
     @torch.no_grad()
-    def _val_fn(val_env: CountdownEnv) -> tuple[dict, list[extty.Example]]:
+    def _val_fn(val_env: CountdownEnv) -> tuple[float, list[extty.Example]]:
         q.eval()
 
         all_nll: list[float] = []
@@ -361,12 +364,15 @@ def train_inverse_cot_countdown(
                 prefix_lengths,
                 loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
+                use_bf16=train_params.use_bf16,
             )
             all_nll.append(nll)
 
             # qualitative: generate CoT from q for a few examples
             if len(examples) < train_params.val_episodes:
-                for i in range(min(current_batch, train_params.val_episodes - len(examples))):
+                for i in range(
+                    min(input_ids.shape[0], train_params.val_episodes - len(examples))
+                ):
                     prefix_len = prefix_lengths[i].item()
                     prefix_ids = input_ids[i, :prefix_len].unsqueeze(0)
 
@@ -381,18 +387,14 @@ def train_inverse_cot_countdown(
                         use_bf16=train_params.use_bf16,
                     ).tokens
 
-                    q_cot = tokenizer.decode(
-                        q_completion[0, prefix_len:].tolist()
-                    )
+                    q_cot = tokenizer.decode(q_completion[0, prefix_len:].tolist())
 
                     # decode the target CoT from training data
                     cot_mask = loss_mask[i]
                     cot_ids = input_ids[i][cot_mask].tolist()
                     target_cot = tokenizer.decode(cot_ids)
 
-                    prompt_str = tokenizer.decode(
-                        input_ids[i, :prefix_len].tolist()
-                    )
+                    prompt_str = tokenizer.decode(input_ids[i, :prefix_len].tolist())
                     examples.append(
                         extty.Example(
                             prompt=prompt_str,
@@ -407,29 +409,65 @@ def train_inverse_cot_countdown(
             n_episodes += current_batch
 
         nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
-        return {"nll_mean": nll_mean}, examples
+        return nll_mean, examples
 
-    def val_fn_adapter(val_env):
-        from dialectic.rl.evaluate import EvaluationResult
+    @torch.no_grad()
+    def _run_validation(step: int):
+        was_training = q.training
+        q.eval()
+        metrics: dict[str, Any] = {}
+        all_nll: list[float] = []
 
-        metrics, examples = _val_fn(val_env)
-        return EvaluationResult(
-            n_episodes=train_params.val_episodes,
-            reward_mean=-metrics["nll_mean"],
-            reward_std=0.0,
-            component_means=metrics,
-        ), examples
+        for val_env in val_envs:
+            val_env.reseed()
+            label = str(val_env)
+            nll_mean, examples = _val_fn(val_env)
+            metrics[f"val/{label}/nll_mean"] = nll_mean
+            if examples:
+                metrics[f"val/{label}/example"] = extty.BatchExample(
+                    prompts=[e.prompt for e in examples],
+                    responses=[e.responses for e in examples],
+                    rewards=[e.rewards for e in examples],
+                )
+            all_nll.append(nll_mean)
 
-    train_loop(
-        max_episodes=train_params.max_episodes,
-        save_ckpt_freq=train_params.save_ckpt_freq,
-        val_freq=train_params.val_freq,
-        net=q,
-        opt=opt,
-        train_step=_train_step,
-        val_fn=val_fn_adapter,
-        val_envs=val_envs,
-    )
+        if all_nll:
+            metrics["val/nll_mean"] = sum(all_nll) / len(all_nll)
+
+        if was_training:
+            q.train()
+        if extty.has_active_run():
+            extty.log(metrics, step=step)
+
+    n_episodes = 0
+    step = 0
+    while n_episodes < train_params.max_episodes:
+        start_time = time.perf_counter()
+        step_ret = _train_step(step)
+        step_time = time.perf_counter() - start_time
+        step += 1
+        n_episodes += step_ret.n_episodes_processed
+
+        if extty.has_active_run():
+            metrics = step_ret.metrics
+            metrics["step_time"] = step_time
+            extty.log(metrics, step=step)
+
+            if step % train_params.save_ckpt_freq == 0:
+                extty.save_checkpoint(
+                    step=step,
+                    state_dict=q.state_dict(),
+                    optimizer_state_dict=opt.state_dict(),
+                )
+            if train_params.val_freq > 0 and step % train_params.val_freq == 0:
+                _run_validation(step)
+
+    if step % train_params.save_ckpt_freq != 0 and extty.has_active_run():
+        extty.save_checkpoint(
+            step=step,
+            state_dict=q.state_dict(),
+            optimizer_state_dict=opt.state_dict(),
+        )
 
 
 if __name__ == "__main__":

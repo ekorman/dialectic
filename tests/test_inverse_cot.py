@@ -1,19 +1,14 @@
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
-from dialectic.llm.components.attention import attention
-from dialectic.llm.generate import generate_hard_tokens
-from dialectic.llm.inverse_cot import (
-    InverseCotModel,
-    create_prefix_lm_mask,
-)
-from dialectic.llm.qwen import create_qwen
-
 from dialectic.experiments.launchers.inverse_cot import (
     _compute_nll_loss,
     _parse_cot_and_answer,
 )
-
+from dialectic.llm.components.attention import attention
+from dialectic.llm.generate import generate_hard_tokens
+from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
+from dialectic.llm.qwen import create_qwen
 
 TINY_QWEN_KWARGS = dict(
     d=32,
@@ -38,27 +33,37 @@ def _make_p():
 
 class TestPrefixLmMask:
     def test_shape(self):
-        mask = create_prefix_lm_mask(torch.tensor([3, 5]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([3, 5]), seq_len=8, device=torch.device("cpu")
+        )
         assert mask.shape == (2, 1, 8, 8)
         assert mask.dtype == torch.bool
 
     def test_prefix_bidirectional(self):
-        mask = create_prefix_lm_mask(torch.tensor([4]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([4]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         assert m[:4, :4].all(), "prefix tokens should attend to all prefix tokens"
 
     def test_prefix_cannot_see_cot(self):
-        mask = create_prefix_lm_mask(torch.tensor([4]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([4]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         assert not m[:4, 4:].any(), "prefix tokens should not attend to CoT tokens"
 
     def test_cot_sees_all_prefix(self):
-        mask = create_prefix_lm_mask(torch.tensor([4]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([4]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         assert m[4:, :4].all(), "CoT tokens should attend to all prefix tokens"
 
     def test_cot_causal(self):
-        mask = create_prefix_lm_mask(torch.tensor([4]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([4]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         cot_cot = m[4:, 4:]
         for i in range(cot_cot.shape[0]):
@@ -66,7 +71,9 @@ class TestPrefixLmMask:
                 assert cot_cot[i, j] == (j <= i), f"cot[{i},{j}] should be {j <= i}"
 
     def test_varying_prefix_lengths(self):
-        mask = create_prefix_lm_mask(torch.tensor([2, 6]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([2, 6]), seq_len=8, device=torch.device("cpu")
+        )
         # sample 0: prefix=2, cot=6
         m0 = mask[0, 0]
         assert m0[:2, :2].all()
@@ -79,12 +86,16 @@ class TestPrefixLmMask:
         assert m1[6:, :6].all()
 
     def test_all_prefix(self):
-        mask = create_prefix_lm_mask(torch.tensor([8]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([8]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         assert m.all(), "when everything is prefix, all attention should be allowed"
 
     def test_all_cot(self):
-        mask = create_prefix_lm_mask(torch.tensor([0]), seq_len=8, device=torch.device("cpu"))
+        mask = create_prefix_lm_mask(
+            torch.tensor([0]), seq_len=8, device=torch.device("cpu")
+        )
         m = mask[0, 0]
         expected = torch.ones(8, 8, dtype=torch.bool).tril()
         assert (m == expected).all(), "when prefix_len=0, should be standard causal"
@@ -105,7 +116,12 @@ class TestAttention4dMask:
 
         result = attention(q, k, v, causal=False, attention_mask=mask_2d)
         expected = scaled_dot_product_attention(
-            q, k, v, attn_mask=mask_2d.view(B, 1, 1, L), is_causal=False, enable_gqa=True
+            q,
+            k,
+            v,
+            attn_mask=mask_2d.view(B, 1, 1, L),
+            is_causal=False,
+            enable_gqa=True,
         )
         torch.testing.assert_close(result, expected)
 
@@ -357,6 +373,30 @@ class TestParseCotAndAnswer:
 # ---------- NLL loss ----------
 
 
+class TestEosTokenInTrainingData:
+    def test_eos_token_present_in_input_ids(self, tokenizer):
+        """The actual EOS token ID must appear in the training sequence."""
+        eos_token_id = 151645  # Qwen <|im_end|>
+
+        prefix_str = "some prompt <answer>42</answer>"
+        cot_str = "Let me think step by step"
+
+        prefix_enc = tokenizer.encode(prefix_str)
+        cot_enc = tokenizer.encode(cot_str)
+        ids = prefix_enc.ids + cot_enc.ids + [eos_token_id]
+
+        assert ids[-1] == eos_token_id
+
+    def test_string_roundtrip_loses_eos(self, tokenizer):
+        """Demonstrate that decode→encode round-trip does NOT preserve the
+        special EOS token, which is why we append the ID directly."""
+        eos_token_id = 151645
+        eos_str = tokenizer.decode([eos_token_id])
+        cot_with_eos = "Let me think" + eos_str
+        re_encoded = tokenizer.encode(cot_with_eos)
+        assert eos_token_id not in re_encoded.ids
+
+
 class TestNllLoss:
     def test_zero_loss_when_mask_empty(self):
         p = _make_p()
@@ -398,7 +438,9 @@ class TestNllLoss:
         loss_mask = positions >= prefix_lengths.unsqueeze(1)
 
         _, nll_norm = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
-        _, nll_global = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, False)
+        _, nll_global = _compute_nll_loss(
+            q, input_ids, prefix_lengths, loss_mask, False
+        )
         # with different CoT lengths (9 vs 4), these should generally differ
         assert nll_norm != nll_global
 
