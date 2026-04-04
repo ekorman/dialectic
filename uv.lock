@@ -303,6 +303,7 @@ dependencies = [
     { name = "safetensors" },
     { name = "tokenizers" },
     { name = "torch" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -318,13 +319,14 @@ modal = [
 
 [package.metadata]
 requires-dist = [
-    { name = "extty", specifier = ">=0.13.0" },
+    { name = "extty", specifier = ">=0.15.0" },
     { name = "jaxtyping", specifier = ">=0.3.3" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "safetensors", specifier = ">=0.7.0" },
     { name = "tokenizers", specifier = ">=0.22.1" },
     { name = "torch", specifier = ">=2.9.1" },
+    { name = "tqdm", specifier = ">=4.67.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -347,16 +349,16 @@ wheels = [
 
 [[package]]
 name = "extty"
-version = "0.13.0"
+version = "0.15.0"
 source = { registry = "https://pypi.pols.ai/" }
 dependencies = [
     { name = "boto3" },
     { name = "nvidia-ml-py" },
     { name = "psutil" },
 ]
-sdist = { url = "https://pypi.pols.ai/packages/extty-0.13.0.tar.gz", hash = "sha256:27f908dfeba6bbb782d36910b7563f6f827dad3f2e6d103a427d0b87ee948a52" }
+sdist = { url = "https://pypi.pols.ai/packages/extty-0.15.0.tar.gz", hash = "sha256:4a5b4f8d8f328a379e13bdcf463365107d78d46451afc9137b570841f08d6cd0" }
 wheels = [
-    { url = "https://pypi.pols.ai/packages/extty-0.13.0-py3-none-any.whl", hash = "sha256:5ed27870be26dd3ad09012cee144562a5e3e969510061fdb8bf49dbee4d066f4" },
+    { url = "https://pypi.pols.ai/packages/extty-0.15.0-py3-none-any.whl", hash = "sha256:82e41f1afd25ff7047014be4ea877c5943885f73d73ed48edab16f575f4c7ef1" },
 ]
 
 [[package]]

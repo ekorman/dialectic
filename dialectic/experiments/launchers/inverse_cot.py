@@ -1,5 +1,6 @@
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import extty
@@ -22,6 +23,8 @@ from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
+from dialectic.rl.extractors import extract_from_answer_tags
+from dialectic.rl.reward import _evaluate_and_verify_countdown
 from dialectic.rl.rollout import get_batch
 from dialectic.training import StepFunctionReturn
 
@@ -50,6 +53,17 @@ def _parse_cot_and_answer(text: str) -> tuple[str, str] | None:
     return None
 
 
+@dataclass
+class TrainingBatch:
+    input_ids: torch.Tensor
+    prefix_lengths: torch.Tensor
+    loss_mask: torch.Tensor
+    n_skipped: int
+    prompt_token_ids: list[list[int]]
+    answer_token_ids: list[list[int]]
+    cot_token_ids: list[list[int]]
+
+
 def _generate_training_data(
     *,
     p: BaseTransformer,
@@ -62,12 +76,9 @@ def _generate_training_data(
     temperature: float,
     max_tokens_generated: int,
     use_bf16: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
-    """Generate data from p and construct q's training batch.
-
-    Returns (input_ids, prefix_lengths, loss_mask, n_skipped) or None if no
-    valid samples. n_skipped is the number of samples that failed parsing.
-    """
+    correct_only: bool = False,
+) -> TrainingBatch | None:
+    """Generate data from p and construct q's training batch."""
     device = next(p.parameters()).device
 
     env_responses = get_batch(env, batch_size)
@@ -106,6 +117,7 @@ def _generate_training_data(
 
     n_no_answer_tag = 0
     n_empty_cot = 0
+    n_incorrect = 0
     for i, comp_str in enumerate(completion_strs):
         parsed = _parse_cot_and_answer(comp_str)
         if parsed is None:
@@ -115,6 +127,15 @@ def _generate_training_data(
         if not cot.strip():
             n_empty_cot += 1
             continue
+        if correct_only:
+            extracted = extract_from_answer_tags(comp_str)
+            if extracted is None or not _evaluate_and_verify_countdown(
+                extracted,
+                env_responses[i].data.numbers,
+                env_responses[i].data.target,
+            ):
+                n_incorrect += 1
+                continue
         # reconstruct prompt string (remove left-padding artifacts)
         prompt_token_ids = token_ids[i][attention_mask[i]].tolist()
         prompt_str = tokenizer.decode(prompt_token_ids)
@@ -122,35 +143,34 @@ def _generate_training_data(
         valid_answer_strs.append(answer)
         valid_cot_strs.append(cot)
 
-    if n_no_answer_tag > 0 or n_empty_cot > 0:
+    n_skipped = n_no_answer_tag + n_empty_cot + n_incorrect
+    if n_skipped > 0:
         print(
             f"Skipped {n_no_answer_tag}/{batch_size} (no parse), "
-            f"{n_empty_cot}/{batch_size} (empty CoT). "
+            f"{n_empty_cot}/{batch_size} (empty CoT), "
+            f"{n_incorrect}/{batch_size} (incorrect). "
             f"Sample failed completion: {completion_strs[0][:200]!r}"
         )
-    n_skipped = n_no_answer_tag + n_empty_cot
     if not valid_prompt_strs:
         return None
 
-    # tokenize prefix and cot separately, then concatenate
-    # this avoids cross-boundary tokenization issues and gives exact prefix lengths
-    prefix_strs = [
-        prompt + " " + answer
-        for prompt, answer in zip(valid_prompt_strs, valid_answer_strs)
-    ]
+    # tokenize prompt, answer, cot separately
+    prompt_encs = [tokenizer.encode(s) for s in valid_prompt_strs]
+    answer_encs = [tokenizer.encode(" " + s) for s in valid_answer_strs]
+    cot_encs = [tokenizer.encode(s) for s in valid_cot_strs]
 
-    prefix_encodings = [tokenizer.encode(s) for s in prefix_strs]
-    cot_encodings = [tokenizer.encode(cot) for cot in valid_cot_strs]
+    prompt_ids = [enc.ids for enc in prompt_encs]
+    answer_ids = [enc.ids for enc in answer_encs]
+    cot_ids = [enc.ids for enc in cot_encs]
 
     prefix_lengths = torch.tensor(
-        [len(enc.ids) for enc in prefix_encodings], dtype=torch.long, device=device
+        [len(p) + len(a) for p, a in zip(prompt_ids, answer_ids)],
+        dtype=torch.long,
+        device=device,
     )
 
-    # append EOS token ID directly (not via string round-trip which may not
-    # re-encode special tokens correctly)
     all_ids = [
-        p_enc.ids + c_enc.ids + [eos_token_id]
-        for p_enc, c_enc in zip(prefix_encodings, cot_encodings)
+        p + a + c + [eos_token_id] for p, a, c in zip(prompt_ids, answer_ids, cot_ids)
     ]
     max_len = max(len(ids) for ids in all_ids)
     input_ids = torch.full((len(all_ids), max_len), pad_token_id, device=device)
@@ -165,7 +185,15 @@ def _generate_training_data(
         positions < actual_lengths
     )
 
-    return input_ids, prefix_lengths, loss_mask, n_skipped
+    return TrainingBatch(
+        input_ids=input_ids,
+        prefix_lengths=prefix_lengths,
+        loss_mask=loss_mask,
+        n_skipped=n_skipped,
+        prompt_token_ids=prompt_ids,
+        answer_token_ids=answer_ids,
+        cot_token_ids=cot_ids,
+    )
 
 
 def _compute_nll_loss(
@@ -208,6 +236,198 @@ def _compute_nll_loss(
 
     nll = loss.item()
     return loss, nll
+
+
+@dataclass
+class PreTokenizedCompletion:
+    answer_ids: list[int]
+    cot_ids: list[int]
+    is_correct: bool
+
+
+@dataclass
+class PreTokenizedPrompt:
+    prompt_ids: list[int]
+    completions: list[PreTokenizedCompletion]
+
+
+def _load_rollout_artifact(
+    artifact_name: str, tokenizer: Tokenizer
+) -> list[PreTokenizedPrompt]:
+    import json
+
+    data = extty.load_artifact(artifact_name)
+    if not isinstance(data, bytes):
+        raise ValueError(f"Expected bytes from artifact, got {type(data)}")
+
+    prompts = []
+    for line in data.decode().splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        prompt_ids = tokenizer.encode(entry["prompt_str"]).ids
+        completions = []
+        for comp in entry["completions"]:
+            answer_ids = tokenizer.encode(" " + comp["answer"]).ids
+            cot_ids = tokenizer.encode(comp["cot"]).ids
+            completions.append(
+                PreTokenizedCompletion(
+                    answer_ids=answer_ids,
+                    cot_ids=cot_ids,
+                    is_correct=comp["is_correct"],
+                )
+            )
+        prompts.append(
+            PreTokenizedPrompt(prompt_ids=prompt_ids, completions=completions)
+        )
+    print(f"Loaded {len(prompts)} prompts from artifact '{artifact_name}'")
+    return prompts
+
+
+def _subsample_completions(prompt: PreTokenizedPrompt, k: int) -> PreTokenizedPrompt:
+    """Subsample k completions, guaranteeing at least 1 positive and 1 negative."""
+    import random
+
+    positives = [c for c in prompt.completions if c.is_correct]
+    negatives = [c for c in prompt.completions if not c.is_correct]
+
+    if not positives or not negatives:
+        return prompt
+
+    selected: list[PreTokenizedCompletion] = []
+    selected.append(random.choice(positives))
+    selected.append(random.choice(negatives))
+
+    remaining = [c for c in prompt.completions if c not in selected]
+    n_extra = min(k - 2, len(remaining))
+    if n_extra > 0:
+        selected.extend(random.sample(remaining, n_extra))
+
+    random.shuffle(selected)
+    return PreTokenizedPrompt(prompt_ids=prompt.prompt_ids, completions=selected)
+
+
+def _build_contrastive_batch(
+    prompts: list[PreTokenizedPrompt],
+    eos_token_id: int,
+    pad_token_id: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    """Build a batch from pre-tokenized prompts for contrastive training.
+
+    Returns (input_ids, prefix_lengths, loss_mask, is_correct, group_sizes).
+    input_ids is [N, L] where N = sum of group sizes across prompts.
+    """
+    all_ids: list[list[int]] = []
+    all_prefix_lengths: list[int] = []
+    all_is_correct: list[bool] = []
+    group_sizes: list[int] = []
+
+    for prompt in prompts:
+        group_sizes.append(len(prompt.completions))
+        for comp in prompt.completions:
+            seq = prompt.prompt_ids + comp.answer_ids + comp.cot_ids + [eos_token_id]
+            all_ids.append(seq)
+            all_prefix_lengths.append(len(prompt.prompt_ids) + len(comp.answer_ids))
+            all_is_correct.append(comp.is_correct)
+
+    max_len = max(len(ids) for ids in all_ids)
+    N = len(all_ids)
+    input_ids = torch.full((N, max_len), pad_token_id, device=device)
+    for i, ids in enumerate(all_ids):
+        input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+
+    prefix_lengths = torch.tensor(all_prefix_lengths, dtype=torch.long, device=device)
+    actual_lengths = torch.tensor(
+        [len(ids) for ids in all_ids], dtype=torch.long, device=device
+    )
+    positions = torch.arange(max_len, device=device).unsqueeze(0)
+    loss_mask = (positions >= prefix_lengths.unsqueeze(1)) & (
+        positions < actual_lengths.unsqueeze(1)
+    )
+    is_correct = torch.tensor(all_is_correct, dtype=torch.bool, device=device)
+
+    return input_ids, prefix_lengths, loss_mask, is_correct, group_sizes
+
+
+def _compute_contrastive_loss(
+    q: InverseCotModel,
+    input_ids: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    loss_mask: torch.Tensor,
+    is_correct: torch.Tensor,
+    group_sizes: list[int],
+    contrastive_weight: float,
+    use_bf16: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute NLL + contrastive loss over grouped completions.
+
+    Returns (total_loss, metrics_dict).
+    """
+    seq_len = input_ids.shape[1]
+    device = input_ids.device
+
+    attention_mask = create_prefix_lm_mask(prefix_lengths, seq_len, device)
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
+
+    shift_logits = logits[:, :-1]
+    shift_targets = input_ids[:, 1:]
+    shift_mask = loss_mask[:, 1:]
+
+    N, L, V = shift_logits.shape
+    per_token_loss = F.cross_entropy(
+        shift_logits.reshape(N * L, V),
+        shift_targets.reshape(N * L),
+        reduction="none",
+    ).reshape(N, L)
+
+    # per-sequence average log prob (negative of per-token avg loss)
+    seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
+    per_seq_avg_nll = (per_token_loss * shift_mask).sum(dim=1) / seq_lengths
+    per_seq_avg_logprob = -per_seq_avg_nll
+
+    # split into groups and compute per-prompt losses
+    nll_losses: list[torch.Tensor] = []
+    contrastive_losses: list[torch.Tensor] = []
+    offset = 0
+    for gs in group_sizes:
+        group_nll = per_seq_avg_nll[offset : offset + gs]
+        group_logprob = per_seq_avg_logprob[offset : offset + gs]
+        group_correct = is_correct[offset : offset + gs]
+
+        # NLL: mean over positive examples
+        if group_correct.any():
+            nll_losses.append(group_nll[group_correct].mean())
+
+        # contrastive: -log(sum_pos exp(s) / sum_all exp(s))
+        if contrastive_weight > 0 and group_correct.any() and not group_correct.all():
+            log_numerator = torch.logsumexp(group_logprob[group_correct], dim=0)
+            log_denominator = torch.logsumexp(group_logprob, dim=0)
+            contrastive_losses.append(-(log_numerator - log_denominator))
+
+        offset += gs
+
+    nll_loss = (
+        torch.stack(nll_losses).mean()
+        if nll_losses
+        else torch.tensor(0.0, device=device)
+    )
+    contrastive_loss = (
+        torch.stack(contrastive_losses).mean()
+        if contrastive_losses
+        else torch.tensor(0.0, device=device)
+    )
+    total_loss = nll_loss + contrastive_weight * contrastive_loss
+
+    metrics = {
+        "train/nll": nll_loss.item(),
+        "train/contrastive_loss": contrastive_loss.item(),
+        "train/loss": total_loss.item(),
+    }
+    return total_loss, metrics
 
 
 @extty.experiment(project="inverse-cot-countdown")
@@ -272,7 +492,16 @@ def train_inverse_cot_countdown(
         for i in range(len(n_ops_list))
     ]
 
-    def _train_step(_step_idx: int) -> StepFunctionReturn:
+    # load rollout artifact if provided
+    rollout_data: list[PreTokenizedPrompt] | None = None
+    if inverse_cot_params.rollout_file is not None:
+        rollout_data = _load_rollout_artifact(
+            inverse_cot_params.rollout_file,
+            tokenizer,
+        )
+
+    def _train_step_online() -> StepFunctionReturn:
+        """Train step using on-the-fly generation from p."""
         q.train()
         opt.zero_grad()
 
@@ -293,25 +522,25 @@ def train_inverse_cot_countdown(
                 temperature=train_params.temperature,
                 max_tokens_generated=train_params.max_tokens_generated,
                 use_bf16=train_params.use_bf16,
+                correct_only=inverse_cot_params.correct_only,
             )
             if data is None:
                 skipped += train_params.batch_size
                 continue
 
-            input_ids, prefix_lengths, loss_mask, batch_skipped = data
-            skipped += batch_skipped
+            skipped += data.n_skipped
             loss, nll = _compute_nll_loss(
                 q,
-                input_ids,
-                prefix_lengths,
-                loss_mask,
+                data.input_ids,
+                data.prefix_lengths,
+                data.loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
                 use_bf16=train_params.use_bf16,
             )
             (loss / train_params.accumulation_steps).backward()
             total_loss += loss.item()
             total_nll += nll
-            total_episodes += input_ids.shape[0]
+            total_episodes += data.input_ids.shape[0]
 
         if total_episodes > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, train_params.max_grad_norm)
@@ -327,11 +556,71 @@ def train_inverse_cot_countdown(
             n_episodes_processed=total_episodes + skipped, metrics=metrics
         )
 
+    def _train_step_offline() -> StepFunctionReturn:
+        """Train step using pre-generated rollout file with contrastive loss."""
+        assert rollout_data is not None
+        q.train()
+        opt.zero_grad()
+
+        total_metrics: dict[str, float] = {}
+        total_episodes = 0
+
+        for _ in range(train_params.accumulation_steps):
+            indices = torch.randint(
+                len(rollout_data), (train_params.batch_size,)
+            ).tolist()
+            batch_prompts = [rollout_data[i] for i in indices]
+
+            if inverse_cot_params.train_group_size is not None:
+                batch_prompts = [
+                    _subsample_completions(p, inverse_cot_params.train_group_size)
+                    for p in batch_prompts
+                ]
+
+            input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+                _build_contrastive_batch(
+                    batch_prompts,
+                    model_info.eos_token_id,
+                    model_info.pad_token_id,
+                    device,
+                )
+            )
+
+            loss, step_metrics = _compute_contrastive_loss(
+                q,
+                input_ids,
+                prefix_lengths,
+                loss_mask,
+                is_correct,
+                group_sizes,
+                inverse_cot_params.contrastive_weight,
+                use_bf16=train_params.use_bf16,
+            )
+            (loss / train_params.accumulation_steps).backward()
+
+            for k, v in step_metrics.items():
+                total_metrics[k] = total_metrics.get(k, 0.0) + v
+            total_episodes += train_params.batch_size
+
+        torch.nn.utils.clip_grad_norm_(trainable_params, train_params.max_grad_norm)
+        opt.step()
+
+        metrics = {
+            k: v / train_params.accumulation_steps for k, v in total_metrics.items()
+        }
+        metrics["train/episodes"] = total_episodes
+        return StepFunctionReturn(n_episodes_processed=total_episodes, metrics=metrics)
+
+    _train_step = (
+        _train_step_offline if rollout_data is not None else _train_step_online
+    )
+
     @torch.no_grad()
-    def _val_fn(val_env: CountdownEnv) -> tuple[float, list[extty.Example]]:
+    def _val_fn(val_env: CountdownEnv) -> tuple[float, float, list[extty.Example]]:
         q.eval()
 
         all_nll: list[float] = []
+        all_nll_shuffled: list[float] = []
         examples: list[extty.Example] = []
 
         n_episodes = 0
@@ -352,29 +641,69 @@ def train_inverse_cot_countdown(
                 temperature=train_params.temperature,
                 max_tokens_generated=train_params.max_tokens_generated,
                 use_bf16=train_params.use_bf16,
+                correct_only=inverse_cot_params.correct_only,
             )
             if data is None:
                 n_episodes += current_batch
                 continue
 
-            input_ids, prefix_lengths, loss_mask, batch_skipped = data
             _, nll = _compute_nll_loss(
                 q,
-                input_ids,
-                prefix_lengths,
-                loss_mask,
+                data.input_ids,
+                data.prefix_lengths,
+                data.loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
                 use_bf16=train_params.use_bf16,
             )
             all_nll.append(nll)
 
+            # shuffled answer diagnostic: keep same prompt and CoT,
+            # roll only the answer tokens by 1 within batch
+            B = len(data.prompt_token_ids)
+            if B > 1:
+                shuffled_answer_ids = (
+                    data.answer_token_ids[1:] + data.answer_token_ids[:1]
+                )
+                shuffled_all_ids = [
+                    p + a + c + [model_info.eos_token_id]
+                    for p, a, c in zip(
+                        data.prompt_token_ids, shuffled_answer_ids, data.cot_token_ids
+                    )
+                ]
+                s_max_len = max(len(ids) for ids in shuffled_all_ids)
+                s_input_ids = torch.full(
+                    (B, s_max_len), model_info.pad_token_id, device=device
+                )
+                for i, ids in enumerate(shuffled_all_ids):
+                    s_input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+                s_prefix_lengths = torch.tensor(
+                    [
+                        len(p) + len(a)
+                        for p, a in zip(data.prompt_token_ids, shuffled_answer_ids)
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                )
+                positions_s = torch.arange(s_max_len, device=device).unsqueeze(0)
+                cot_lengths = data.loss_mask.sum(dim=1)
+                s_loss_mask = (positions_s >= s_prefix_lengths.unsqueeze(1)) & (
+                    positions_s < (s_prefix_lengths + cot_lengths).unsqueeze(1)
+                )
+                _, nll_shuffled = _compute_nll_loss(
+                    q,
+                    s_input_ids,
+                    s_prefix_lengths,
+                    s_loss_mask,
+                    inverse_cot_params.normalize_by_sequence_length,
+                    use_bf16=train_params.use_bf16,
+                )
+                all_nll_shuffled.append(nll_shuffled)
+
             # qualitative: generate CoT from q for a few examples
             if len(examples) < train_params.val_episodes:
-                for i in range(
-                    min(input_ids.shape[0], train_params.val_episodes - len(examples))
-                ):
-                    prefix_len = prefix_lengths[i].item()
-                    prefix_ids = input_ids[i, :prefix_len].unsqueeze(0)
+                for i in range(min(B, train_params.val_episodes - len(examples))):
+                    prefix_len = data.prefix_lengths[i].item()
+                    prefix_ids = data.input_ids[i, :prefix_len].unsqueeze(0)
 
                     q_completion = generate_hard_tokens(
                         net=q,
@@ -389,12 +718,11 @@ def train_inverse_cot_countdown(
 
                     q_cot = tokenizer.decode(q_completion[0, prefix_len:].tolist())
 
-                    # decode the target CoT from training data
-                    cot_mask = loss_mask[i]
-                    cot_ids = input_ids[i][cot_mask].tolist()
-                    target_cot = tokenizer.decode(cot_ids)
+                    target_cot = tokenizer.decode(data.cot_token_ids[i])
 
-                    prompt_str = tokenizer.decode(input_ids[i, :prefix_len].tolist())
+                    prompt_str = tokenizer.decode(
+                        data.input_ids[i, :prefix_len].tolist()
+                    )
                     examples.append(
                         extty.Example(
                             prompt=prompt_str,
@@ -409,7 +737,10 @@ def train_inverse_cot_countdown(
             n_episodes += current_batch
 
         nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
-        return nll_mean, examples
+        nll_shuffled_mean = (
+            sum(all_nll_shuffled) / len(all_nll_shuffled) if all_nll_shuffled else 0.0
+        )
+        return nll_mean, nll_shuffled_mean, examples
 
     @torch.no_grad()
     def _run_validation(step: int):
@@ -418,11 +749,14 @@ def train_inverse_cot_countdown(
         metrics: dict[str, Any] = {}
         all_nll: list[float] = []
 
+        all_nll_shuffled: list[float] = []
+
         for val_env in val_envs:
             val_env.reseed()
             label = str(val_env)
-            nll_mean, examples = _val_fn(val_env)
+            nll_mean, nll_shuffled_mean, examples = _val_fn(val_env)
             metrics[f"val/{label}/nll_mean"] = nll_mean
+            metrics[f"val/{label}/nll_shuffled_mean"] = nll_shuffled_mean
             if examples:
                 metrics[f"val/{label}/example"] = extty.BatchExample(
                     prompts=[e.prompt for e in examples],
@@ -430,9 +764,14 @@ def train_inverse_cot_countdown(
                     rewards=[e.rewards for e in examples],
                 )
             all_nll.append(nll_mean)
+            all_nll_shuffled.append(nll_shuffled_mean)
 
         if all_nll:
             metrics["val/nll_mean"] = sum(all_nll) / len(all_nll)
+        if all_nll_shuffled:
+            metrics["val/nll_shuffled_mean"] = sum(all_nll_shuffled) / len(
+                all_nll_shuffled
+            )
 
         if was_training:
             q.train()
@@ -443,7 +782,7 @@ def train_inverse_cot_countdown(
     step = 0
     while n_episodes < train_params.max_episodes:
         start_time = time.perf_counter()
-        step_ret = _train_step(step)
+        step_ret = _train_step()
         step_time = time.perf_counter() - start_time
         step += 1
         n_episodes += step_ret.n_episodes_processed

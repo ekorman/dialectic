@@ -86,3 +86,23 @@ class MultiStepSFTParams:
 @dataclass
 class InverseCotParams:
     normalize_by_sequence_length: bool
+    correct_only: bool
+    contrastive_weight: float = 0.0
+    rollout_file: str | None = None
+    train_group_size: int | None = None
+
+
+@dataclass
+class RolloutGenParams:
+    model_name: str
+    batch_size: int
+    seed: int
+    temperature: float
+    max_tokens_generated: int
+    group_size: int
+    n_prompts: int
+    n_pos_min: int
+    n_neg_min: int
+    use_bf16: bool
+    start_ckpt_run: str | None = None
+    start_ckpt_step: int | None = None

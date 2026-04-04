@@ -2,6 +2,10 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from dialectic.experiments.launchers.inverse_cot import (
+    PreTokenizedCompletion,
+    PreTokenizedPrompt,
+    _build_contrastive_batch,
+    _compute_contrastive_loss,
     _compute_nll_loss,
     _parse_cot_and_answer,
 )
@@ -456,3 +460,173 @@ class TestNllLoss:
         loss, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
         loss.backward()
         assert q.lm_head.weight.grad is not None
+
+
+# ---------- contrastive loss ----------
+
+
+def _make_prompts(n_prompts=2, group_size=4, n_correct=2):
+    """Create synthetic PreTokenizedPrompt data for testing."""
+    prompts = []
+    for i in range(n_prompts):
+        completions = []
+        for g in range(group_size):
+            completions.append(
+                PreTokenizedCompletion(
+                    answer_ids=[10 + i, 20 + g],
+                    cot_ids=[30 + g, 40 + g, 50 + g],
+                    is_correct=g < n_correct,
+                )
+            )
+        prompts.append(
+            PreTokenizedPrompt(prompt_ids=[1, 2, 3], completions=completions)
+        )
+    return prompts
+
+
+class TestContrastiveLoss:
+    def test_build_batch_shapes(self):
+        prompts = _make_prompts(n_prompts=2, group_size=4)
+        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+            _build_contrastive_batch(
+                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+            )
+        )
+        assert input_ids.shape[0] == 8  # 2 prompts * 4 completions
+        assert prefix_lengths.shape == (8,)
+        assert loss_mask.shape == input_ids.shape
+        assert is_correct.shape == (8,)
+        assert group_sizes == [4, 4]
+
+    def test_build_batch_correctness_mask(self):
+        prompts = _make_prompts(n_prompts=1, group_size=4, n_correct=2)
+        _, _, _, is_correct, _ = _build_contrastive_batch(
+            prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        )
+        assert is_correct.tolist() == [True, True, False, False]
+
+    def test_contrastive_loss_all_positive(self):
+        """When all examples are positive, contrastive loss should be 0."""
+        p = _make_p()
+        q = InverseCotModel(p)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=4)
+        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+            _build_contrastive_batch(
+                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+            )
+        )
+        _, metrics = _compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            is_correct,
+            group_sizes,
+            contrastive_weight=1.0,
+        )
+        assert metrics["train/contrastive_loss"] == 0.0
+
+    def test_contrastive_loss_with_negatives(self):
+        """Contrastive loss should be > 0 when there are negatives."""
+        p = _make_p()
+        q = InverseCotModel(p)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
+        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+            _build_contrastive_batch(
+                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+            )
+        )
+        _, metrics = _compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            is_correct,
+            group_sizes,
+            contrastive_weight=1.0,
+        )
+        assert metrics["train/contrastive_loss"] > 0.0
+
+    def test_contrastive_loss_is_differentiable(self):
+        p = _make_p()
+        q = InverseCotModel(p)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
+        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+            _build_contrastive_batch(
+                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+            )
+        )
+        loss, _ = _compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            is_correct,
+            group_sizes,
+            contrastive_weight=1.0,
+        )
+        loss.backward()
+        assert q.lm_head.weight.grad is not None
+
+    def test_contrastive_weight_zero_matches_nll_only(self):
+        """With contrastive_weight=0, contrastive loss shouldn't contribute."""
+        p = _make_p()
+        q = InverseCotModel(p)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
+        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+            _build_contrastive_batch(
+                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+            )
+        )
+        loss_w0, m0 = _compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            is_correct,
+            group_sizes,
+            contrastive_weight=0.0,
+        )
+        assert m0["train/loss"] == m0["train/nll"]
+
+
+# ---------- JSONL round-trip ----------
+
+
+class TestJsonlRoundTrip:
+    def test_write_and_load(self, tokenizer, monkeypatch):
+        import json
+
+        from dialectic.experiments.launchers import inverse_cot
+
+        entries = [
+            {
+                "prompt_str": "Using [1, 2, 3], reach 6",
+                "numbers": [1, 2, 3],
+                "target": 6,
+                "completions": [
+                    {
+                        "cot": "1+2=3, 3+3=6",
+                        "answer": "<answer>1+2+3</answer>",
+                        "is_correct": True,
+                    },
+                    {
+                        "cot": "1*2=2",
+                        "answer": "<answer>1*2</answer>",
+                        "is_correct": False,
+                    },
+                ],
+            }
+        ]
+        jsonl_bytes = "\n".join(json.dumps(e) for e in entries).encode()
+        monkeypatch.setattr(
+            inverse_cot.extty, "load_artifact", lambda name: jsonl_bytes
+        )
+
+        loaded = inverse_cot._load_rollout_artifact("test-artifact", tokenizer)
+        assert len(loaded) == 1
+        assert len(loaded[0].completions) == 2
+        assert loaded[0].completions[0].is_correct is True
+        assert loaded[0].completions[1].is_correct is False
+        assert len(loaded[0].prompt_ids) > 0
+        assert len(loaded[0].completions[0].cot_ids) > 0
