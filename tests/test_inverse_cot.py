@@ -410,7 +410,7 @@ class TestNllLoss:
         prefix_lengths = torch.tensor([L, L])  # all prefix, no CoT
         loss_mask = torch.zeros(B, L, dtype=torch.bool)
 
-        loss, nll = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
+        loss, nll, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
         assert loss.item() == 0.0
 
     def test_loss_only_on_masked_positions(self):
@@ -426,8 +426,8 @@ class TestNllLoss:
         mask2 = torch.zeros(B, L, dtype=torch.bool)
         mask2[:, 7:] = True
 
-        _, nll1 = _compute_nll_loss(q, input_ids, prefix_lengths, mask1, True)
-        _, nll2 = _compute_nll_loss(q, input_ids, prefix_lengths, mask2, True)
+        _, nll1, _ = _compute_nll_loss(q, input_ids, prefix_lengths, mask1, True)
+        _, nll2, _ = _compute_nll_loss(q, input_ids, prefix_lengths, mask2, True)
         assert nll1 != nll2
 
     def test_normalize_by_sequence_length(self):
@@ -441,8 +441,10 @@ class TestNllLoss:
         positions = torch.arange(L).unsqueeze(0)
         loss_mask = positions >= prefix_lengths.unsqueeze(1)
 
-        _, nll_norm = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
-        _, nll_global = _compute_nll_loss(
+        _, nll_norm, _ = _compute_nll_loss(
+            q, input_ids, prefix_lengths, loss_mask, True
+        )
+        _, nll_global, _ = _compute_nll_loss(
             q, input_ids, prefix_lengths, loss_mask, False
         )
         # with different CoT lengths (9 vs 4), these should generally differ
@@ -457,7 +459,7 @@ class TestNllLoss:
         loss_mask = torch.zeros(B, L, dtype=torch.bool)
         loss_mask[:, 4:] = True
 
-        loss, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
+        loss, _, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
         loss.backward()
         assert q.lm_head.weight.grad is not None
 

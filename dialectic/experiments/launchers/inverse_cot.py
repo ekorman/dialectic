@@ -62,6 +62,7 @@ class TrainingBatch:
     prompt_token_ids: list[list[int]]
     answer_token_ids: list[list[int]]
     cot_token_ids: list[list[int]]
+    is_correct: list[bool]
 
 
 def _generate_training_data(
@@ -111,9 +112,10 @@ def _generate_training_data(
     prompt_len = token_ids.shape[1]
     completion_strs = tokenizer.decode_batch(completions[:, prompt_len:].tolist())
 
-    valid_prompt_strs: list[str] = []
+    valid_prompt_ids: list[list[int]] = []
     valid_answer_strs: list[str] = []
     valid_cot_strs: list[str] = []
+    valid_is_correct: list[bool] = []
 
     n_no_answer_tag = 0
     n_empty_cot = 0
@@ -127,21 +129,20 @@ def _generate_training_data(
         if not cot.strip():
             n_empty_cot += 1
             continue
-        if correct_only:
-            extracted = extract_from_answer_tags(comp_str)
-            if extracted is None or not _evaluate_and_verify_countdown(
-                extracted,
-                env_responses[i].data.numbers,
-                env_responses[i].data.target,
-            ):
-                n_incorrect += 1
-                continue
-        # reconstruct prompt string (remove left-padding artifacts)
-        prompt_token_ids = token_ids[i][attention_mask[i]].tolist()
-        prompt_str = tokenizer.decode(prompt_token_ids)
-        valid_prompt_strs.append(prompt_str)
+        extracted = extract_from_answer_tags(comp_str)
+        sample_correct = extracted is not None and _evaluate_and_verify_countdown(
+            extracted,
+            env_responses[i].data.numbers,
+            env_responses[i].data.target,
+        )
+        if correct_only and not sample_correct:
+            n_incorrect += 1
+            continue
+        # keep original prompt token IDs (no lossy decode→re-encode roundtrip)
+        valid_prompt_ids.append(token_ids[i][attention_mask[i]].tolist())
         valid_answer_strs.append(answer)
         valid_cot_strs.append(cot)
+        valid_is_correct.append(sample_correct)
 
     n_skipped = n_no_answer_tag + n_empty_cot + n_incorrect
     if n_skipped > 0:
@@ -151,15 +152,14 @@ def _generate_training_data(
             f"{n_incorrect}/{batch_size} (incorrect). "
             f"Sample failed completion: {completion_strs[0][:200]!r}"
         )
-    if not valid_prompt_strs:
+    if not valid_prompt_ids:
         return None
 
-    # tokenize prompt, answer, cot separately
-    prompt_encs = [tokenizer.encode(s) for s in valid_prompt_strs]
+    # tokenize answer and cot (prompt IDs are kept from original tokenization)
     answer_encs = [tokenizer.encode(" " + s) for s in valid_answer_strs]
     cot_encs = [tokenizer.encode(s) for s in valid_cot_strs]
 
-    prompt_ids = [enc.ids for enc in prompt_encs]
+    prompt_ids = valid_prompt_ids
     answer_ids = [enc.ids for enc in answer_encs]
     cot_ids = [enc.ids for enc in cot_encs]
 
@@ -193,6 +193,7 @@ def _generate_training_data(
         prompt_token_ids=prompt_ids,
         answer_token_ids=answer_ids,
         cot_token_ids=cot_ids,
+        is_correct=valid_is_correct,
     )
 
 
@@ -203,8 +204,11 @@ def _compute_nll_loss(
     loss_mask: torch.Tensor,
     normalize_by_sequence_length: bool,
     use_bf16: bool = False,
-) -> tuple[torch.Tensor, float]:
-    """Forward through q and compute NLL loss on CoT tokens."""
+) -> tuple[torch.Tensor, float, list[float]]:
+    """Forward through q and compute NLL loss on CoT tokens.
+
+    Returns (loss, mean_nll, per_sample_nlls).
+    """
     seq_len = input_ids.shape[1]
     device = input_ids.device
 
@@ -227,15 +231,17 @@ def _compute_nll_loss(
     ).reshape(B, L)
 
     masked_loss = per_token_loss * shift_mask
+    seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
+    per_seq_loss = masked_loss.sum(dim=1) / seq_lengths
+
     if normalize_by_sequence_length:
-        seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
-        per_seq_loss = masked_loss.sum(dim=1) / seq_lengths
         loss = per_seq_loss.mean()
     else:
         loss = masked_loss.sum() / shift_mask.sum().clamp(min=1)
 
     nll = loss.item()
-    return loss, nll
+    per_sample_nlls = per_seq_loss.detach().tolist()
+    return loss, nll, per_sample_nlls
 
 
 @dataclass
@@ -450,6 +456,8 @@ def train_inverse_cot_countdown(
 
     # Build q from p
     q = InverseCotModel(p)
+    if inverse_cot_params.freeze_lm_head:
+        q.lm_head.requires_grad_(False)
     device = get_default_device()
     q = q.to(device)
 
@@ -492,13 +500,25 @@ def train_inverse_cot_countdown(
         for i in range(len(n_ops_list))
     ]
 
-    # load rollout artifact if provided
+    # load rollout artifact and optionally split for val
     rollout_data: list[PreTokenizedPrompt] | None = None
+    val_rollout_data: list[PreTokenizedPrompt] | None = None
     if inverse_cot_params.rollout_file is not None:
-        rollout_data = _load_rollout_artifact(
+        all_rollout_data = _load_rollout_artifact(
             inverse_cot_params.rollout_file,
             tokenizer,
         )
+        if inverse_cot_params.val_rollout_pct > 0:
+            n_val = max(
+                1, int(len(all_rollout_data) * inverse_cot_params.val_rollout_pct)
+            )
+            val_rollout_data = all_rollout_data[:n_val]
+            rollout_data = all_rollout_data[n_val:]
+            print(
+                f"Split rollout: {len(rollout_data)} train, {len(val_rollout_data)} val"
+            )
+        else:
+            rollout_data = all_rollout_data
 
     def _train_step_online() -> StepFunctionReturn:
         """Train step using on-the-fly generation from p."""
@@ -529,7 +549,7 @@ def train_inverse_cot_countdown(
                 continue
 
             skipped += data.n_skipped
-            loss, nll = _compute_nll_loss(
+            loss, nll, _ = _compute_nll_loss(
                 q,
                 data.input_ids,
                 data.prefix_lengths,
@@ -616,10 +636,129 @@ def train_inverse_cot_countdown(
     )
 
     @torch.no_grad()
-    def _val_fn(val_env: CountdownEnv) -> tuple[float, float, list[extty.Example]]:
+    def _val_fn_offline() -> tuple[float, float, float, list[extty.Example]]:
+        """Validation using the val rollout file (same code path as training)."""
+        assert val_rollout_data is not None
         q.eval()
 
         all_nll: list[float] = []
+        all_nll_correct: list[float] = []
+        all_nll_incorrect: list[float] = []
+        examples: list[extty.Example] = []
+
+        n_episodes = 0
+        while n_episodes < train_params.val_episodes:
+            current_batch = min(
+                train_params.val_batch_size,
+                train_params.val_episodes - n_episodes,
+            )
+            indices = torch.randint(len(val_rollout_data), (current_batch,)).tolist()
+            batch_prompts = [val_rollout_data[i] for i in indices]
+
+            if inverse_cot_params.train_group_size is not None:
+                batch_prompts = [
+                    _subsample_completions(pr, inverse_cot_params.train_group_size)
+                    for pr in batch_prompts
+                ]
+
+            input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+                _build_contrastive_batch(
+                    batch_prompts,
+                    model_info.eos_token_id,
+                    model_info.pad_token_id,
+                    device,
+                )
+            )
+
+            _, step_metrics = _compute_contrastive_loss(
+                q,
+                input_ids,
+                prefix_lengths,
+                loss_mask,
+                is_correct,
+                group_sizes,
+                inverse_cot_params.contrastive_weight,
+                use_bf16=train_params.use_bf16,
+            )
+            all_nll.append(step_metrics["train/nll"])
+
+            _, _, per_sample_nlls = _compute_nll_loss(
+                q,
+                input_ids,
+                prefix_lengths,
+                loss_mask,
+                inverse_cot_params.normalize_by_sequence_length,
+                use_bf16=train_params.use_bf16,
+            )
+            for sample_nll, correct in zip(per_sample_nlls, is_correct.tolist()):
+                if correct:
+                    all_nll_correct.append(sample_nll)
+                else:
+                    all_nll_incorrect.append(sample_nll)
+
+            # qualitative examples
+            if len(examples) < train_params.val_episodes:
+                offset = 0
+                for prompt_data, gs in zip(batch_prompts, group_sizes):
+                    if len(examples) >= train_params.val_episodes:
+                        break
+                    prefix_len = prefix_lengths[offset].item()
+                    prefix_ids = input_ids[offset, :prefix_len].unsqueeze(0)
+
+                    q_completion = generate_hard_tokens(
+                        net=q,
+                        token_ids=prefix_ids,
+                        sampling_strategy="greedy",
+                        eos_token_id=model_info.eos_token_id,
+                        pad_token_id=model_info.pad_token_id,
+                        max_tokens_generated=train_params.max_tokens_generated,
+                        use_kv_cache=True,
+                        use_bf16=train_params.use_bf16,
+                    ).tokens
+
+                    q_cot = tokenizer.decode(q_completion[0, prefix_len:].tolist())
+                    target_cot = tokenizer.decode(prompt_data.completions[0].cot_ids)
+                    prompt_str = tokenizer.decode(
+                        input_ids[offset, :prefix_len].tolist()
+                    )
+
+                    examples.append(
+                        extty.Example(
+                            prompt=prompt_str,
+                            responses=[
+                                f"[p's CoT] {target_cot}",
+                                f"[q's CoT] {q_cot}",
+                            ],
+                            rewards=[
+                                {"nll": step_metrics["train/nll"]},
+                                {"nll": step_metrics["train/nll"]},
+                            ],
+                        )
+                    )
+                    offset += gs
+
+            n_episodes += current_batch
+
+        nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
+        nll_correct_mean = (
+            sum(all_nll_correct) / len(all_nll_correct) if all_nll_correct else 0.0
+        )
+        nll_incorrect_mean = (
+            sum(all_nll_incorrect) / len(all_nll_incorrect)
+            if all_nll_incorrect
+            else 0.0
+        )
+        return nll_mean, nll_correct_mean, nll_incorrect_mean, examples
+
+    @torch.no_grad()
+    def _val_fn(
+        val_env: CountdownEnv,
+    ) -> tuple[float, float, float, float, list[extty.Example]]:
+        q.eval()
+
+        all_nll: list[float] = []
+        all_nll_correct: list[float] = []
+        all_nll_incorrect: list[float] = []
         all_nll_shuffled: list[float] = []
         examples: list[extty.Example] = []
 
@@ -641,13 +780,13 @@ def train_inverse_cot_countdown(
                 temperature=train_params.temperature,
                 max_tokens_generated=train_params.max_tokens_generated,
                 use_bf16=train_params.use_bf16,
-                correct_only=inverse_cot_params.correct_only,
+                correct_only=False,
             )
             if data is None:
                 n_episodes += current_batch
                 continue
 
-            _, nll = _compute_nll_loss(
+            _, nll, per_sample_nlls = _compute_nll_loss(
                 q,
                 data.input_ids,
                 data.prefix_lengths,
@@ -656,6 +795,11 @@ def train_inverse_cot_countdown(
                 use_bf16=train_params.use_bf16,
             )
             all_nll.append(nll)
+            for sample_nll, correct in zip(per_sample_nlls, data.is_correct):
+                if correct:
+                    all_nll_correct.append(sample_nll)
+                else:
+                    all_nll_incorrect.append(sample_nll)
 
             # shuffled answer diagnostic: keep same prompt and CoT,
             # roll only the answer tokens by 1 within batch
@@ -689,7 +833,7 @@ def train_inverse_cot_countdown(
                 s_loss_mask = (positions_s >= s_prefix_lengths.unsqueeze(1)) & (
                     positions_s < (s_prefix_lengths + cot_lengths).unsqueeze(1)
                 )
-                _, nll_shuffled = _compute_nll_loss(
+                _, nll_shuffled, _ = _compute_nll_loss(
                     q,
                     s_input_ids,
                     s_prefix_lengths,
@@ -737,25 +881,59 @@ def train_inverse_cot_countdown(
             n_episodes += current_batch
 
         nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
+        nll_correct_mean = (
+            sum(all_nll_correct) / len(all_nll_correct) if all_nll_correct else 0.0
+        )
+        nll_incorrect_mean = (
+            sum(all_nll_incorrect) / len(all_nll_incorrect)
+            if all_nll_incorrect
+            else 0.0
+        )
         nll_shuffled_mean = (
             sum(all_nll_shuffled) / len(all_nll_shuffled) if all_nll_shuffled else 0.0
         )
-        return nll_mean, nll_shuffled_mean, examples
+        return (
+            nll_mean,
+            nll_correct_mean,
+            nll_incorrect_mean,
+            nll_shuffled_mean,
+            examples,
+        )
 
     @torch.no_grad()
     def _run_validation(step: int):
         was_training = q.training
         q.eval()
         metrics: dict[str, Any] = {}
-        all_nll: list[float] = []
 
+        # offline val (same code path as training)
+        if val_rollout_data is not None:
+            nll_mean, nll_correct, nll_incorrect, examples = _val_fn_offline()
+            metrics["val/offline/nll_mean"] = nll_mean
+            metrics["val/offline/nll_correct"] = nll_correct
+            metrics["val/offline/nll_incorrect"] = nll_incorrect
+            if examples:
+                metrics["val/offline/example"] = extty.BatchExample(
+                    prompts=[e.prompt for e in examples],
+                    responses=[e.responses for e in examples],
+                    rewards=[e.rewards for e in examples],
+                )
+
+        # online val (fresh generation from p)
+        all_nll: list[float] = []
+        all_nll_correct: list[float] = []
+        all_nll_incorrect: list[float] = []
         all_nll_shuffled: list[float] = []
 
         for val_env in val_envs:
             val_env.reseed()
             label = str(val_env)
-            nll_mean, nll_shuffled_mean, examples = _val_fn(val_env)
+            nll_mean, nll_correct, nll_incorrect, nll_shuffled_mean, examples = _val_fn(
+                val_env
+            )
             metrics[f"val/{label}/nll_mean"] = nll_mean
+            metrics[f"val/{label}/nll_correct"] = nll_correct
+            metrics[f"val/{label}/nll_incorrect"] = nll_incorrect
             metrics[f"val/{label}/nll_shuffled_mean"] = nll_shuffled_mean
             if examples:
                 metrics[f"val/{label}/example"] = extty.BatchExample(
@@ -764,10 +942,16 @@ def train_inverse_cot_countdown(
                     rewards=[e.rewards for e in examples],
                 )
             all_nll.append(nll_mean)
+            all_nll_correct.append(nll_correct)
+            all_nll_incorrect.append(nll_incorrect)
             all_nll_shuffled.append(nll_shuffled_mean)
 
         if all_nll:
             metrics["val/nll_mean"] = sum(all_nll) / len(all_nll)
+            metrics["val/nll_correct"] = sum(all_nll_correct) / len(all_nll_correct)
+            metrics["val/nll_incorrect"] = sum(all_nll_incorrect) / len(
+                all_nll_incorrect
+            )
         if all_nll_shuffled:
             metrics["val/nll_shuffled_mean"] = sum(all_nll_shuffled) / len(
                 all_nll_shuffled

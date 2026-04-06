@@ -100,22 +100,19 @@ class InverseCotModel(nn.Module):
 
         self.norm = RMSNorm(p.d, eps=p.norm.eps)
         self.lm_head = nn.Linear(p.d, p.vocab_size, bias=False)
+        self.lm_head.weight.data.copy_(p.lm_head.weight.data)
 
     def forward(
         self,
         x: Int[Tensor, "B L"],
         kv_caches: list[KVCache] | None = None,
-        attention_mask: Bool[Tensor, "B 1 L L"]
-        | Bool[Tensor, "B L"]
-        | None = None,
+        attention_mask: Bool[Tensor, "B 1 L L"] | Bool[Tensor, "B L"] | None = None,
         return_all_logits: bool = False,
         return_hidden_states: bool = False,
     ):
         x = self.embed_tokens(x)
 
-        for layer, kv_cache in zip(
-            self.layers, kv_caches or [None] * len(self.layers)
-        ):
+        for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
             x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
 
         x = self.norm(x)
