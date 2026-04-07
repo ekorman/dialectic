@@ -297,6 +297,7 @@ class TestGRPOMechanics:
 
     def test_bf16_training_produces_finite_loss(self, tiny_model, tokenizer, env):
         """bf16 mixed precision training produces finite loss values."""
+        tiny_model = tiny_model.to(dtype=torch.bfloat16)
         opt = torch.optim.Adam(tiny_model.parameters(), lr=1e-3)
 
         train_grpo(

@@ -778,9 +778,6 @@ def train_grpo(
     val_freq: int = 0,
     warmup_steps: int = 0,
 ) -> None:
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
     collect_old_log_probs = eps is not None
 
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
@@ -1242,9 +1239,6 @@ def train_soft_grpo(
     val_freq: int = 0,
     warmup_steps: int = 0,
 ) -> None:
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
     collect_old_log_probs = eps is not None
 
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer) -> dict:

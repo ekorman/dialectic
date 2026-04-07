@@ -27,10 +27,12 @@ def load_model_and_opt(
             )["model_state_dict"]
         )
 
+    if train_params.use_bf16:
+        net = net.to(dtype=torch.bfloat16)
     if train_params.compile_model:
         net.compile()
     device = get_default_device()
     net = net.to(device)
-    print(f"loaded net on device {device}")
+    print(f"loaded net on device {device} (dtype={next(net.parameters()).dtype})")
     opt = torch.optim.AdamW(net.parameters(), lr=train_params.lr)
     return net, opt
