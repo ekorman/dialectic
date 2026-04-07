@@ -95,6 +95,23 @@ class InverseCotParams:
 
 
 @dataclass
+class InverseCotEvalParams:
+    model_name: str
+    batch_size: int
+    seed: int
+    temperature: float
+    max_tokens_generated: int
+    q_ckpt_run: str
+    q_ckpt_step: int
+    dataset_artifact: str
+    split: str
+    q_max_tokens_generated: int
+    use_bf16: bool
+    start_ckpt_run: str | None = None
+    start_ckpt_step: int | None = None
+
+
+@dataclass
 class DatasetGenParams:
     n_examples: int
     train_pct: float
