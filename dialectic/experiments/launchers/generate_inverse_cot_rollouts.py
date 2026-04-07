@@ -265,6 +265,15 @@ def generate_inverse_cot_rollouts(
                 pbar.set_postfix(
                     shard=f"{shard_idx + 1}/{n_shards}", kept=total_kept + shard_kept
                 )
+                if extty.has_active_run():
+                    extty.log(
+                        {
+                            "processed": shard_start + problem_idx,
+                            "kept": total_kept + shard_kept,
+                            "shard": shard_idx + 1,
+                        },
+                        step=shard_start + problem_idx,
+                    )
         finally:
             tmpfile.close()
 
