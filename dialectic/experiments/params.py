@@ -95,6 +95,15 @@ class InverseCotParams:
 
 
 @dataclass
+class DatasetGenParams:
+    n_examples: int
+    train_pct: float
+    val_pct: float
+    test_pct: float
+    seed: int
+
+
+@dataclass
 class RolloutGenParams:
     model_name: str
     batch_size: int

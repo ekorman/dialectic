@@ -65,34 +65,50 @@ def load_dc_from_arg_parser_args(dc: Type[T], args: argparse.Namespace) -> T:
 
 @dataclass
 class Experiment:
-    env_name: str
+    env_name: str | None
     fn: Callable
     include_prompt_collection_id: bool
 
 
 def _build_parser(
     experiments: list[Experiment],
-) -> tuple[argparse.ArgumentParser, dict[str, list[inspect.Parameter]]]:
+) -> tuple[argparse.ArgumentParser, dict[str | None, list[inspect.Parameter]]]:
     parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="env")
-    parameters = {}
+    parameters: dict[str | None, list[inspect.Parameter]] = {}
 
-    for ex in experiments:
+    if len(experiments) == 1 and experiments[0].env_name is None:
+        ex = experiments[0]
         sig = inspect.signature(ex.fn)
-        parameters[ex.env_name] = [
+        parameters[None] = [
             p
             for p in sig.parameters.values()
             if not (
                 p.annotation == PromptCollection and ex.include_prompt_collection_id
             )
         ]
+        for dc in [p.annotation for p in parameters[None]]:
+            _add_dataclass_to_parser_(parser, dc)
+        if ex.include_prompt_collection_id:
+            parser.add_argument("--prompt-collection-id", type=int, required=True)
+    else:
+        subparsers = parser.add_subparsers(dest="env")
+        for ex in experiments:
+            assert ex.env_name is not None
+            sig = inspect.signature(ex.fn)
+            parameters[ex.env_name] = [
+                p
+                for p in sig.parameters.values()
+                if not (
+                    p.annotation == PromptCollection and ex.include_prompt_collection_id
+                )
+            ]
 
-        create_subparser(
-            name=ex.env_name,
-            subparsers=subparsers,
-            dcs=[p.annotation for p in parameters[ex.env_name]],
-            include_prompt_collection_id=ex.include_prompt_collection_id,
-        )
+            create_subparser(
+                name=ex.env_name,
+                subparsers=subparsers,
+                dcs=[p.annotation for p in parameters[ex.env_name]],
+                include_prompt_collection_id=ex.include_prompt_collection_id,
+            )
 
     return parser, parameters
 
@@ -100,6 +116,18 @@ def _build_parser(
 def run_experiments_parser(experiments: list[Experiment]):
     parser, parameters = _build_parser(experiments)
     args = parser.parse_args()
+
+    if len(experiments) == 1 and experiments[0].env_name is None:
+        ex = experiments[0]
+        kwargs = {}
+        for p in parameters[None]:
+            kwargs[p.name] = load_dc_from_arg_parser_args(p.annotation, args)
+        if ex.include_prompt_collection_id:
+            kwargs["prompt_collection"] = PROMPT_COLLECTIONS[""][
+                args.prompt_collection_id
+            ]
+        return ex.fn(**kwargs)
+
     for ex in experiments:
         if args.env == ex.env_name:
             kwargs = {}
