@@ -606,6 +606,7 @@ class TestJsonlRoundTrip:
                 "prompt_str": "Using [1, 2, 3], reach 6",
                 "numbers": [1, 2, 3],
                 "target": 6,
+                "split": "train",
                 "completions": [
                     {
                         "cot": "1+2=3, 3+3=6",
@@ -625,7 +626,9 @@ class TestJsonlRoundTrip:
             inverse_cot.extty, "load_artifact", lambda name: jsonl_bytes
         )
 
-        loaded = inverse_cot._load_rollout_artifact("test-artifact", tokenizer)
+        by_split = inverse_cot._load_rollout_artifacts(["test-artifact"], tokenizer)
+        assert "train" in by_split
+        loaded = by_split["train"]
         assert len(loaded) == 1
         assert len(loaded[0].completions) == 2
         assert loaded[0].completions[0].is_correct is True

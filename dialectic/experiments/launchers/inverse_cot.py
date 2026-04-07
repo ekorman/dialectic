@@ -9,10 +9,12 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
-from dialectic.experiments.envs import get_state_to_str
+from dialectic.experiments.envs import (
+    get_state_to_str,
+    load_countdown_dataset_artifacts,
+)
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
-    CountdownParams,
     InverseCotParams,
     TrainParams,
 )
@@ -21,7 +23,8 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.rl.env import Countdown, CountdownEnv
+from dialectic.rl.dataset_env import DatasetEnv
+from dialectic.rl.env import Countdown, Env
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import _evaluate_and_verify_countdown
 from dialectic.rl.rollout import get_batch
@@ -67,7 +70,7 @@ class TrainingBatch:
 def _generate_training_data(
     *,
     p: BaseTransformer,
-    env: CountdownEnv,
+    env: Env,
     state_to_str: Callable[[Countdown], str],
     tokenizer: Tokenizer,
     eos_token_id: int,
@@ -252,37 +255,47 @@ class PreTokenizedPrompt:
     completions: list[PreTokenizedCompletion]
 
 
-def _load_rollout_artifact(
-    artifact_name: str, tokenizer: Tokenizer
-) -> list[PreTokenizedPrompt]:
+def _load_rollout_artifacts(
+    artifact_names: list[str], tokenizer: Tokenizer
+) -> dict[str, list[PreTokenizedPrompt]]:
+    """Load rollout data from multiple artifacts, grouped by split.
+
+    Returns dict mapping split name to list of PreTokenizedPrompt.
+    Entries without a split field go under "train".
+    """
     import json
 
-    data = extty.load_artifact(artifact_name)
-    if not isinstance(data, bytes):
-        raise ValueError(f"Expected bytes from artifact, got {type(data)}")
-
-    prompts = []
-    for line in data.decode().splitlines():
-        if not line.strip():
-            continue
-        entry = json.loads(line)
-        prompt_ids = tokenizer.encode(entry["prompt_str"]).ids
-        completions = []
-        for comp in entry["completions"]:
-            answer_ids = tokenizer.encode(" " + comp["answer"]).ids
-            cot_ids = tokenizer.encode(comp["cot"]).ids
-            completions.append(
-                PreTokenizedCompletion(
-                    answer_ids=answer_ids,
-                    cot_ids=cot_ids,
-                    is_correct=comp["is_correct"],
+    by_split: dict[str, list[PreTokenizedPrompt]] = {}
+    for name in artifact_names:
+        data = extty.load_artifact(name)
+        if not isinstance(data, bytes):
+            raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
+        count = 0
+        for line in data.decode().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            prompt_ids = tokenizer.encode(entry["prompt_str"]).ids
+            completions = []
+            for comp in entry["completions"]:
+                answer_ids = tokenizer.encode(" " + comp["answer"]).ids
+                cot_ids = tokenizer.encode(comp["cot"]).ids
+                completions.append(
+                    PreTokenizedCompletion(
+                        answer_ids=answer_ids,
+                        cot_ids=cot_ids,
+                        is_correct=comp["is_correct"],
+                    )
                 )
+            split = entry.get("split", "train")
+            by_split.setdefault(split, []).append(
+                PreTokenizedPrompt(prompt_ids=prompt_ids, completions=completions)
             )
-        prompts.append(
-            PreTokenizedPrompt(prompt_ids=prompt_ids, completions=completions)
-        )
-    print(f"Loaded {len(prompts)} prompts from artifact '{artifact_name}'")
-    return prompts
+            count += 1
+        print(f"Loaded {count} prompts from artifact '{name}'")
+    for split, prompts in sorted(by_split.items()):
+        print(f"  {split}: {len(prompts)} prompts")
+    return by_split
 
 
 def _subsample_completions(prompt: PreTokenizedPrompt, k: int) -> PreTokenizedPrompt:
@@ -432,8 +445,8 @@ def train_inverse_cot_countdown(
     *,
     train_params: TrainParams,
     inverse_cot_params: InverseCotParams,
-    countdown_params: CountdownParams,
     prompt_collection: PromptCollection,
+    dataset_artifacts: list[str],
 ):
     torch.manual_seed(train_params.seed)
 
@@ -466,110 +479,27 @@ def train_inverse_cot_countdown(
         assistant_prefill=prompt_collection.assistant_prefill,
     )
 
-    n_ops = countdown_params.n_ops
-    n_total = countdown_params.n_total
-    n_larges = countdown_params.n_larges
+    # load rollout data from artifacts, split by train/val
+    by_split = _load_rollout_artifacts(dataset_artifacts, tokenizer)
+    rollout_data = by_split.get("train", [])
+    val_rollout_data = by_split.get("val", [])
+    if not rollout_data:
+        raise ValueError("No training data found (split='train')")
 
-    env = CountdownEnv(
-        seed=train_params.seed,
-        n_larges=n_larges,
-        n_total=n_total,
-        n_ops=n_ops,
-        prompt_template=prompt_collection.env_prompt,
+    # build val envs from dataset for online val
+    all_countdown_problems = load_countdown_dataset_artifacts(
+        dataset_artifacts, prompt_template=prompt_collection.env_prompt
+    )
+    val_countdown = [
+        resp for resp, extra in all_countdown_problems if extra.get("split") == "val"
+    ]
+    val_envs: list = (
+        [DatasetEnv(val_countdown, seed=2026, label="countdown_val")]
+        if val_countdown
+        else []
     )
 
-    n_ops_list = [n_ops] if isinstance(n_ops, int) else n_ops
-    n_total_list = [n_total] if isinstance(n_total, int) else n_total
-    n_larges_list = [n_larges] if isinstance(n_larges, int) else n_larges
-    val_envs = [
-        CountdownEnv(
-            seed=2026 + i,
-            n_larges=n_larges_list[i],
-            n_total=n_total_list[i],
-            n_ops=n_ops_list[i],
-            prompt_template=prompt_collection.env_prompt,
-        )
-        for i in range(len(n_ops_list))
-    ]
-
-    # load rollout artifact and optionally split for val
-    rollout_data: list[PreTokenizedPrompt] | None = None
-    val_rollout_data: list[PreTokenizedPrompt] | None = None
-    if inverse_cot_params.rollout_file is not None:
-        all_rollout_data = _load_rollout_artifact(
-            inverse_cot_params.rollout_file,
-            tokenizer,
-        )
-        if inverse_cot_params.val_rollout_pct > 0:
-            n_val = max(
-                1, int(len(all_rollout_data) * inverse_cot_params.val_rollout_pct)
-            )
-            val_rollout_data = all_rollout_data[:n_val]
-            rollout_data = all_rollout_data[n_val:]
-            print(
-                f"Split rollout: {len(rollout_data)} train, {len(val_rollout_data)} val"
-            )
-        else:
-            rollout_data = all_rollout_data
-
-    def _train_step_online() -> StepFunctionReturn:
-        """Train step using on-the-fly generation from p."""
-        q.train()
-        opt.zero_grad()
-
-        total_loss = 0.0
-        total_nll = 0.0
-        total_episodes = 0
-        skipped = 0
-
-        for _ in range(train_params.accumulation_steps):
-            data = _generate_training_data(
-                p=p,
-                env=env,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                batch_size=train_params.batch_size,
-                temperature=train_params.temperature,
-                max_tokens_generated=train_params.max_tokens_generated,
-                use_bf16=train_params.use_bf16,
-                correct_only=inverse_cot_params.correct_only,
-            )
-            if data is None:
-                skipped += train_params.batch_size
-                continue
-
-            skipped += data.n_skipped
-            loss, nll, _ = _compute_nll_loss(
-                q,
-                data.input_ids,
-                data.prefix_lengths,
-                data.loss_mask,
-                inverse_cot_params.normalize_by_sequence_length,
-            )
-            (loss / train_params.accumulation_steps).backward()
-            total_loss += loss.item()
-            total_nll += nll
-            total_episodes += data.input_ids.shape[0]
-
-        if total_episodes > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, train_params.max_grad_norm)
-            opt.step()
-
-        metrics = {
-            "train/loss": total_loss / max(train_params.accumulation_steps, 1),
-            "train/nll": total_nll / max(train_params.accumulation_steps, 1),
-            "train/episodes": total_episodes,
-            "train/skipped": skipped,
-        }
-        return StepFunctionReturn(
-            n_episodes_processed=total_episodes + skipped, metrics=metrics
-        )
-
-    def _train_step_offline() -> StepFunctionReturn:
-        """Train step using pre-generated rollout file with contrastive loss."""
-        assert rollout_data is not None
+    def _train_step() -> StepFunctionReturn:
         q.train()
         opt.zero_grad()
 
@@ -621,10 +551,6 @@ def train_inverse_cot_countdown(
         metrics["train/episodes"] = total_episodes
         return StepFunctionReturn(n_episodes_processed=total_episodes, metrics=metrics)
 
-    _train_step = (
-        _train_step_offline if rollout_data is not None else _train_step_online
-    )
-
     @torch.no_grad()
     def _val_fn_offline() -> tuple[float, float, float, list[extty.Example]]:
         """Validation using the val rollout file (same code path as training)."""
@@ -636,12 +562,14 @@ def train_inverse_cot_countdown(
         all_nll_incorrect: list[float] = []
         examples: list[extty.Example] = []
 
+        max_val = (
+            train_params.val_episodes
+            if train_params.val_episodes is not None
+            else len(val_rollout_data)
+        )
         n_episodes = 0
-        while n_episodes < train_params.val_episodes:
-            current_batch = min(
-                train_params.val_batch_size,
-                train_params.val_episodes - n_episodes,
-            )
+        while n_episodes < max_val:
+            current_batch = min(train_params.val_batch_size, max_val - n_episodes)
             indices = torch.randint(len(val_rollout_data), (current_batch,)).tolist()
             batch_prompts = [val_rollout_data[i] for i in indices]
 
@@ -684,11 +612,11 @@ def train_inverse_cot_countdown(
                 else:
                     all_nll_incorrect.append(sample_nll)
 
-            # qualitative examples
-            if len(examples) < train_params.val_episodes:
+            # qualitative examples (cap at 20)
+            if len(examples) < 20:
                 offset = 0
                 for prompt_data, gs in zip(batch_prompts, group_sizes):
-                    if len(examples) >= train_params.val_episodes:
+                    if len(examples) >= 20:
                         break
                     prefix_len = prefix_lengths[offset].item()
                     prefix_ids = input_ids[offset, :prefix_len].unsqueeze(0)
@@ -740,7 +668,7 @@ def train_inverse_cot_countdown(
 
     @torch.no_grad()
     def _val_fn(
-        val_env: CountdownEnv,
+        val_env: Env,
     ) -> tuple[float, float, float, float, list[extty.Example]]:
         q.eval()
 
@@ -750,12 +678,14 @@ def train_inverse_cot_countdown(
         all_nll_shuffled: list[float] = []
         examples: list[extty.Example] = []
 
+        max_val = (
+            train_params.val_episodes
+            if train_params.val_episodes is not None
+            else len(val_countdown)
+        )
         n_episodes = 0
-        while n_episodes < train_params.val_episodes:
-            current_batch = min(
-                train_params.val_batch_size,
-                train_params.val_episodes - n_episodes,
-            )
+        while n_episodes < max_val:
+            current_batch = min(train_params.val_batch_size, max_val - n_episodes)
 
             data = _generate_training_data(
                 p=p,
@@ -829,9 +759,9 @@ def train_inverse_cot_countdown(
                 )
                 all_nll_shuffled.append(nll_shuffled)
 
-            # qualitative: generate CoT from q for a few examples
-            if len(examples) < train_params.val_episodes:
-                for i in range(min(B, train_params.val_episodes - len(examples))):
+            # qualitative: generate CoT from q for a few examples (cap at 20)
+            if len(examples) < 20:
+                for i in range(min(B, 20 - len(examples))):
                     prefix_len = data.prefix_lengths[i].item()
                     prefix_ids = data.input_ids[i, :prefix_len].unsqueeze(0)
 
@@ -986,6 +916,7 @@ if __name__ == "__main__":
                 env_name="countdown",
                 fn=train_inverse_cot_countdown,
                 include_prompt_collection_id=True,
+                include_dataset_glob=True,
             ),
         ]
     )

@@ -6,21 +6,23 @@ import torch
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import (
-    get_countdown_env_reward_fn_extractor_val_envs,
     get_maze_env_reward_fn_extractor_val_envs,
     get_state_to_str,
+    load_countdown_dataset_artifacts,
 )
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
-    CountdownParams,
     GRPOParams,
     MazeRewardParams,
     RewardParams,
     TrainParams,
 )
 from dialectic.experiments.prompts import PromptCollection
+from dialectic.experiments.reward_fns import get_countdown_reward_fn
 from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env
+from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import grpo_advantage, rloo_advantage, train_grpo
@@ -101,15 +103,32 @@ def train_grpo_countdown(
     grpo_params: GRPOParams,
     reward_params: RewardParams,
     prompt_collection: PromptCollection,
-    countdown_params: CountdownParams,
+    dataset_artifacts: list[str],
 ):
-    env, reward_fn, extractor, val_envs = (
-        get_countdown_env_reward_fn_extractor_val_envs(
-            train_params=train_params,
-            reward_params=reward_params,
-            prompt_collection=prompt_collection,
-            countdown_params=countdown_params,
-        )
+    all_problems = load_countdown_dataset_artifacts(
+        dataset_artifacts, prompt_template=prompt_collection.env_prompt
+    )
+    train_problems = [
+        resp for resp, extra in all_problems if extra.get("split") == "train"
+    ]
+    val_problems = [resp for resp, extra in all_problems if extra.get("split") == "val"]
+
+    if not train_problems:
+        raise ValueError("No training problems found (split='train')")
+    print(f"Train: {len(train_problems)}, Val: {len(val_problems)}")
+
+    env: Env = DatasetEnv(
+        train_problems, seed=train_params.seed, label="countdown_train"
+    )
+    val_envs: list[Env] = (
+        [DatasetEnv(val_problems, seed=2026, label="countdown_val")]
+        if val_problems
+        else []
+    )
+
+    reward_fn = get_countdown_reward_fn(
+        answer_tags_weight=reward_params.answer_tags_weight,
+        think_tags_weight=reward_params.think_tags_weight,
     )
 
     return _train_grpo(
@@ -118,7 +137,7 @@ def train_grpo_countdown(
         env=env,
         prompt_collection=prompt_collection,
         reward_fn=reward_fn,
-        extractor=extractor,
+        extractor=extract_from_answer_tags,
         val_envs=val_envs,
     )
 
@@ -163,6 +182,7 @@ if __name__ == "__main__":
                 env_name="countdown",
                 fn=train_grpo_countdown,
                 include_prompt_collection_id=True,
+                include_dataset_glob=True,
             ),
         ]
     )
