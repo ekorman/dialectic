@@ -14,6 +14,7 @@ def load_model_and_opt(
     net = model_info.load_net(
         **kwargs, pretrained_weights=train_params.start_ckpt_run is None
     )
+    ckpt = None
     if train_params.start_ckpt_run is not None:
         if train_params.start_ckpt_step is None:
             raise ValueError("`ckpt_step` cannot be none if `ckpt_run` is not None")
@@ -21,11 +22,10 @@ def load_model_and_opt(
             f"Loading checkpoint from run {train_params.start_ckpt_run}, step {train_params.start_ckpt_step}"
         )
         project, run_name = train_params.start_ckpt_run.split("/")
-        net.load_state_dict(
-            extty.load_checkpoint_from(
-                project=project, run_name=run_name, step=train_params.start_ckpt_step
-            )["model_state_dict"]
+        ckpt = extty.load_checkpoint_from(
+            project=project, run_name=run_name, step=train_params.start_ckpt_step
         )
+        net.load_state_dict(ckpt["model_state_dict"])
 
     if train_params.use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -35,4 +35,13 @@ def load_model_and_opt(
     net = net.to(device)
     print(f"loaded net on device {device} (dtype={next(net.parameters()).dtype})")
     opt = torch.optim.AdamW(net.parameters(), lr=train_params.lr)
+
+    if (
+        train_params.load_ckpt_opt
+        and ckpt is not None
+        and "optimizer_state_dict" in ckpt
+    ):
+        opt.load_state_dict(ckpt["optimizer_state_dict"])
+        print("Loaded optimizer state from checkpoint")
+
     return net, opt

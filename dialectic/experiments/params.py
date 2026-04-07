@@ -22,6 +22,7 @@ class TrainParams:
     start_ckpt_run: str | None = None
     start_ckpt_step: int | None = None
     save_ckpt_freq: int = sys.maxsize
+    load_ckpt_opt: bool = False
     logprob_chunk_size: int = 64
     warmup_steps: int = 0
 
