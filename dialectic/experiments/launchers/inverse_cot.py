@@ -21,7 +21,6 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.llm.utils import get_default_device
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import _evaluate_and_verify_countdown
@@ -203,7 +202,6 @@ def _compute_nll_loss(
     prefix_lengths: torch.Tensor,
     loss_mask: torch.Tensor,
     normalize_by_sequence_length: bool,
-    use_bf16: bool = False,
 ) -> tuple[torch.Tensor, float, list[float]]:
     """Forward through q and compute NLL loss on CoT tokens.
 
@@ -213,10 +211,7 @@ def _compute_nll_loss(
     device = input_ids.device
 
     attention_mask = create_prefix_lm_mask(prefix_lengths, seq_len, device)
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-    ):
-        logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
+    logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
 
     # shift: predict next token from current position
     shift_logits = logits[:, :-1]
@@ -364,7 +359,6 @@ def _compute_contrastive_loss(
     is_correct: torch.Tensor,
     group_sizes: list[int],
     contrastive_weight: float,
-    use_bf16: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute NLL + contrastive loss over grouped completions.
 
@@ -374,10 +368,7 @@ def _compute_contrastive_loss(
     device = input_ids.device
 
     attention_mask = create_prefix_lm_mask(prefix_lengths, seq_len, device)
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-    ):
-        logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
+    logits = q(input_ids, attention_mask=attention_mask, return_all_logits=True)
 
     shift_logits = logits[:, :-1]
     shift_targets = input_ids[:, 1:]
@@ -454,12 +445,13 @@ def train_inverse_cot_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    # Build q from p
+    # Build q from p (p is already on device and optionally bf16 from load_model_and_opt)
     q = InverseCotModel(p)
     if inverse_cot_params.freeze_lm_head:
         q.lm_head.requires_grad_(False)
-    device = get_default_device()
-    q = q.to(device)
+    device = next(p.parameters()).device
+    dtype = next(p.parameters()).dtype
+    q = q.to(device=device, dtype=dtype)
 
     trainable_params = [param for param in q.parameters() if param.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=train_params.lr)
@@ -555,7 +547,6 @@ def train_inverse_cot_countdown(
                 data.prefix_lengths,
                 data.loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
-                use_bf16=train_params.use_bf16,
             )
             (loss / train_params.accumulation_steps).backward()
             total_loss += loss.item()
@@ -614,7 +605,6 @@ def train_inverse_cot_countdown(
                 is_correct,
                 group_sizes,
                 inverse_cot_params.contrastive_weight,
-                use_bf16=train_params.use_bf16,
             )
             (loss / train_params.accumulation_steps).backward()
 
@@ -678,7 +668,6 @@ def train_inverse_cot_countdown(
                 is_correct,
                 group_sizes,
                 inverse_cot_params.contrastive_weight,
-                use_bf16=train_params.use_bf16,
             )
             all_nll.append(step_metrics["train/nll"])
 
@@ -688,7 +677,6 @@ def train_inverse_cot_countdown(
                 prefix_lengths,
                 loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
-                use_bf16=train_params.use_bf16,
             )
             for sample_nll, correct in zip(per_sample_nlls, is_correct.tolist()):
                 if correct:
@@ -792,7 +780,6 @@ def train_inverse_cot_countdown(
                 data.prefix_lengths,
                 data.loss_mask,
                 inverse_cot_params.normalize_by_sequence_length,
-                use_bf16=train_params.use_bf16,
             )
             all_nll.append(nll)
             for sample_nll, correct in zip(per_sample_nlls, data.is_correct):
@@ -839,7 +826,6 @@ def train_inverse_cot_countdown(
                     s_prefix_lengths,
                     s_loss_mask,
                     inverse_cot_params.normalize_by_sequence_length,
-                    use_bf16=train_params.use_bf16,
                 )
                 all_nll_shuffled.append(nll_shuffled)
 
