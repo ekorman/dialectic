@@ -124,9 +124,7 @@ def eval_inverse_cot_countdown(
         # --- q-primed: q generates CoT from (prompt, ground truth answer) ---
         # tokenize prompt and answer separately, concatenate IDs
         # (matches how training constructs q's input)
-        prompt_id_lists = [
-            tokenizer.encode(prompt).ids for prompt in prompts
-        ]
+        prompt_id_lists = [tokenizer.encode(prompt).ids for prompt in prompts]
         # strip "= target" from equation to match p's answer format
         equations = [extra["equation"].split("=")[0].strip() for extra in batch_extras]
         answer_id_lists = [
@@ -140,7 +138,9 @@ def eval_inverse_cot_countdown(
         q_prefix_ids = torch.full(
             (B, q_max_prefix_len), model_info.pad_token_id, device=device
         )
-        q_prefix_mask = torch.zeros(B, q_max_prefix_len, dtype=torch.bool, device=device)
+        q_prefix_mask = torch.zeros(
+            B, q_max_prefix_len, dtype=torch.bool, device=device
+        )
         for i, ids in enumerate(q_prefix_id_lists):
             offset = q_max_prefix_len - len(ids)
             q_prefix_ids[i, offset:] = torch.tensor(ids, device=device)
@@ -158,23 +158,22 @@ def eval_inverse_cot_countdown(
         ).tokens
 
         q_cot_strs = [
-            tokenizer.decode(
-                q_completions[i, q_max_prefix_len:].tolist()
-            )
+            tokenizer.decode(q_completions[i, q_max_prefix_len:].tolist())
             for i in range(B)
         ]
 
-        # Build p's primed input: original prompt + q's CoT
-        primed_strs = [prompt + q_cot for prompt, q_cot in zip(prompts, q_cot_strs)]
+        # Build p's primed input: original prompt + q's CoT wrapped in think tags
+        primed_strs = [
+            prompt + "<think>\n" + q_cot.strip() + "\n</think>\n\n"
+            for prompt, q_cot in zip(prompts, q_cot_strs)
+        ]
 
         tokenizer.enable_padding(direction="left")
         primed_tokens = tokenizer.encode_batch(primed_strs)
         primed_mask = torch.tensor(
             [t.attention_mask for t in primed_tokens], dtype=torch.bool, device=device
         )
-        primed_ids = torch.tensor(
-            [t.ids for t in primed_tokens], device=device
-        )
+        primed_ids = torch.tensor([t.ids for t in primed_tokens], device=device)
 
         primed_completions = generate_hard_tokens(
             net=p,
@@ -207,9 +206,8 @@ def eval_inverse_cot_countdown(
                 baseline_correct += 1
 
             primed_extracted = extract_from_answer_tags(primed_strs_out[b])
-            primed_ok = (
-                primed_extracted is not None
-                and _evaluate_and_verify_countdown(primed_extracted, numbers, target)
+            primed_ok = primed_extracted is not None and _evaluate_and_verify_countdown(
+                primed_extracted, numbers, target
             )
             if primed_ok:
                 q_primed_correct += 1
