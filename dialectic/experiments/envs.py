@@ -15,6 +15,7 @@ from dialectic.experiments.prompts import (
 )
 from dialectic.experiments.reward_fns import get_countdown_reward_fn, get_maze_reward_fn
 from dialectic.llm.templates import Message
+from dialectic.log import log
 from dialectic.rl.env import Countdown, CountdownEnv, MathState, MazeEnv, MazeState
 from dialectic.rl.extractors import extract_from_answer_tags, extract_maze_moves
 from dialectic.rl.maze import MazeConfig
@@ -149,6 +150,8 @@ def load_countdown_dataset_artifacts(
                 )
             )
             count += 1
-        print(f"Loaded {count} problems from artifact '{name}'")
-    print(f"Total: {len(all_problems)} problems from {len(artifact_names)} artifact(s)")
+        log.info(f"Loaded {count} problems from artifact '{name}'")
+    log.info(
+        f"Total: {len(all_problems)} problems from {len(artifact_names)} artifact(s)"
+    )
     return all_problems

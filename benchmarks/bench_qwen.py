@@ -16,6 +16,7 @@ import torch
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.qwen import create_qwen
+from dialectic.log import log
 
 
 @dataclass
@@ -423,11 +424,11 @@ def main():
     available = get_available_devices()
     for d in devices:
         if d not in available:
-            print(f"Warning: device '{d}' not available, skipping")
+            log.warning(f"device '{d}' not available, skipping")
     devices = [d for d in devices if d in available]
 
     if not devices:
-        print("No devices available for benchmarking")
+        log.warning("No devices available for benchmarking")
         return
 
     configs = [CONFIGS[name] for name in args.configs]

@@ -18,6 +18,7 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
+from dialectic.log import log
 from dialectic.rl.env import Countdown
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import _evaluate_and_verify_countdown
@@ -61,7 +62,7 @@ def _load_dataset_problems(
                 extra,
             )
         )
-    print(f"Loaded {len(problems)} problems from artifact '{artifact_name}'")
+    log.info(f"Loaded {len(problems)} problems from artifact '{artifact_name}'")
     return problems
 
 
@@ -157,7 +158,7 @@ def _generate_rollouts_for_batch(
             kept.append(entry)
 
     total = total_correct + total_incorrect + total_unparsed
-    print(
+    log.info(
         f"Batch: {total_correct}/{total} correct, "
         f"{total_incorrect}/{total} incorrect, "
         f"{total_unparsed}/{total} unparsed, "
@@ -226,7 +227,7 @@ def generate_inverse_cot_rollouts(
         tmpfile = tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", delete=False, prefix="inverse_cot_rollouts_"
         )
-        print(
+        log.info(
             f"Shard {shard_idx + 1}/{n_shards}: {len(shard_problems)} problems -> {tmpfile.name}"
         )
 
@@ -298,12 +299,12 @@ def generate_inverse_cot_rollouts(
                 },
             )
             os.unlink(tmpfile.name)
-            print(f"Uploaded shard {shard_idx + 1}/{n_shards}: {meta}")
+            log.info(f"Uploaded shard {shard_idx + 1}/{n_shards}: {meta}")
 
         total_kept += shard_kept
 
     pbar.close()
-    print(f"Done: {total_kept}/{n_total} prompts kept across {n_shards} shard(s)")
+    log.info(f"Done: {total_kept}/{n_total} prompts kept across {n_shards} shard(s)")
 
 
 if __name__ == "__main__":

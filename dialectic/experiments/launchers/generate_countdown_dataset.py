@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.params import CountdownParams, DatasetGenParams
+from dialectic.log import log
 from dialectic.rl.env import CountdownEnv, build_countdown_equation
 
 
@@ -63,7 +64,7 @@ def generate_countdown_dataset(
         pbar.set_postfix(generated=n_generated, kept=len(examples))
     pbar.close()
 
-    print(f"Generated {n_generated} total, kept {len(examples)} unique")
+    log.info(f"Generated {n_generated} total, kept {len(examples)} unique")
 
     rng = random.Random(p.seed)
     rng.shuffle(examples)
@@ -80,7 +81,7 @@ def generate_countdown_dataset(
             ex["split"] = "test"
 
     split_counts = Counter(ex["split"] for ex in examples)
-    print(f"Splits: {dict(split_counts)}")
+    log.info(f"Splits: {dict(split_counts)}")
 
     tmpfile = tempfile.NamedTemporaryFile(
         mode="w", suffix=".jsonl", delete=False, prefix="countdown_dataset_"
@@ -107,7 +108,7 @@ def generate_countdown_dataset(
                 "countdown_params": dataclasses.asdict(countdown_params),
             },
         )
-        print(f"Uploaded artifact: {meta}")
+        log.info(f"Uploaded artifact: {meta}")
     finally:
         os.unlink(tmpfile.name)
 

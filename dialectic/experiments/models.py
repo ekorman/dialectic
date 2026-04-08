@@ -5,6 +5,7 @@ from dialectic.experiments.params import TrainParams
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
+from dialectic.log import log
 
 
 def load_model_and_opt(
@@ -18,7 +19,7 @@ def load_model_and_opt(
     if train_params.start_ckpt_run is not None:
         if train_params.start_ckpt_step is None:
             raise ValueError("`ckpt_step` cannot be none if `ckpt_run` is not None")
-        print(
+        log.info(
             f"Loading checkpoint from run {train_params.start_ckpt_run}, step {train_params.start_ckpt_step}"
         )
         project, run_name = train_params.start_ckpt_run.split("/")
@@ -33,7 +34,7 @@ def load_model_and_opt(
         net.compile()
     device = get_default_device()
     net = net.to(device)
-    print(f"loaded net on device {device} (dtype={next(net.parameters()).dtype})")
+    log.info(f"loaded net on device {device} (dtype={next(net.parameters()).dtype})")
     opt = torch.optim.AdamW(net.parameters(), lr=train_params.lr)
 
     if (
@@ -42,6 +43,6 @@ def load_model_and_opt(
         and "optimizer_state_dict" in ckpt
     ):
         opt.load_state_dict(ckpt["optimizer_state_dict"])
-        print("Loaded optimizer state from checkpoint")
+        log.info("Loaded optimizer state from checkpoint")
 
     return net, opt

@@ -8,6 +8,7 @@ from typing import Callable, Literal, Sequence, Type, TypeVar, get_args, get_ori
 import extty
 
 from dialectic.experiments.prompts import PROMPT_COLLECTIONS, PromptCollection
+from dialectic.log import log
 
 
 def resolve_artifact_glob(pattern: str) -> list[str]:
@@ -16,7 +17,7 @@ def resolve_artifact_glob(pattern: str) -> list[str]:
     matched.sort()
     if not matched:
         raise ValueError(f"No artifacts matched pattern: {pattern!r}")
-    print(f"Resolved {pattern!r} -> {len(matched)} artifacts")
+    log.info(f"Resolved {pattern!r} -> {len(matched)} artifacts")
     return matched
 
 

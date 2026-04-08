@@ -1,3 +1,4 @@
+import sys
 from functools import partial
 from typing import Callable
 
@@ -20,12 +21,21 @@ from dialectic.experiments.params import (
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.experiments.reward_fns import get_countdown_reward_fn
 from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import grpo_advantage, rloo_advantage, train_grpo
+
+
+def _resolve_val_episodes(val_episodes: int | None, val_envs: list[Env]) -> int:
+    if val_episodes is not None:
+        return val_episodes
+    if val_envs and hasattr(val_envs[0], "problems"):
+        return len(val_envs[0].problems)
+    return sys.maxsize
 
 
 def _train_grpo(
@@ -89,7 +99,7 @@ def _train_grpo(
         use_bf16=train_params.use_bf16,
         save_ckpt_freq=train_params.save_ckpt_freq,
         val_batch_size=train_params.val_batch_size,
-        val_episodes=train_params.val_episodes,
+        val_episodes=_resolve_val_episodes(train_params.val_episodes, val_envs),
         val_freq=train_params.val_freq,
         val_envs=val_envs,
         warmup_steps=train_params.warmup_steps,
@@ -115,7 +125,7 @@ def train_grpo_countdown(
 
     if not train_problems:
         raise ValueError("No training problems found (split='train')")
-    print(f"Train: {len(train_problems)}, Val: {len(val_problems)}")
+    log.info(f"Train: {len(train_problems)}, Val: {len(val_problems)}")
 
     env: Env = DatasetEnv(
         train_problems, seed=train_params.seed, label="countdown_train"

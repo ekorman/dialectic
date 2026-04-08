@@ -13,6 +13,7 @@ from dialectic.experiments.params import CountdownParams, RewardParams, TrainPar
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
+from dialectic.log import log
 from dialectic.rl.evaluate import EvaluationResult, evaluate
 
 
@@ -98,7 +99,7 @@ def main():
     model_info = MODEL_REGISTRY[train_params.model_name]
     net = model_info.load_net(pretrained_weights=False)
 
-    print(f"Loading checkpoint from {project}/{args.run_name}, step {args.step}")
+    log.info(f"Loading checkpoint from {project}/{args.run_name}, step {args.step}")
     ckpt = extty.load_checkpoint_from(
         project=project,
         run_name=args.run_name,
@@ -110,7 +111,7 @@ def main():
     device = get_default_device()
     net = net.to(device)
     net.eval()
-    print(f"Model loaded on {device}")
+    log.info(f"Model loaded on {device}")
 
     tokenizer = model_info.load_tokenizer()
     state_to_str = get_state_to_str(

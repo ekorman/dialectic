@@ -23,6 +23,7 @@ from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Countdown, Env
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -148,7 +149,7 @@ def _generate_training_data(
 
     n_skipped = n_no_answer_tag + n_empty_cot + n_incorrect
     if n_skipped > 0:
-        print(
+        log.info(
             f"Skipped {n_no_answer_tag}/{batch_size} (no parse), "
             f"{n_empty_cot}/{batch_size} (empty CoT), "
             f"{n_incorrect}/{batch_size} (incorrect). "
@@ -292,9 +293,9 @@ def _load_rollout_artifacts(
                 PreTokenizedPrompt(prompt_ids=prompt_ids, completions=completions)
             )
             count += 1
-        print(f"Loaded {count} prompts from artifact '{name}'")
+        log.info(f"Loaded {count} prompts from artifact '{name}'")
     for split, prompts in sorted(by_split.items()):
-        print(f"  {split}: {len(prompts)} prompts")
+        log.info(f"  {split}: {len(prompts)} prompts")
     return by_split
 
 
@@ -471,7 +472,7 @@ def train_inverse_cot_countdown(
 
     total_params = sum(param.numel() for param in q.parameters())
     trainable_count = sum(param.numel() for param in trainable_params)
-    print(f"q total params: {total_params:,}, trainable: {trainable_count:,}")
+    log.info(f"q total params: {total_params:,}, trainable: {trainable_count:,}")
 
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,

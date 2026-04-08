@@ -13,6 +13,7 @@ from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
+from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import _evaluate_and_verify_countdown
 
@@ -76,7 +77,7 @@ def eval_inverse_cot_countdown(
         for resp, extra in all_problems
         if extra.get("split") == eval_params.split
     ]
-    print(f"Evaluating on {len(problems)} problems (split={eval_params.split})")
+    log.info(f"Evaluating on {len(problems)} problems (split={eval_params.split})")
 
     baseline_correct = 0
     q_primed_correct = 0
@@ -263,8 +264,12 @@ def eval_inverse_cot_countdown(
     baseline_acc = baseline_correct / max(n_evaluated, 1)
     q_primed_acc = q_primed_correct / max(n_evaluated, 1)
 
-    print(f"Baseline accuracy: {baseline_acc:.4f} ({baseline_correct}/{n_evaluated})")
-    print(f"q-primed accuracy: {q_primed_acc:.4f} ({q_primed_correct}/{n_evaluated})")
+    log.info(
+        f"Baseline accuracy: {baseline_acc:.4f} ({baseline_correct}/{n_evaluated})"
+    )
+    log.info(
+        f"q-primed accuracy: {q_primed_acc:.4f} ({q_primed_correct}/{n_evaluated})"
+    )
 
 
 if __name__ == "__main__":
