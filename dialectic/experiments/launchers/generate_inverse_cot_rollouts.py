@@ -9,6 +9,15 @@ import torch
 from tokenizers import Tokenizer
 from tqdm import tqdm
 
+from dialectic.distributed import (
+    barrier,
+    cleanup,
+    get_device,
+    get_rank,
+    get_world_size,
+    init_distributed,
+    is_main_process,
+)
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import get_state_to_str
 from dialectic.experiments.params import RolloutGenParams
@@ -16,7 +25,6 @@ from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.llm.utils import get_default_device
 from dialectic.log import log
 from dialectic.rl.env import Countdown
 from dialectic.rl.extractors import extract_from_answer_tags, parse_cot_and_answer
@@ -172,7 +180,10 @@ def generate_inverse_cot_rollouts(
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
 ):
-    torch.manual_seed(rollout_gen_params.seed)
+    init_distributed()
+    rank = get_rank()
+    world_size = get_world_size()
+    torch.manual_seed(rollout_gen_params.seed + rank)
 
     model_info = MODEL_REGISTRY[rollout_gen_params.model_name]
     tokenizer = model_info.load_tokenizer()
@@ -192,7 +203,7 @@ def generate_inverse_cot_rollouts(
             )["model_state_dict"]
         )
 
-    device = get_default_device()
+    device = get_device()
     if rollout_gen_params.use_bf16:
         p = p.to(device=device, dtype=torch.bfloat16)
     else:
@@ -214,11 +225,23 @@ def generate_inverse_cot_rollouts(
     n_shards = rollout_gen_params.n_shards
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    if n_shards < world_size:
+        raise ValueError(f"n_shards ({n_shards}) must be >= world_size ({world_size})")
+
     shard_size = (n_total + n_shards - 1) // n_shards
     total_kept = 0
 
-    pbar = tqdm(total=n_total, desc="Generating rollouts")
-    for shard_idx in range(n_shards):
+    my_shard_indices = list(range(rank, n_shards, world_size))
+    my_n_problems = sum(
+        min((idx + 1) * shard_size, n_total) - idx * shard_size
+        for idx in my_shard_indices
+    )
+    pbar = tqdm(
+        total=my_n_problems,
+        desc=f"Generating rollouts (rank {rank})",
+        disable=not is_main_process(),
+    )
+    for shard_idx in my_shard_indices:
         shard_start = shard_idx * shard_size
         shard_end = min(shard_start + shard_size, n_total)
         shard_problems = all_problems[shard_start:shard_end]
@@ -265,7 +288,7 @@ def generate_inverse_cot_rollouts(
                 pbar.set_postfix(
                     shard=f"{shard_idx + 1}/{n_shards}", kept=total_kept + shard_kept
                 )
-                if extty.has_active_run():
+                if is_main_process() and extty.has_active_run():
                     extty.log(
                         {
                             "processed": shard_start + problem_idx,
@@ -307,7 +330,12 @@ def generate_inverse_cot_rollouts(
         total_kept += shard_kept
 
     pbar.close()
-    log.info(f"Done: {total_kept}/{n_total} prompts kept across {n_shards} shard(s)")
+    log.info(
+        f"Rank {rank} done: {total_kept} prompts kept "
+        f"across {len(my_shard_indices)} shard(s)"
+    )
+    barrier()
+    cleanup()
 
 
 if __name__ == "__main__":

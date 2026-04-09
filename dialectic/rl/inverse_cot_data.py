@@ -20,6 +20,7 @@ class PreTokenizedCompletion:
 class PreTokenizedPrompt:
     prompt_ids: list[int]
     completions: list[PreTokenizedCompletion]
+    equation: str | None = None
 
 
 def load_rollout_artifacts(
@@ -52,9 +53,16 @@ def load_rollout_artifacts(
                         is_correct=comp["is_correct"],
                     )
                 )
+            equation = entry.get("equation")
+            if equation and "=" in equation:
+                equation = equation.split("=")[0].strip()
             split = entry.get("split", "train")
             by_split.setdefault(split, []).append(
-                PreTokenizedPrompt(prompt_ids=prompt_ids, completions=completions)
+                PreTokenizedPrompt(
+                    prompt_ids=prompt_ids,
+                    completions=completions,
+                    equation=equation,
+                )
             )
             count += 1
         log.info(f"Loaded {count} prompts from artifact '{name}'")

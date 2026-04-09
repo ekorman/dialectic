@@ -10,8 +10,10 @@ from dialectic.rl.inverse_cot_data import (
     PreTokenizedCompletion,
     PreTokenizedPrompt,
     build_contrastive_batch,
+    build_shuffled_batch,
     load_rollout_artifacts,
 )
+from dialectic.rl.inverse_cot_eval import expressions_match
 from dialectic.rl.inverse_cot_loss import compute_contrastive_loss, compute_nll_loss
 
 TINY_QWEN_KWARGS = dict(
@@ -633,3 +635,112 @@ class TestJsonlRoundTrip:
         assert loaded[0].completions[1].is_correct is False
         assert len(loaded[0].prompt_ids) > 0
         assert len(loaded[0].completions[0].cot_ids) > 0
+
+    def test_equation_loaded_and_stripped(self, tokenizer, monkeypatch):
+        import json
+
+        from dialectic.rl import inverse_cot_data
+
+        entries = [
+            {
+                "prompt_str": "solve this",
+                "numbers": [1, 2],
+                "target": 3,
+                "split": "train",
+                "equation": "(1 + 2) = 3",
+                "completions": [
+                    {
+                        "cot": "add them",
+                        "answer": "<answer>1+2</answer>",
+                        "is_correct": True,
+                    },
+                ],
+            },
+            {
+                "prompt_str": "solve that",
+                "numbers": [4, 5],
+                "target": 20,
+                "split": "train",
+                "completions": [
+                    {
+                        "cot": "multiply",
+                        "answer": "<answer>4*5</answer>",
+                        "is_correct": True,
+                    },
+                ],
+            },
+        ]
+        jsonl_bytes = "\n".join(json.dumps(e) for e in entries).encode()
+        monkeypatch.setattr(
+            inverse_cot_data.extty, "load_artifact", lambda name: jsonl_bytes
+        )
+
+        by_split = load_rollout_artifacts(["test"], tokenizer)
+        loaded = by_split["train"]
+        assert loaded[0].equation == "(1 + 2)"
+        assert loaded[1].equation is None
+
+
+# ---------- build_shuffled_batch ----------
+
+
+class TestBuildShuffledBatch:
+    def test_shapes(self):
+        prompts = _make_prompts(n_prompts=2, group_size=3, n_correct=1)
+        input_ids, prefix_lengths, loss_mask = build_shuffled_batch(
+            prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        )
+        assert input_ids.shape[0] == 6  # 2 * 3
+        assert prefix_lengths.shape == (6,)
+        assert loss_mask.shape == input_ids.shape
+
+    def test_answers_are_rolled(self):
+        prompts = [
+            PreTokenizedPrompt(
+                prompt_ids=[1, 2],
+                completions=[
+                    PreTokenizedCompletion(
+                        answer_ids=[10], cot_ids=[20], is_correct=True
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[11], cot_ids=[21], is_correct=False
+                    ),
+                ],
+            )
+        ]
+        input_ids, prefix_lengths, _ = build_shuffled_batch(
+            prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        )
+        # original: [1,2,10,20,99] and [1,2,11,21,99]
+        # shuffled answers: sample 0 gets answer [11], sample 1 gets answer [10]
+        assert input_ids[0].tolist()[:4] == [1, 2, 11, 20]
+        assert input_ids[1].tolist()[:4] == [1, 2, 10, 21]
+
+
+# ---------- expressions_match ----------
+
+
+class TestExpressionsMatch:
+    def test_equal_expressions(self):
+        assert expressions_match("1+2", "3")
+
+    def test_equivalent_expressions(self):
+        assert expressions_match("(25*6)+9+9", "100+50+18")
+
+    def test_unequal_expressions(self):
+        assert not expressions_match("1+2", "4")
+
+    def test_malformed_pred(self):
+        assert not expressions_match("not_math", "3")
+
+    def test_malformed_gt(self):
+        assert not expressions_match("3", "not_math")
+
+    def test_both_malformed(self):
+        assert not expressions_match("abc", "def")
+
+    def test_division(self):
+        assert expressions_match("10/2", "5")
+
+    def test_float_tolerance(self):
+        assert expressions_match("1/3*3", "1")

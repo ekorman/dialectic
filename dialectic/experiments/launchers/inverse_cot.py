@@ -18,6 +18,7 @@ from dialectic.rl.inverse_cot_data import (
     load_rollout_artifacts,
     subsample_completions,
 )
+from dialectic.rl.inverse_cot_eval import compute_fcr
 from dialectic.rl.inverse_cot_loss import compute_contrastive_loss, compute_nll_loss
 from dialectic.training import StepFunctionReturn, train_loop
 
@@ -250,6 +251,19 @@ def train_inverse_cot_countdown(
             sum(all_nll_shuffled) / len(all_nll_shuffled) if all_nll_shuffled else 0.0
         )
 
+        # Forward Consistency Rate (FCR)
+        fcr_result = compute_fcr(
+            p=p,
+            q=q,
+            prompts=val_rollout_data[:max_val],
+            tokenizer=tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            pad_token_id=model_info.pad_token_id,
+            max_tokens_generated=train_params.max_tokens_generated,
+            batch_size=train_params.val_batch_size,
+            use_bf16=train_params.use_bf16,
+        )
+
         return EvaluationResult(
             n_episodes=n_episodes,
             reward_mean=nll_mean,
@@ -258,6 +272,9 @@ def train_inverse_cot_countdown(
                 "nll_correct": nll_correct_mean,
                 "nll_incorrect": nll_incorrect_mean,
                 "nll_shuffled": nll_shuffled_mean,
+                "fcr": fcr_result.fcr,
+                "fcr_all_incorrect": fcr_result.fcr_all_incorrect,
+                "fcr_n_all_incorrect": fcr_result.fcr_all_incorrect_total,
             },
         ), examples
 
