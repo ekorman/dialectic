@@ -7,12 +7,12 @@ from dialectic.experiments.launchers.inverse_cot import (
     _build_contrastive_batch,
     _compute_contrastive_loss,
     _compute_nll_loss,
-    _parse_cot_and_answer,
 )
 from dialectic.llm.components.attention import attention
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.qwen import create_qwen
+from dialectic.rl.extractors import parse_cot_and_answer
 
 TINY_QWEN_KWARGS = dict(
     d=32,
@@ -322,13 +322,13 @@ class TestInverseCotGeneration:
         assert output.tokens.shape[0] == B
 
 
-# ---------- _parse_cot_and_answer ----------
+# ---------- parse_cot_and_answer ----------
 
 
 class TestParseCotAndAnswer:
     def test_think_tags(self):
         text = "<think>\n100 + 50 = 150\n</think>\n\n(100 + 50)"
-        result = _parse_cot_and_answer(text)
+        result = parse_cot_and_answer(text)
         assert result is not None
         cot, answer = result
         assert cot == "100 + 50 = 150"
@@ -336,7 +336,7 @@ class TestParseCotAndAnswer:
 
     def test_think_tags_with_answer_tags(self):
         text = "<think>\nreasoning\n</think>\n\n<answer>42</answer>"
-        result = _parse_cot_and_answer(text)
+        result = parse_cot_and_answer(text)
         assert result is not None
         cot, answer = result
         assert cot == "reasoning"
@@ -344,29 +344,29 @@ class TestParseCotAndAnswer:
 
     def test_think_tags_empty_cot(self):
         text = "<think>\n\n</think>\n\n42"
-        assert _parse_cot_and_answer(text) is None
+        assert parse_cot_and_answer(text) is None
 
     def test_think_tags_empty_answer(self):
         text = "<think>\nreasoning\n</think>"
-        assert _parse_cot_and_answer(text) is None
+        assert parse_cot_and_answer(text) is None
 
     def test_answer_tags_fallback(self):
         text = "Let me think step by step\n<answer>42 + 8</answer>"
-        result = _parse_cot_and_answer(text)
+        result = parse_cot_and_answer(text)
         assert result is not None
         cot, answer = result
         assert cot == "Let me think step by step\n"
         assert answer == "<answer>42 + 8</answer>"
 
     def test_no_tags(self):
-        assert _parse_cot_and_answer("just some text without tags") is None
+        assert parse_cot_and_answer("just some text without tags") is None
 
     def test_answer_tags_empty_cot(self):
-        assert _parse_cot_and_answer("<answer>42</answer>") is None
+        assert parse_cot_and_answer("<answer>42</answer>") is None
 
     def test_multiline_think(self):
         text = "<think>\nstep 1\nstep 2\nstep 3\n</think>\n\nexpr"
-        result = _parse_cot_and_answer(text)
+        result = parse_cot_and_answer(text)
         assert result is not None
         cot, answer = result
         assert "step 1" in cot

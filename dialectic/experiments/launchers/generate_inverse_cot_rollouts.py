@@ -11,7 +11,6 @@ from tqdm import tqdm
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import get_state_to_str
-from dialectic.experiments.launchers.inverse_cot import _parse_cot_and_answer
 from dialectic.experiments.params import RolloutGenParams
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.base import BaseTransformer
@@ -20,7 +19,7 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.utils import get_default_device
 from dialectic.log import log
 from dialectic.rl.env import Countdown
-from dialectic.rl.extractors import extract_from_answer_tags
+from dialectic.rl.extractors import extract_from_answer_tags, parse_cot_and_answer
 from dialectic.rl.reward import _evaluate_and_verify_countdown
 from dialectic.rl.types import EnvResponse
 
@@ -122,7 +121,7 @@ def _generate_rollouts_for_batch(
         for g in range(group_size):
             idx = b * group_size + g
             comp_str = completion_strs[idx]
-            parsed = _parse_cot_and_answer(comp_str)
+            parsed = parse_cot_and_answer(comp_str)
             if parsed is None:
                 total_unparsed += 1
                 continue
