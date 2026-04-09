@@ -8,6 +8,7 @@ from jaxtyping import Bool, Float, Int
 from tokenizers import Tokenizer
 from torch import Tensor
 
+from dialectic.distributed import unwrap_model
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.components import KVCache
 from dialectic.llm.templates import (
@@ -137,6 +138,7 @@ class _BaseTokenGenerator(ABC):
         attention_mask: torch.Tensor | None = None,  # should be left-padded
         use_bf16: bool = False,
     ):
+        raw_net = unwrap_model(net)
         if use_kv_cache:
             kv_caches = [
                 KVCache(
@@ -144,11 +146,11 @@ class _BaseTokenGenerator(ABC):
                     * (1 + self._extra_tokens_per_step_bound)
                     + self._extra_kv_reserve
                     + token_ids.shape[1],
-                    num_heads=net.attn_num_kv_heads,
-                    head_dim=net.attn_head_d,
-                    device=next(net.parameters()).device,
+                    num_heads=raw_net.attn_num_kv_heads,
+                    head_dim=raw_net.attn_head_d,
+                    device=next(raw_net.parameters()).device,
                 )
-                for _ in range(len(net.layers))
+                for _ in range(len(raw_net.layers))
             ]
         else:
             kv_caches = None
@@ -417,11 +419,12 @@ class _SoftGenerator(_BaseTokenGenerator):
         kv_caches: list[KVCache] | None,
         attention_mask: Bool[torch.Tensor, "B L"],
     ):
+        raw = unwrap_model(net)
         if self.soft_token_noise_std is not None and input_tokens.ndim > 2:
             noise = torch.normal(
                 0.0,
                 self.soft_token_noise_std,
-                size=(input_tokens.shape[0], input_tokens.shape[1], net.d),
+                size=(input_tokens.shape[0], input_tokens.shape[1], raw.d),
                 device=input_tokens.device,
             )
             self.all_noise.append(noise)
@@ -432,7 +435,7 @@ class _SoftGenerator(_BaseTokenGenerator):
                     torch.zeros(
                         input_tokens.shape[0],
                         input_tokens.shape[1],
-                        net.d,
+                        raw.d,
                         device=input_tokens.device,
                     )
                 )
@@ -579,7 +582,7 @@ class _SoftGenerator(_BaseTokenGenerator):
             use_bf16=use_bf16,
         )
 
-        W = net.embed_tokens.weight
+        W = unwrap_model(net).embed_tokens.weight
         embeddings = self.all_tokens.float() @ W.float()
 
         if self.all_noise:
@@ -681,7 +684,7 @@ def generate_soft_tokens(
         pad_token_id = eos_token_id
 
     return _SoftGenerator(
-        vocab_size=net.vocab_size,
+        vocab_size=unwrap_model(net).vocab_size,
         temperature=temperature,
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,

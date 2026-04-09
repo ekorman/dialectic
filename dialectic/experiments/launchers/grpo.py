@@ -5,6 +5,17 @@ from typing import Callable
 import extty
 import torch
 
+from dialectic.distributed import (
+    barrier,
+    cleanup,
+    get_device,
+    get_rank,
+    get_world_size,
+    init_distributed,
+    is_distributed,
+    is_main_process,
+    wrap_ddp,
+)
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import (
     get_maze_env_reward_fn_extractor_val_envs,
@@ -48,7 +59,18 @@ def _train_grpo(
     extractor: Callable[[str], str | None],
     val_envs: list[Env],
 ):
-    torch.manual_seed(train_params.seed)
+    init_distributed()
+    rank = get_rank()
+    world_size = get_world_size()
+    torch.manual_seed(train_params.seed + rank)
+    device = get_device()
+
+    batch_size = train_params.batch_size
+    if batch_size % world_size != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by world_size ({world_size})"
+        )
+    local_batch_size = batch_size // world_size
 
     if grpo_params.advantage_fn_type == "grpo":
         advantage_fn = partial(
@@ -62,7 +84,15 @@ def _train_grpo(
         )
 
     model_info = MODEL_REGISTRY[train_params.model_name]
-    net, opt = load_model_and_opt(train_params=train_params)
+    if is_distributed() and not is_main_process():
+        barrier()
+    net, opt = load_model_and_opt(train_params=train_params, device=device)
+    if is_distributed():
+        if is_main_process():
+            barrier()
+        from dialectic.distributed import get_local_rank
+
+        net = wrap_ddp(net, get_local_rank())
     format_messages = model_info.format_messages
 
     state_to_str = get_state_to_str(
@@ -88,7 +118,7 @@ def _train_grpo(
         max_tokens_generated=train_params.max_tokens_generated,
         max_episodes=train_params.max_episodes,
         update_ref_net_batch_cadence=grpo_params.update_ref_net_batch_cadence,
-        batch_size=train_params.batch_size,
+        batch_size=local_batch_size,
         group_size=grpo_params.group_size,
         temperature=train_params.temperature,
         advantage_fn=advantage_fn,
@@ -104,6 +134,7 @@ def _train_grpo(
         val_envs=val_envs,
         warmup_steps=train_params.warmup_steps,
     )
+    cleanup()
 
 
 @extty.experiment(project="grpo-countdown")
@@ -115,6 +146,9 @@ def train_grpo_countdown(
     prompt_collection: PromptCollection,
     dataset_artifacts: list[str],
 ):
+    init_distributed()
+    rank = get_rank()
+
     all_problems = load_countdown_dataset_artifacts(
         dataset_artifacts, prompt_template=prompt_collection.env_prompt
     )
@@ -128,7 +162,9 @@ def train_grpo_countdown(
     log.info(f"Train: {len(train_problems)}, Val: {len(val_problems)}")
 
     env: Env = DatasetEnv(
-        train_problems, seed=train_params.seed, label="countdown_train"
+        train_problems,
+        seed=train_params.seed + rank * 10_000,
+        label="countdown_train",
     )
     val_envs: list[Env] = (
         [DatasetEnv(val_problems, seed=2026, label="countdown_val")]
@@ -161,12 +197,16 @@ def train_grpo_maze(
     maze_config: MazeConfig,
     prompt_collection: PromptCollection,
 ):
+    init_distributed()
+    rank = get_rank()
+
     env, reward_fn, extractor, val_envs = get_maze_env_reward_fn_extractor_val_envs(
         train_params=train_params,
         reward_params=reward_params,
         maze_reward_params=maze_reward_params,
         maze_config=maze_config,
         prompt_collection=prompt_collection,
+        env_seed=train_params.seed + rank * 10_000,
     )
 
     return _train_grpo(

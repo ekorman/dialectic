@@ -7,6 +7,7 @@ import torch
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
+from dialectic.distributed import unwrap_model
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import PreFill, generate_hard_tokens, generate_soft_tokens
 from dialectic.rl.env import Env
@@ -15,7 +16,7 @@ from dialectic.rl.types import A, E, EnvResponse, RewardResult, T
 
 
 def _embedding_rms_norm(net: BaseTransformer) -> float:
-    W = net.embed_tokens.weight
+    W = unwrap_model(net).embed_tokens.weight
     return W.pow(2).mean().sqrt().item()
 
 

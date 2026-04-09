@@ -9,6 +9,12 @@ import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
+from dialectic.distributed import (
+    all_gather_rewards,
+    get_rank,
+    get_world_size,
+    unwrap_model,
+)
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
@@ -177,7 +183,7 @@ def _compute_log_probs_chunked(
         chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
         chunk_targets = target_tokens[:, chunk_start:chunk_end]
 
-        chunk_logits = net.lm_head(chunk_hidden)
+        chunk_logits = unwrap_model(net).lm_head(chunk_hidden)
 
         BG, L_chunk, V = chunk_logits.shape
         chunk_log_probs = -torch.nn.functional.cross_entropy(
@@ -464,7 +470,7 @@ def create_grpo_step_fn(
                 and (step % update_ref_net_batch_cadence == 0)
             )
         ):
-            ref_net = deepcopy(net)
+            ref_net = deepcopy(unwrap_model(net))
 
         t_gen_total = 0.0
         t_logprobs_total = 0.0
@@ -479,7 +485,12 @@ def create_grpo_step_fn(
         all_rewards = torch.cat(
             [mb["rewards"] for mb in micro_batches], dim=1
         )  # [G, B*accum]
-        global_advs: Float[torch.Tensor, "G B*accum"] = advantage_fn(all_rewards)
+        all_rewards_global = all_gather_rewards(all_rewards)
+        global_advs_full = advantage_fn(all_rewards_global)
+        rank, local_size = get_rank(), all_rewards.shape[1]
+        global_advs: Float[torch.Tensor, "G B*accum"] = global_advs_full[
+            :, rank * local_size : (rank + 1) * local_size
+        ]
 
         t_opt_start = time.perf_counter()
         total_loss = 0.0
@@ -644,7 +655,8 @@ def create_grpo_step_fn(
             )
 
         return StepFunctionReturn(
-            n_episodes_processed=all_rewards.shape[1], metrics=metrics
+            n_episodes_processed=all_rewards.shape[1] * get_world_size(),
+            metrics=metrics,
         )
 
     return _step
@@ -665,7 +677,7 @@ def create_grpo_val_fn(
 ):
     def _val(env: Env):
         return evaluate(
-            net=net,
+            net=unwrap_model(net),
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -970,7 +982,8 @@ def _compute_soft_log_probs_chunked(
 ) -> Float[torch.Tensor, "B G L_c"]:
     batch_size, group_size, seq_len, D = stacked_embeddings.shape
     BG = batch_size * group_size
-    V = net.vocab_size
+    raw_net = unwrap_model(net)
+    V = raw_net.vocab_size
 
     flat_embeddings = stacked_embeddings.view(BG, seq_len, D)
     flat_shadow_ids = stacked_shadow_ids.view(BG, seq_len)
@@ -988,7 +1001,7 @@ def _compute_soft_log_probs_chunked(
     comp_shadow_ids = flat_shadow_ids[:, l_prompt:]
     comp_embeddings = flat_embeddings[:, l_prompt:]
     comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
-    W = net.embed_tokens.weight
+    W = raw_net.embed_tokens.weight
 
     if chunk_size == 0:
         chunk_size = completion_len
@@ -998,7 +1011,7 @@ def _compute_soft_log_probs_chunked(
         chunk_end = min(chunk_start + chunk_size, completion_len)
 
         chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
-        chunk_logits = net.lm_head(chunk_hidden)
+        chunk_logits = raw_net.lm_head(chunk_hidden)
         chunk_shadow_ids = comp_shadow_ids[:, chunk_start:chunk_end]
         chunk_embeddings = comp_embeddings[:, chunk_start:chunk_end]
         chunk_masks = comp_masks[:, chunk_start:chunk_end]
@@ -1163,7 +1176,9 @@ def collect_soft_micro_batch(
         if normalize_soft_pdf_by_dim:
             gaussian_dist_mean = (-2.0 * soft_lp_vals).mean().item()
         else:
-            gaussian_dist_mean = (-2.0 * soft_lp_vals / net.d).mean().item()
+            gaussian_dist_mean = (
+                (-2.0 * soft_lp_vals / unwrap_model(net).d).mean().item()
+            )
     else:
         soft_lp_mean = soft_lp_std = gaussian_dist_mean = 0.0
 

@@ -86,11 +86,12 @@ def get_maze_env_reward_fn_extractor_val_envs(
     maze_reward_params: MazeRewardParams,
     maze_config: MazeConfig,
     prompt_collection: PromptCollection,
+    env_seed: int | None = None,
 ):
     env = MazeEnv(
         config=maze_config,
         prompt_template=prompt_collection.env_prompt,
-        seed=train_params.seed,
+        seed=env_seed if env_seed is not None else train_params.seed,
     )
     reward_fn = get_maze_reward_fn(
         answer_tags_weight=reward_params.answer_tags_weight,

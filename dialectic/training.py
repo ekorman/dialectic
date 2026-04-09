@@ -6,6 +6,7 @@ import extty
 import torch
 from extty import Example
 
+from dialectic.distributed import barrier, is_main_process, unwrap_model
 from dialectic.llm.base import BaseTransformer
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
@@ -37,7 +38,7 @@ def train_loop(
 
         n_episodes += step_ret.n_episodes_processed
 
-        if extty.has_active_run():
+        if is_main_process() and extty.has_active_run():
             metrics = step_ret.metrics
             metrics.update({"step_time": step_time})
             extty.log(metrics, step=step)
@@ -45,21 +46,23 @@ def train_loop(
             if step % save_ckpt_freq == 0:
                 extty.save_checkpoint(
                     step=step,
-                    state_dict=net.state_dict(),
+                    state_dict=unwrap_model(net).state_dict(),
                     optimizer_state_dict=opt.state_dict(),
                 )
             if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
-                was_training = net.training
-                net.eval()
+                raw_net = unwrap_model(net)
+                was_training = raw_net.training
+                raw_net.eval()
                 val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
                 if was_training:
-                    net.train()
+                    raw_net.train()
                 extty.log(val_metrics, step=step)
+        barrier()
 
-    if step % save_ckpt_freq != 0 and extty.has_active_run():
+    if is_main_process() and step % save_ckpt_freq != 0 and extty.has_active_run():
         extty.save_checkpoint(
             step=step,
-            state_dict=net.state_dict(),
+            state_dict=unwrap_model(net).state_dict(),
             optimizer_state_dict=opt.state_dict(),
         )
 
