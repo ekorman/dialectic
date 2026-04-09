@@ -1,7 +1,6 @@
+import random
 import re
-import time
 from dataclasses import dataclass
-from typing import Any, Callable
 
 import extty
 import torch
@@ -9,27 +8,20 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
-from dialectic.experiments.envs import (
-    get_state_to_str,
-    load_countdown_dataset_artifacts,
-)
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     InverseCotParams,
     TrainParams,
 )
 from dialectic.experiments.prompts import PromptCollection
-from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
-from dialectic.rl.env import Countdown, Env
-from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.reward import _evaluate_and_verify_countdown
-from dialectic.rl.rollout import get_batch
-from dialectic.training import StepFunctionReturn
+from dialectic.rl.env import Env
+from dialectic.rl.evaluate import EvaluationResult
+from dialectic.training import StepFunctionReturn, train_loop
 
 
 def _parse_cot_and_answer(text: str) -> tuple[str, str] | None:
@@ -54,150 +46,6 @@ def _parse_cot_and_answer(text: str) -> tuple[str, str] | None:
             return cot, answer
 
     return None
-
-
-@dataclass
-class TrainingBatch:
-    input_ids: torch.Tensor
-    prefix_lengths: torch.Tensor
-    loss_mask: torch.Tensor
-    n_skipped: int
-    prompt_token_ids: list[list[int]]
-    answer_token_ids: list[list[int]]
-    cot_token_ids: list[list[int]]
-    is_correct: list[bool]
-
-
-def _generate_training_data(
-    *,
-    p: BaseTransformer,
-    env: Env,
-    state_to_str: Callable[[Countdown], str],
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
-    batch_size: int,
-    temperature: float,
-    max_tokens_generated: int,
-    use_bf16: bool,
-    correct_only: bool = False,
-) -> TrainingBatch | None:
-    """Generate data from p and construct q's training batch."""
-    device = next(p.parameters()).device
-
-    env_responses = get_batch(env, batch_size)
-    prompts = [state_to_str(resp.data) for resp in env_responses]
-
-    tokenizer.enable_padding(direction="left")
-    tokens = tokenizer.encode_batch(prompts)
-    attention_mask = torch.tensor(
-        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
-    )
-    token_ids = torch.tensor([t.ids for t in tokens], device=device)
-
-    was_training = p.training
-    p.eval()
-    completions = generate_hard_tokens(
-        net=p,
-        token_ids=token_ids,
-        sampling_strategy="sample" if temperature > 0 else "greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-        attention_mask=attention_mask,
-        temperature=temperature if temperature > 0 else 1.0,
-        use_bf16=use_bf16,
-    ).tokens
-    if was_training:
-        p.train()
-
-    prompt_len = token_ids.shape[1]
-    completion_strs = tokenizer.decode_batch(completions[:, prompt_len:].tolist())
-
-    valid_prompt_ids: list[list[int]] = []
-    valid_answer_strs: list[str] = []
-    valid_cot_strs: list[str] = []
-    valid_is_correct: list[bool] = []
-
-    n_no_answer_tag = 0
-    n_empty_cot = 0
-    n_incorrect = 0
-    for i, comp_str in enumerate(completion_strs):
-        parsed = _parse_cot_and_answer(comp_str)
-        if parsed is None:
-            n_no_answer_tag += 1
-            continue
-        cot, answer = parsed
-        if not cot.strip():
-            n_empty_cot += 1
-            continue
-        extracted = extract_from_answer_tags(comp_str)
-        sample_correct = extracted is not None and _evaluate_and_verify_countdown(
-            extracted,
-            env_responses[i].data.numbers,
-            env_responses[i].data.target,
-        )
-        if correct_only and not sample_correct:
-            n_incorrect += 1
-            continue
-        # keep original prompt token IDs (no lossy decode→re-encode roundtrip)
-        valid_prompt_ids.append(token_ids[i][attention_mask[i]].tolist())
-        valid_answer_strs.append(answer)
-        valid_cot_strs.append(cot)
-        valid_is_correct.append(sample_correct)
-
-    n_skipped = n_no_answer_tag + n_empty_cot + n_incorrect
-    if n_skipped > 0:
-        log.info(
-            f"Skipped {n_no_answer_tag}/{batch_size} (no parse), "
-            f"{n_empty_cot}/{batch_size} (empty CoT), "
-            f"{n_incorrect}/{batch_size} (incorrect). "
-            f"Sample failed completion: {completion_strs[0][:200]!r}"
-        )
-    if not valid_prompt_ids:
-        return None
-
-    # tokenize answer and cot (prompt IDs are kept from original tokenization)
-    answer_encs = [tokenizer.encode(" " + s) for s in valid_answer_strs]
-    cot_encs = [tokenizer.encode(s) for s in valid_cot_strs]
-
-    prompt_ids = valid_prompt_ids
-    answer_ids = [enc.ids for enc in answer_encs]
-    cot_ids = [enc.ids for enc in cot_encs]
-
-    prefix_lengths = torch.tensor(
-        [len(p) + len(a) for p, a in zip(prompt_ids, answer_ids)],
-        dtype=torch.long,
-        device=device,
-    )
-
-    all_ids = [
-        p + a + c + [eos_token_id] for p, a, c in zip(prompt_ids, answer_ids, cot_ids)
-    ]
-    max_len = max(len(ids) for ids in all_ids)
-    input_ids = torch.full((len(all_ids), max_len), pad_token_id, device=device)
-    for i, ids in enumerate(all_ids):
-        input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
-
-    positions = torch.arange(max_len, device=device).unsqueeze(0)
-    actual_lengths = torch.tensor(
-        [len(ids) for ids in all_ids], dtype=torch.long, device=device
-    ).unsqueeze(1)
-    loss_mask = (positions >= prefix_lengths.unsqueeze(1)) & (
-        positions < actual_lengths
-    )
-
-    return TrainingBatch(
-        input_ids=input_ids,
-        prefix_lengths=prefix_lengths,
-        loss_mask=loss_mask,
-        n_skipped=n_skipped,
-        prompt_token_ids=prompt_ids,
-        answer_token_ids=answer_ids,
-        cot_token_ids=cot_ids,
-        is_correct=valid_is_correct,
-    )
 
 
 def _compute_nll_loss(
@@ -301,7 +149,6 @@ def _load_rollout_artifacts(
 
 def _subsample_completions(prompt: PreTokenizedPrompt, k: int) -> PreTokenizedPrompt:
     """Subsample k completions, guaranteeing at least 1 positive and 1 negative."""
-    import random
 
     positives = [c for c in prompt.completions if c.is_correct]
     negatives = [c for c in prompt.completions if not c.is_correct]
@@ -474,12 +321,6 @@ def train_inverse_cot_countdown(
     trainable_count = sum(param.numel() for param in trainable_params)
     log.info(f"q total params: {total_params:,}, trainable: {trainable_count:,}")
 
-    state_to_str = get_state_to_str(
-        format_messages=model_info.format_messages,
-        system_prompt=prompt_collection.system_prompt,
-        assistant_prefill=prompt_collection.assistant_prefill,
-    )
-
     # load rollout data from artifacts, split by train/val
     by_split = _load_rollout_artifacts(dataset_artifacts, tokenizer)
     rollout_data = by_split.get("train", [])
@@ -487,20 +328,14 @@ def train_inverse_cot_countdown(
     if not rollout_data:
         raise ValueError("No training data found (split='train')")
 
-    # build val envs from dataset for online val
-    all_countdown_problems = load_countdown_dataset_artifacts(
-        dataset_artifacts, prompt_template=prompt_collection.env_prompt
-    )
-    val_countdown = [
-        resp for resp, extra in all_countdown_problems if extra.get("split") == "val"
-    ]
-    val_envs: list = (
-        [DatasetEnv(val_countdown, seed=2026, label="countdown_val")]
-        if val_countdown
+    # wrap val data as a dummy env for train_loop compatibility
+    val_envs: list[Env] = (
+        [DatasetEnv(val_rollout_data, seed=2026, label="inverse_cot_val")]
+        if val_rollout_data
         else []
     )
 
-    def _train_step() -> StepFunctionReturn:
+    def _train_step(_step_idx: int) -> StepFunctionReturn:
         q.train()
         opt.zero_grad()
 
@@ -515,8 +350,8 @@ def train_inverse_cot_countdown(
 
             if inverse_cot_params.train_group_size is not None:
                 batch_prompts = [
-                    _subsample_completions(p, inverse_cot_params.train_group_size)
-                    for p in batch_prompts
+                    _subsample_completions(pr, inverse_cot_params.train_group_size)
+                    for pr in batch_prompts
                 ]
 
             input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
@@ -552,22 +387,21 @@ def train_inverse_cot_countdown(
         metrics["train/episodes"] = total_episodes
         return StepFunctionReturn(n_episodes_processed=total_episodes, metrics=metrics)
 
-    @torch.no_grad()
-    def _val_fn_offline() -> tuple[float, float, float, list[extty.Example]]:
-        """Validation using the val rollout file (same code path as training)."""
-        assert val_rollout_data is not None
+    max_val = (
+        train_params.val_episodes
+        if train_params.val_episodes is not None
+        else len(val_rollout_data)
+    )
+
+    def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
         q.eval()
 
         all_nll: list[float] = []
         all_nll_correct: list[float] = []
         all_nll_incorrect: list[float] = []
+        all_nll_shuffled: list[float] = []
         examples: list[extty.Example] = []
 
-        max_val = (
-            train_params.val_episodes
-            if train_params.val_episodes is not None
-            else len(val_rollout_data)
-        )
         n_episodes = 0
         while n_episodes < max_val:
             current_batch = min(train_params.val_batch_size, max_val - n_episodes)
@@ -613,14 +447,63 @@ def train_inverse_cot_countdown(
                 else:
                     all_nll_incorrect.append(sample_nll)
 
+            # shuffled answer diagnostic: roll answer tokens by 1
+            N = input_ids.shape[0]
+            if N > 1:
+                all_prompt_ids: list[list[int]] = []
+                all_answer_ids: list[list[int]] = []
+                all_cot_ids: list[list[int]] = []
+                for prompt_data in batch_prompts:
+                    for comp in prompt_data.completions:
+                        all_prompt_ids.append(prompt_data.prompt_ids)
+                        all_answer_ids.append(comp.answer_ids)
+                        all_cot_ids.append(comp.cot_ids)
+
+                shuffled_answer = all_answer_ids[1:] + all_answer_ids[:1]
+                shuffled_seqs = [
+                    pi + ai + ci + [model_info.eos_token_id]
+                    for pi, ai, ci in zip(all_prompt_ids, shuffled_answer, all_cot_ids)
+                ]
+                s_max_len = max(len(s) for s in shuffled_seqs)
+                s_input_ids = torch.full(
+                    (N, s_max_len), model_info.pad_token_id, device=device
+                )
+                for i, ids in enumerate(shuffled_seqs):
+                    s_input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+                s_prefix_lengths = torch.tensor(
+                    [
+                        len(pi) + len(ai)
+                        for pi, ai in zip(all_prompt_ids, shuffled_answer)
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                )
+                cot_lens = torch.tensor(
+                    [len(ci) + 1 for ci in all_cot_ids],
+                    dtype=torch.long,
+                    device=device,
+                )
+                positions_s = torch.arange(s_max_len, device=device).unsqueeze(0)
+                s_loss_mask = (positions_s >= s_prefix_lengths.unsqueeze(1)) & (
+                    positions_s < (s_prefix_lengths + cot_lens).unsqueeze(1)
+                )
+                _, nll_shuffled, _ = _compute_nll_loss(
+                    q,
+                    s_input_ids,
+                    s_prefix_lengths,
+                    s_loss_mask,
+                    inverse_cot_params.normalize_by_sequence_length,
+                )
+                all_nll_shuffled.append(nll_shuffled)
+
             # qualitative examples (cap at 20)
             if len(examples) < 20:
-                offset = 0
+                ex_offset = 0
                 for prompt_data, gs in zip(batch_prompts, group_sizes):
                     if len(examples) >= 20:
                         break
-                    prefix_len = prefix_lengths[offset].item()
-                    prefix_ids = input_ids[offset, :prefix_len].unsqueeze(0)
+                    prefix_len = prefix_lengths[ex_offset].item()
+                    prefix_ids = input_ids[ex_offset, :prefix_len].unsqueeze(0)
 
                     q_completion = generate_hard_tokens(
                         net=q,
@@ -636,9 +519,8 @@ def train_inverse_cot_countdown(
                     q_cot = tokenizer.decode(q_completion[0, prefix_len:].tolist())
                     target_cot = tokenizer.decode(prompt_data.completions[0].cot_ids)
                     prompt_str = tokenizer.decode(
-                        input_ids[offset, :prefix_len].tolist()
+                        input_ids[ex_offset, :prefix_len].tolist()
                     )
-
                     examples.append(
                         extty.Example(
                             prompt=prompt_str,
@@ -652,148 +534,7 @@ def train_inverse_cot_countdown(
                             ],
                         )
                     )
-                    offset += gs
-
-            n_episodes += current_batch
-
-        nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
-        nll_correct_mean = (
-            sum(all_nll_correct) / len(all_nll_correct) if all_nll_correct else 0.0
-        )
-        nll_incorrect_mean = (
-            sum(all_nll_incorrect) / len(all_nll_incorrect)
-            if all_nll_incorrect
-            else 0.0
-        )
-        return nll_mean, nll_correct_mean, nll_incorrect_mean, examples
-
-    @torch.no_grad()
-    def _val_fn(
-        val_env: Env,
-    ) -> tuple[float, float, float, float, list[extty.Example]]:
-        q.eval()
-
-        all_nll: list[float] = []
-        all_nll_correct: list[float] = []
-        all_nll_incorrect: list[float] = []
-        all_nll_shuffled: list[float] = []
-        examples: list[extty.Example] = []
-
-        max_val = (
-            train_params.val_episodes
-            if train_params.val_episodes is not None
-            else len(val_countdown)
-        )
-        n_episodes = 0
-        while n_episodes < max_val:
-            current_batch = min(train_params.val_batch_size, max_val - n_episodes)
-
-            data = _generate_training_data(
-                p=p,
-                env=val_env,
-                state_to_str=state_to_str,
-                tokenizer=tokenizer,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                batch_size=current_batch,
-                temperature=train_params.temperature,
-                max_tokens_generated=train_params.max_tokens_generated,
-                use_bf16=train_params.use_bf16,
-                correct_only=False,
-            )
-            if data is None:
-                n_episodes += current_batch
-                continue
-
-            _, nll, per_sample_nlls = _compute_nll_loss(
-                q,
-                data.input_ids,
-                data.prefix_lengths,
-                data.loss_mask,
-                inverse_cot_params.normalize_by_sequence_length,
-            )
-            all_nll.append(nll)
-            for sample_nll, correct in zip(per_sample_nlls, data.is_correct):
-                if correct:
-                    all_nll_correct.append(sample_nll)
-                else:
-                    all_nll_incorrect.append(sample_nll)
-
-            # shuffled answer diagnostic: keep same prompt and CoT,
-            # roll only the answer tokens by 1 within batch
-            B = len(data.prompt_token_ids)
-            if B > 1:
-                shuffled_answer_ids = (
-                    data.answer_token_ids[1:] + data.answer_token_ids[:1]
-                )
-                shuffled_all_ids = [
-                    p + a + c + [model_info.eos_token_id]
-                    for p, a, c in zip(
-                        data.prompt_token_ids, shuffled_answer_ids, data.cot_token_ids
-                    )
-                ]
-                s_max_len = max(len(ids) for ids in shuffled_all_ids)
-                s_input_ids = torch.full(
-                    (B, s_max_len), model_info.pad_token_id, device=device
-                )
-                for i, ids in enumerate(shuffled_all_ids):
-                    s_input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
-                s_prefix_lengths = torch.tensor(
-                    [
-                        len(p) + len(a)
-                        for p, a in zip(data.prompt_token_ids, shuffled_answer_ids)
-                    ],
-                    dtype=torch.long,
-                    device=device,
-                )
-                positions_s = torch.arange(s_max_len, device=device).unsqueeze(0)
-                cot_lengths = data.loss_mask.sum(dim=1)
-                s_loss_mask = (positions_s >= s_prefix_lengths.unsqueeze(1)) & (
-                    positions_s < (s_prefix_lengths + cot_lengths).unsqueeze(1)
-                )
-                _, nll_shuffled, _ = _compute_nll_loss(
-                    q,
-                    s_input_ids,
-                    s_prefix_lengths,
-                    s_loss_mask,
-                    inverse_cot_params.normalize_by_sequence_length,
-                )
-                all_nll_shuffled.append(nll_shuffled)
-
-            # qualitative: generate CoT from q for a few examples (cap at 20)
-            if len(examples) < 20:
-                for i in range(min(B, 20 - len(examples))):
-                    prefix_len = data.prefix_lengths[i].item()
-                    prefix_ids = data.input_ids[i, :prefix_len].unsqueeze(0)
-
-                    q_completion = generate_hard_tokens(
-                        net=q,
-                        token_ids=prefix_ids,
-                        sampling_strategy="greedy",
-                        eos_token_id=model_info.eos_token_id,
-                        pad_token_id=model_info.pad_token_id,
-                        max_tokens_generated=train_params.max_tokens_generated,
-                        use_kv_cache=True,
-                        use_bf16=train_params.use_bf16,
-                    ).tokens
-
-                    q_cot = tokenizer.decode(q_completion[0, prefix_len:].tolist())
-
-                    target_cot = tokenizer.decode(data.cot_token_ids[i])
-
-                    prompt_str = tokenizer.decode(
-                        data.input_ids[i, :prefix_len].tolist()
-                    )
-                    examples.append(
-                        extty.Example(
-                            prompt=prompt_str,
-                            responses=[
-                                f"[p's CoT] {target_cot}",
-                                f"[q's CoT] {q_cot}",
-                            ],
-                            rewards=[{"nll": nll}, {"nll": nll}],
-                        )
-                    )
+                    ex_offset += gs
 
             n_episodes += current_batch
 
@@ -809,105 +550,28 @@ def train_inverse_cot_countdown(
         nll_shuffled_mean = (
             sum(all_nll_shuffled) / len(all_nll_shuffled) if all_nll_shuffled else 0.0
         )
-        return (
-            nll_mean,
-            nll_correct_mean,
-            nll_incorrect_mean,
-            nll_shuffled_mean,
-            examples,
-        )
 
-    @torch.no_grad()
-    def _run_validation(step: int):
-        was_training = q.training
-        q.eval()
-        metrics: dict[str, Any] = {}
+        return EvaluationResult(
+            n_episodes=n_episodes,
+            reward_mean=nll_mean,
+            reward_std=0.0,
+            component_means={
+                "nll_correct": nll_correct_mean,
+                "nll_incorrect": nll_incorrect_mean,
+                "nll_shuffled": nll_shuffled_mean,
+            },
+        ), examples
 
-        # offline val (same code path as training)
-        if val_rollout_data is not None:
-            nll_mean, nll_correct, nll_incorrect, examples = _val_fn_offline()
-            metrics["val/offline/nll_mean"] = nll_mean
-            metrics["val/offline/nll_correct"] = nll_correct
-            metrics["val/offline/nll_incorrect"] = nll_incorrect
-            if examples:
-                metrics["val/offline/example"] = extty.BatchExample(
-                    prompts=[e.prompt for e in examples],
-                    responses=[e.responses for e in examples],
-                    rewards=[e.rewards for e in examples],
-                )
-
-        # online val (fresh generation from p)
-        all_nll: list[float] = []
-        all_nll_correct: list[float] = []
-        all_nll_incorrect: list[float] = []
-        all_nll_shuffled: list[float] = []
-
-        for val_env in val_envs:
-            val_env.reseed()
-            label = str(val_env)
-            nll_mean, nll_correct, nll_incorrect, nll_shuffled_mean, examples = _val_fn(
-                val_env
-            )
-            metrics[f"val/{label}/nll_mean"] = nll_mean
-            metrics[f"val/{label}/nll_correct"] = nll_correct
-            metrics[f"val/{label}/nll_incorrect"] = nll_incorrect
-            metrics[f"val/{label}/nll_shuffled_mean"] = nll_shuffled_mean
-            if examples:
-                metrics[f"val/{label}/example"] = extty.BatchExample(
-                    prompts=[e.prompt for e in examples],
-                    responses=[e.responses for e in examples],
-                    rewards=[e.rewards for e in examples],
-                )
-            all_nll.append(nll_mean)
-            all_nll_correct.append(nll_correct)
-            all_nll_incorrect.append(nll_incorrect)
-            all_nll_shuffled.append(nll_shuffled_mean)
-
-        if all_nll:
-            metrics["val/nll_mean"] = sum(all_nll) / len(all_nll)
-            metrics["val/nll_correct"] = sum(all_nll_correct) / len(all_nll_correct)
-            metrics["val/nll_incorrect"] = sum(all_nll_incorrect) / len(
-                all_nll_incorrect
-            )
-        if all_nll_shuffled:
-            metrics["val/nll_shuffled_mean"] = sum(all_nll_shuffled) / len(
-                all_nll_shuffled
-            )
-
-        if was_training:
-            q.train()
-        if extty.has_active_run():
-            extty.log(metrics, step=step)
-
-    n_episodes = 0
-    step = 0
-    while n_episodes < train_params.max_episodes:
-        start_time = time.perf_counter()
-        step_ret = _train_step()
-        step_time = time.perf_counter() - start_time
-        step += 1
-        n_episodes += step_ret.n_episodes_processed
-
-        if extty.has_active_run():
-            metrics = step_ret.metrics
-            metrics["step_time"] = step_time
-            extty.log(metrics, step=step)
-
-            if step % train_params.save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=q.state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-            if train_params.val_freq > 0 and step % train_params.val_freq == 0:
-                _run_validation(step)
-
-    if step % train_params.save_ckpt_freq != 0 and extty.has_active_run():
-        extty.save_checkpoint(
-            step=step,
-            state_dict=q.state_dict(),
-            optimizer_state_dict=opt.state_dict(),
-        )
+    train_loop(
+        max_episodes=train_params.max_episodes,
+        save_ckpt_freq=train_params.save_ckpt_freq,
+        val_freq=train_params.val_freq,
+        net=q,
+        opt=opt,
+        train_step=_train_step,
+        val_fn=_val_fn,
+        val_envs=val_envs,
+    )
 
 
 if __name__ == "__main__":
