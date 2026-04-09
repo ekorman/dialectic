@@ -1,18 +1,18 @@
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
-from dialectic.experiments.launchers.inverse_cot import (
-    PreTokenizedCompletion,
-    PreTokenizedPrompt,
-    _build_contrastive_batch,
-    _compute_contrastive_loss,
-    _compute_nll_loss,
-)
 from dialectic.llm.components.attention import attention
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 from dialectic.llm.qwen import create_qwen
 from dialectic.rl.extractors import parse_cot_and_answer
+from dialectic.rl.inverse_cot_data import (
+    PreTokenizedCompletion,
+    PreTokenizedPrompt,
+    build_contrastive_batch,
+    load_rollout_artifacts,
+)
+from dialectic.rl.inverse_cot_loss import compute_contrastive_loss, compute_nll_loss
 
 TINY_QWEN_KWARGS = dict(
     d=32,
@@ -410,7 +410,7 @@ class TestNllLoss:
         prefix_lengths = torch.tensor([L, L])  # all prefix, no CoT
         loss_mask = torch.zeros(B, L, dtype=torch.bool)
 
-        loss, nll, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
+        loss, nll, _ = compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
         assert loss.item() == 0.0
 
     def test_loss_only_on_masked_positions(self):
@@ -426,8 +426,8 @@ class TestNllLoss:
         mask2 = torch.zeros(B, L, dtype=torch.bool)
         mask2[:, 7:] = True
 
-        _, nll1, _ = _compute_nll_loss(q, input_ids, prefix_lengths, mask1, True)
-        _, nll2, _ = _compute_nll_loss(q, input_ids, prefix_lengths, mask2, True)
+        _, nll1, _ = compute_nll_loss(q, input_ids, prefix_lengths, mask1, True)
+        _, nll2, _ = compute_nll_loss(q, input_ids, prefix_lengths, mask2, True)
         assert nll1 != nll2
 
     def test_normalize_by_sequence_length(self):
@@ -441,10 +441,8 @@ class TestNllLoss:
         positions = torch.arange(L).unsqueeze(0)
         loss_mask = positions >= prefix_lengths.unsqueeze(1)
 
-        _, nll_norm, _ = _compute_nll_loss(
-            q, input_ids, prefix_lengths, loss_mask, True
-        )
-        _, nll_global, _ = _compute_nll_loss(
+        _, nll_norm, _ = compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
+        _, nll_global, _ = compute_nll_loss(
             q, input_ids, prefix_lengths, loss_mask, False
         )
         # with different CoT lengths (9 vs 4), these should generally differ
@@ -459,7 +457,7 @@ class TestNllLoss:
         loss_mask = torch.zeros(B, L, dtype=torch.bool)
         loss_mask[:, 4:] = True
 
-        loss, _, _ = _compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
+        loss, _, _ = compute_nll_loss(q, input_ids, prefix_lengths, loss_mask, True)
         loss.backward()
         assert q.lm_head.weight.grad is not None
 
@@ -490,7 +488,7 @@ class TestContrastiveLoss:
     def test_build_batch_shapes(self):
         prompts = _make_prompts(n_prompts=2, group_size=4)
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            _build_contrastive_batch(
+            build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
             )
         )
@@ -502,7 +500,7 @@ class TestContrastiveLoss:
 
     def test_build_batch_correctness_mask(self):
         prompts = _make_prompts(n_prompts=1, group_size=4, n_correct=2)
-        _, _, _, is_correct, _ = _build_contrastive_batch(
+        _, _, _, is_correct, _ = build_contrastive_batch(
             prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
         )
         assert is_correct.tolist() == [True, True, False, False]
@@ -513,11 +511,11 @@ class TestContrastiveLoss:
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=4)
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            _build_contrastive_batch(
+            build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
             )
         )
-        _, metrics = _compute_contrastive_loss(
+        _, metrics = compute_contrastive_loss(
             q,
             input_ids,
             prefix_lengths,
@@ -534,11 +532,11 @@ class TestContrastiveLoss:
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            _build_contrastive_batch(
+            build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
             )
         )
-        _, metrics = _compute_contrastive_loss(
+        _, metrics = compute_contrastive_loss(
             q,
             input_ids,
             prefix_lengths,
@@ -554,11 +552,11 @@ class TestContrastiveLoss:
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            _build_contrastive_batch(
+            build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
             )
         )
-        loss, _ = _compute_contrastive_loss(
+        loss, _ = compute_contrastive_loss(
             q,
             input_ids,
             prefix_lengths,
@@ -576,11 +574,11 @@ class TestContrastiveLoss:
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            _build_contrastive_batch(
+            build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
             )
         )
-        loss_w0, m0 = _compute_contrastive_loss(
+        loss_w0, m0 = compute_contrastive_loss(
             q,
             input_ids,
             prefix_lengths,
@@ -599,7 +597,7 @@ class TestJsonlRoundTrip:
     def test_write_and_load(self, tokenizer, monkeypatch):
         import json
 
-        from dialectic.experiments.launchers import inverse_cot
+        from dialectic.rl import inverse_cot_data
 
         entries = [
             {
@@ -623,10 +621,10 @@ class TestJsonlRoundTrip:
         ]
         jsonl_bytes = "\n".join(json.dumps(e) for e in entries).encode()
         monkeypatch.setattr(
-            inverse_cot.extty, "load_artifact", lambda name: jsonl_bytes
+            inverse_cot_data.extty, "load_artifact", lambda name: jsonl_bytes
         )
 
-        by_split = inverse_cot._load_rollout_artifacts(["test-artifact"], tokenizer)
+        by_split = load_rollout_artifacts(["test-artifact"], tokenizer)
         assert "train" in by_split
         loaded = by_split["train"]
         assert len(loaded) == 1
