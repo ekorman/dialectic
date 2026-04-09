@@ -278,11 +278,15 @@ def generate_inverse_cot_rollouts(
         finally:
             tmpfile.close()
 
-            shard_suffix = f"-shard{shard_idx + 1}of{n_shards}" if n_shards > 1 else ""
-            artifact_name = (
+            base_name = (
                 f"inverse-cot-rollouts-{rollout_gen_params.model_name}-"
-                f"g{rollout_gen_params.group_size}-n{shard_kept}{shard_suffix}-{ts}"
+                f"g{rollout_gen_params.group_size}-{ts}"
             )
+            if n_shards > 1:
+                n_digits = len(str(n_shards))
+                artifact_name = f"{base_name}-shard{str(shard_idx + 1).zfill(n_digits)}"
+            else:
+                artifact_name = base_name
             meta = extty.save_artifact(
                 name=artifact_name,
                 path=tmpfile.name,
