@@ -67,7 +67,7 @@ def train_loop(
 @torch.no_grad()
 def run_validation(
     *,
-    val_envs: list[Env],
+    val_envs: Sequence[Env],
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
