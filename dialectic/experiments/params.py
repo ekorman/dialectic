@@ -129,7 +129,6 @@ class RolloutGenParams:
     group_size: int
     n_pos_min: int
     n_neg_min: int
-    dataset_artifact: str
     use_bf16: bool
     n_shards: int = 1
     start_ckpt_run: str | None = None

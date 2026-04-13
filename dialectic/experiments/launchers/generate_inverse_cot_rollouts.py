@@ -179,6 +179,7 @@ def generate_inverse_cot_rollouts(
     *,
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
+    dataset_artifacts: list[str],
 ):
     init_distributed()
     rank = get_rank()
@@ -217,9 +218,15 @@ def generate_inverse_cot_rollouts(
         assistant_prefill=prompt_collection.assistant_prefill,
     )
 
-    all_problems = _load_dataset_problems(
-        rollout_gen_params.dataset_artifact,
-        prompt_template=prompt_collection.env_prompt,
+    all_problems: list[tuple[EnvResponse[Countdown], dict]] = []
+    for artifact_name in dataset_artifacts:
+        all_problems.extend(
+            _load_dataset_problems(
+                artifact_name, prompt_template=prompt_collection.env_prompt
+            )
+        )
+    log.info(
+        f"Total: {len(all_problems)} problems from {len(dataset_artifacts)} artifact(s)"
     )
     n_total = len(all_problems)
     n_shards = rollout_gen_params.n_shards
@@ -345,6 +352,7 @@ if __name__ == "__main__":
                 env_name="countdown",
                 fn=generate_inverse_cot_rollouts,
                 include_prompt_collection_id=True,
+                include_dataset_glob=True,
             ),
         ]
     )
