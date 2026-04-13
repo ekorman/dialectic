@@ -1,3 +1,4 @@
+import signal
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
@@ -9,8 +10,17 @@ from extty import Example
 from dialectic.distributed import barrier, is_main_process, unwrap_model
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.inverse_cot import InverseCotModel
+from dialectic.log import log
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
+
+_sigterm_received = False
+
+
+def _sigterm_handler(signum, frame):
+    global _sigterm_received
+    _sigterm_received = True
+    log.info("SIGTERM received, will save checkpoint and exit after current step")
 
 
 @dataclass
@@ -29,36 +39,47 @@ def train_loop(
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
     val_envs: Sequence[Env],
 ):
+    global _sigterm_received
+    _sigterm_received = False
+    prev_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
+
     n_episodes = 0
     step = 0
-    while n_episodes < max_episodes:
-        start_time = time.perf_counter()
-        step_ret = train_step(step)
-        step_time = time.perf_counter() - start_time
-        step += 1
+    try:
+        while n_episodes < max_episodes:
+            start_time = time.perf_counter()
+            step_ret = train_step(step)
+            step_time = time.perf_counter() - start_time
+            step += 1
 
-        n_episodes += step_ret.n_episodes_processed
+            n_episodes += step_ret.n_episodes_processed
 
-        if is_main_process() and extty.has_active_run():
-            metrics = step_ret.metrics
-            metrics.update({"step_time": step_time})
-            extty.log(metrics, step=step)
+            if is_main_process() and extty.has_active_run():
+                metrics = step_ret.metrics
+                metrics.update({"step_time": step_time})
+                extty.log(metrics, step=step)
 
-            if step % save_ckpt_freq == 0:
-                extty.save_checkpoint(
-                    step=step,
-                    state_dict=unwrap_model(net).state_dict(),
-                    optimizer_state_dict=opt.state_dict(),
-                )
-            if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
-                raw_net = unwrap_model(net)
-                was_training = raw_net.training
-                raw_net.eval()
-                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
-                if was_training:
-                    raw_net.train()
-                extty.log(val_metrics, step=step)
-        barrier()
+                if step % save_ckpt_freq == 0:
+                    extty.save_checkpoint(
+                        step=step,
+                        state_dict=unwrap_model(net).state_dict(),
+                        optimizer_state_dict=opt.state_dict(),
+                    )
+                if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
+                    raw_net = unwrap_model(net)
+                    was_training = raw_net.training
+                    raw_net.eval()
+                    val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
+                    if was_training:
+                        raw_net.train()
+                    extty.log(val_metrics, step=step)
+            barrier()
+
+            if _sigterm_received:
+                log.info(f"Saving checkpoint at step {step} before exit")
+                break
+    finally:
+        signal.signal(signal.SIGTERM, prev_handler)
 
     if is_main_process() and step % save_ckpt_freq != 0 and extty.has_active_run():
         extty.save_checkpoint(
