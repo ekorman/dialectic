@@ -83,6 +83,10 @@ class MHSA(nn.Module):
         self.causal = causal  # ty: ignore[unresolved-attribute]
         self.use_rope = rope_base_value is not None  # ty: ignore[unresolved-attribute]
         self.apply_rms_norm = apply_rms_norm  # ty: ignore[unresolved-attribute]
+        self.rope_base_value = rope_base_value  # ty: ignore[unresolved-attribute]
+        self.max_position_embeddings = (
+            max_position_embeddings  # ty: ignore[unresolved-attribute]
+        )
 
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d, rms_norm_eps)

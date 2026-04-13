@@ -1,18 +1,30 @@
+"""vLLM-backed variant of ``generate_inverse_cot_rollouts``.
+
+Shares dataset loading, sharding, filtering and artifact upload with the
+pure-PyTorch launcher next door. The only differences are the generation
+backend (``vllm.LLM`` instead of ``generate_hard_tokens``) and the one-time
+checkpoint export that produces a HuggingFace-format directory for vLLM to
+read.
+
+For a small model like Qwen3-0.6B this is typically 10–25× faster than the
+PyTorch path thanks to vLLM's continuous batching, PagedAttention, and
+automatic prefix-cache reuse across the ``group_size`` samples per prompt.
+"""
+
 import dataclasses
 import json
 import os
 import tempfile
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import extty
 import torch
-from tokenizers import Tokenizer
 from tqdm import tqdm
 
 from dialectic.distributed import (
     barrier,
     cleanup,
-    get_device,
     get_rank,
     get_world_size,
     init_distributed,
@@ -23,28 +35,25 @@ from dialectic.experiments.envs import get_state_to_str
 from dialectic.experiments.launchers._rollout_filter import filter_countdown_rollouts
 from dialectic.experiments.params import RolloutGenParams
 from dialectic.experiments.prompts import PromptCollection
-from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
 from dialectic.rl.env import Countdown
 from dialectic.rl.types import EnvResponse
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 
 def _load_dataset_problems(
     artifact_name: str,
     prompt_template: str,
 ) -> list[tuple[EnvResponse[Countdown], dict]]:
-    """Load problems from a dataset artifact.
-
-    Returns list of (env_response, extra_fields) tuples, where extra_fields
-    contains passthrough fields like 'split' and 'equation'.
-    """
     data = extty.load_artifact(artifact_name)
     if not isinstance(data, bytes):
         raise ValueError(f"Expected bytes from artifact, got {type(data)}")
 
-    problems = []
+    problems: list[tuple[EnvResponse[Countdown], dict]] = []
     for line in data.decode().splitlines():
         if not line.strip():
             continue
@@ -72,69 +81,37 @@ def _load_dataset_problems(
     return problems
 
 
-def _generate_rollouts_for_batch(
+def _vllm_generate_group(
+    llm: "LLM",
+    prompts: list[str],
     *,
-    p: BaseTransformer,
-    env_responses: list[EnvResponse[Countdown]],
-    extra_fields: list[dict],
-    state_to_str,
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
     group_size: int,
     temperature: float,
     max_tokens_generated: int,
-    use_bf16: bool,
-    n_pos_min: int,
-    n_neg_min: int,
-) -> list[dict]:
-    device = next(p.parameters()).device
-    batch_size = len(env_responses)
+    eos_token_id: int,
+    seed: int,
+) -> list[list[str]]:
+    """Run ``llm.generate`` and return completions shaped as ``[problem][sample]``."""
+    from vllm import SamplingParams
 
-    prompts = [state_to_str(resp.data) for resp in env_responses]
-
-    tokenizer.enable_padding(direction="left")
-    tokens = tokenizer.encode_batch(prompts)
-    attention_mask = torch.tensor(
-        [t.attention_mask for t in tokens], dtype=torch.bool, device=device
+    sampling_params = SamplingParams(
+        n=group_size,
+        temperature=temperature if temperature > 0 else 0.0,
+        max_tokens=max_tokens_generated,
+        stop_token_ids=[eos_token_id],
+        seed=seed,
     )
-    token_ids = torch.tensor([t.ids for t in tokens], device=device)
 
-    expanded_token_ids = token_ids.repeat_interleave(group_size, dim=0)
-    expanded_attention_mask = attention_mask.repeat_interleave(group_size, dim=0)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
 
-    completions = generate_hard_tokens(
-        net=p,
-        token_ids=expanded_token_ids,
-        sampling_strategy="sample" if temperature > 0 else "greedy",
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-        attention_mask=expanded_attention_mask,
-        temperature=temperature if temperature > 0 else 1.0,
-        use_bf16=use_bf16,
-    ).tokens
-
-    prompt_len = token_ids.shape[1]
-    completion_strs = tokenizer.decode_batch(completions[:, prompt_len:].tolist())
-
-    completions_by_problem = [
-        completion_strs[b * group_size : (b + 1) * group_size]
-        for b in range(batch_size)
-    ]
-    return filter_countdown_rollouts(
-        prompts=prompts,
-        env_responses=env_responses,
-        extra_fields=extra_fields,
-        completions_by_problem=completions_by_problem,
-        n_pos_min=n_pos_min,
-        n_neg_min=n_neg_min,
-    )
+    completions_by_problem: list[list[str]] = []
+    for out in outputs:
+        completions_by_problem.append([sample.text for sample in out.outputs])
+    return completions_by_problem
 
 
 @extty.experiment(project="generate-inverse-cot-rollouts")
-def generate_inverse_cot_rollouts(
+def generate_inverse_cot_rollouts_vllm(
     *,
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
@@ -148,28 +125,22 @@ def generate_inverse_cot_rollouts(
     model_info = MODEL_REGISTRY[rollout_gen_params.model_name]
     tokenizer = model_info.load_tokenizer()
 
-    p = model_info.load_net(
+    net = model_info.load_net(
         pretrained_weights=rollout_gen_params.start_ckpt_run is None
     )
     if rollout_gen_params.start_ckpt_run is not None:
         if rollout_gen_params.start_ckpt_step is None:
             raise ValueError("`start_ckpt_step` required when `start_ckpt_run` is set")
         project, run_name = rollout_gen_params.start_ckpt_run.split("/")
-        p.load_state_dict(
+        net.load_state_dict(
             extty.load_checkpoint_from(
                 project=project,
                 run_name=run_name,
                 step=rollout_gen_params.start_ckpt_step,
             )["model_state_dict"]
         )
-
-    device = get_device()
-    if rollout_gen_params.use_bf16:
-        p = p.to(device=device, dtype=torch.bfloat16)
-    else:
-        p = p.to(device)
-    p.requires_grad_(False)
-    p.eval()
+    net.eval()
+    net.requires_grad_(False)
 
     state_to_str = get_state_to_str(
         format_messages=model_info.format_messages,
@@ -187,6 +158,22 @@ def generate_inverse_cot_rollouts(
     log.info(
         f"Total: {len(all_problems)} problems from {len(dataset_artifacts)} artifact(s)"
     )
+
+    max_model_len = rollout_gen_params.max_tokens_generated + 1024
+
+    llm = load_dialectic_qwen_as_vllm(
+        net,
+        tokenizer=tokenizer,
+        eos_token_id=model_info.eos_token_id,
+        pad_token_id=model_info.pad_token_id,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=0.90,
+        dtype="bfloat16" if rollout_gen_params.use_bf16 else "float16",
+        seed=rollout_gen_params.seed + rank,
+    )
+    del net
+    torch.cuda.empty_cache()
+
     n_total = len(all_problems)
     n_shards = rollout_gen_params.n_shards
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -204,7 +191,7 @@ def generate_inverse_cot_rollouts(
     )
     pbar = tqdm(
         total=my_n_problems,
-        desc=f"Generating rollouts (rank {rank})",
+        desc=f"Generating rollouts (rank {rank}, vllm)",
         disable=not is_main_process(),
     )
     for shard_idx in my_shard_indices:
@@ -213,10 +200,14 @@ def generate_inverse_cot_rollouts(
         shard_problems = all_problems[shard_start:shard_end]
 
         tmpfile = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False, prefix="inverse_cot_rollouts_"
+            mode="w",
+            suffix=".jsonl",
+            delete=False,
+            prefix="inverse_cot_rollouts_vllm_",
         )
         log.info(
-            f"Shard {shard_idx + 1}/{n_shards}: {len(shard_problems)} problems -> {tmpfile.name}"
+            f"Shard {shard_idx + 1}/{n_shards}: "
+            f"{len(shard_problems)} problems -> {tmpfile.name}"
         )
 
         shard_kept = 0
@@ -229,26 +220,29 @@ def generate_inverse_cot_rollouts(
                 batch = shard_problems[problem_idx:batch_end]
                 batch_responses = [resp for resp, _ in batch]
                 batch_extra = [extra for _, extra in batch]
+                batch_prompts = [state_to_str(resp.data) for resp in batch_responses]
                 problem_idx = batch_end
 
-                kept = _generate_rollouts_for_batch(
-                    p=p,
-                    env_responses=batch_responses,
-                    extra_fields=batch_extra,
-                    state_to_str=state_to_str,
-                    tokenizer=tokenizer,
-                    eos_token_id=model_info.eos_token_id,
-                    pad_token_id=model_info.pad_token_id,
+                completions_by_problem = _vllm_generate_group(
+                    llm,
+                    batch_prompts,
                     group_size=rollout_gen_params.group_size,
                     temperature=rollout_gen_params.temperature,
                     max_tokens_generated=rollout_gen_params.max_tokens_generated,
-                    use_bf16=rollout_gen_params.use_bf16,
+                    eos_token_id=model_info.eos_token_id,
+                    seed=rollout_gen_params.seed + rank + shard_start + problem_idx,
+                )
+
+                kept = filter_countdown_rollouts(
+                    prompts=batch_prompts,
+                    env_responses=batch_responses,
+                    extra_fields=batch_extra,
+                    completions_by_problem=completions_by_problem,
                     n_pos_min=rollout_gen_params.n_pos_min,
                     n_neg_min=rollout_gen_params.n_neg_min,
                 )
                 for entry in kept:
                     tmpfile.write(json.dumps(entry) + "\n")
-                    tmpfile.flush()
                 shard_kept += len(kept)
                 pbar.update(len(batch))
                 pbar.set_postfix(
@@ -281,13 +275,14 @@ def generate_inverse_cot_rollouts(
                 description=(
                     f"Inverse CoT rollouts shard {shard_idx + 1}/{n_shards}: "
                     f"{shard_kept}/{len(shard_problems)} prompts, "
-                    f"group_size={rollout_gen_params.group_size}"
+                    f"group_size={rollout_gen_params.group_size} (vllm)"
                 ),
                 metadata={
                     "rollout_gen_params": dataclasses.asdict(rollout_gen_params),
                     "prompt_collection": dataclasses.asdict(prompt_collection),
                     "shard_idx": shard_idx,
                     "n_shards": n_shards,
+                    "backend": "vllm",
                 },
             )
             os.unlink(tmpfile.name)
@@ -309,7 +304,7 @@ if __name__ == "__main__":
         [
             Experiment(
                 env_name="countdown",
-                fn=generate_inverse_cot_rollouts,
+                fn=generate_inverse_cot_rollouts_vllm,
                 include_prompt_collection_id=True,
                 include_dataset_glob=True,
             ),
