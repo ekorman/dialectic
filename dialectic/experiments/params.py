@@ -87,7 +87,6 @@ class MultiStepSFTParams:
 @dataclass
 class InverseCotParams:
     normalize_by_sequence_length: bool
-    correct_only: bool
     freeze_lm_head: bool
     contrastive_weight: float = 0.0
     train_group_size: int | None = None
