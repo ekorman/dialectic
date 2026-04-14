@@ -1,7 +1,7 @@
 import sys
 import time
 from copy import deepcopy
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import extty
 import torch
@@ -17,13 +17,20 @@ from dialectic.distributed import (
 )
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import PreFill
+from dialectic.llm.vllm_weight_sync import sync_weights_to_vllm
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
+from dialectic.rl.rollout import (
+    generate_rollout_batch_vllm,
+    generate_soft_rollout_batch,
+)
 from dialectic.rl.types import A, E, RewardResult, T
 from dialectic.training import StepFunctionReturn, train_loop
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 
 def aggregate_reward_components(
@@ -345,6 +352,7 @@ def collect_micro_batch(
     *,
     net: BaseTransformer,
     ref_net: BaseTransformer | None,
+    llm: "LLM",
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -360,9 +368,18 @@ def collect_micro_batch(
     logprob_chunk_size: int = 0,
     use_bf16: bool = False,
 ) -> dict:
-    """Collect a single micro-batch of data for gradient accumulation."""
-    rollout = generate_rollout_batch(
-        net=net,
+    """Collect a single micro-batch of data for gradient accumulation.
+
+    Sampling is done by ``llm`` (a vLLM engine built via
+    :func:`build_vllm_for_training`). The engine's weights must already be
+    in sync with ``net`` — the training loop calls
+    :func:`sync_weights_to_vllm` after each optimizer step to maintain this
+    invariant. Log-prob recomputation (``ref_log_probs``, ``old_log_probs``)
+    still goes through the dialectic ``net``/``ref_net`` forward pass.
+    """
+    device = next(net.parameters()).device
+    rollout = generate_rollout_batch_vllm(
+        llm=llm,
         env=env,
         reward_fn=reward_fn,
         state_to_str=state_to_str,
@@ -374,10 +391,8 @@ def collect_micro_batch(
         group_size=group_size,
         temperature=temperature,
         max_tokens_generated=max_tokens_generated,
-        use_bf16=use_bf16,
+        device=device,
     )
-
-    device = next(net.parameters()).device
     t_logprobs_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -447,6 +462,7 @@ def create_grpo_step_fn(
     device: torch.device,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     warmup_steps: int = 0,
+    post_update_hook: Callable[[], None] | None = None,
 ):
     if mu > 1 and eps is None:
         raise RuntimeError(
@@ -654,6 +670,11 @@ def create_grpo_step_fn(
                 logprob_recompute_max_diffs
             )
 
+        if post_update_hook is not None:
+            t_sync_start = time.perf_counter()
+            post_update_hook()
+            metrics["train/weight_sync_time"] = time.perf_counter() - t_sync_start
+
         return StepFunctionReturn(
             n_episodes_processed=all_rewards.shape[1] * get_world_size(),
             metrics=metrics,
@@ -722,6 +743,7 @@ def _grpo_train_loop(
     val_envs: list[Env],
     val_freq: int = 0,
     warmup_steps: int = 0,
+    post_update_hook: Callable[[], None] | None = None,
 ) -> None:
     device = next(net.parameters()).device
 
@@ -743,6 +765,7 @@ def _grpo_train_loop(
         device=device,
         advantage_fn=advantage_fn,
         warmup_steps=warmup_steps,
+        post_update_hook=post_update_hook,
     )
 
     train_loop(
@@ -761,6 +784,7 @@ def train_grpo(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
+    llm: "LLM",
     env: Env[T, A],  # assume single step
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -796,6 +820,7 @@ def train_grpo(
         return collect_micro_batch(
             net=net,
             ref_net=ref_net,
+            llm=llm,
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -811,6 +836,9 @@ def train_grpo(
             use_bf16=use_bf16,
             collect_old_log_probs=collect_old_log_probs,
         )
+
+    def post_update_hook() -> None:
+        sync_weights_to_vllm(llm, net)
 
     def recompute_fn(
         net: BaseTransformer, mb: dict
@@ -858,6 +886,7 @@ def train_grpo(
         val_envs=val_envs,
         val_fn=val_fn,
         warmup_steps=warmup_steps,
+        post_update_hook=post_update_hook,
     )
 
 

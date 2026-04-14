@@ -32,6 +32,7 @@ from dialectic.experiments.params import (
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.experiments.reward_fns import get_countdown_reward_fn
 from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.llm.vllm_weight_sync import build_vllm_for_training
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env
@@ -102,9 +103,26 @@ def _train_grpo(
     )
     tokenizer = model_info.load_tokenizer()
 
+    # Build the vLLM sampler engine once. Each rank gets its own engine on
+    # its own LOCAL_RANK GPU; weights get pushed in-place after every
+    # optimizer step via `sync_weights_to_vllm`, so we only pay engine init
+    # cost once per run.
+    vllm_max_model_len = train_params.max_tokens_generated + 1024
+    llm = build_vllm_for_training(
+        net,
+        tokenizer=tokenizer,
+        eos_token_id=model_info.eos_token_id,
+        pad_token_id=model_info.pad_token_id,
+        max_model_len=vllm_max_model_len,
+        gpu_memory_utilization=0.3,
+        dtype="bfloat16" if train_params.use_bf16 else "float16",
+        seed=train_params.seed + rank,
+    )
+
     train_grpo(
         net=net,
         opt=opt,
+        llm=llm,
         env=env,
         reward_fn=reward_fn,
         state_to_str=state_to_str,
