@@ -102,6 +102,17 @@ class InverseCotModel(nn.Module):
         self.lm_head = nn.Linear(p.d, p.vocab_size, bias=False)
         self.lm_head.weight.data.copy_(p.lm_head.weight.data)
 
+        # When True, each decoder layer's forward is run under
+        # `torch.utils.checkpoint.checkpoint` so its activations are dropped
+        # after the layer returns and recomputed during backward. Trades
+        # ~30% step time for ~5-10× less activation memory — load-bearing
+        # for the InfoNCE contrastive loss, where the per-step batch is
+        # (1 + n_negatives) times the NLL-only case and the prefix-LM
+        # attention mask forces SDPA's math backend (which materializes
+        # the full [N, H, L, L] scores matrix). Enable this via
+        # `InverseCotParams.gradient_checkpointing` in training.
+        self.use_gradient_checkpointing = False
+
     def forward(
         self,
         x: Int[Tensor, "B L"],
@@ -112,8 +123,18 @@ class InverseCotModel(nn.Module):
     ):
         x = self.embed_tokens(x)
 
+        use_ckpt = (
+            self.use_gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        )
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
-            x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, kv_cache, attention_mask, use_reentrant=False
+                )
+            else:
+                x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
 
         x = self.norm(x)
 

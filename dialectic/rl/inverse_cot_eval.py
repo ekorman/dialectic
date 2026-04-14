@@ -45,12 +45,16 @@ def compute_fcr(
     max_tokens_generated: int,
     batch_size: int,
     use_bf16: bool = False,
+    q_temperature: float = 1.0,
 ) -> FCRResult:
     """Compute Forward Consistency Rate.
 
     For each prompt with a ground truth equation:
-    1. Feed (prompt, gt answer) to q -> generate CoT
-    2. Feed prompt + CoT to p -> generate answer
+    1. Feed (prompt, gt answer) to q -> generate CoT (sampled at
+       ``q_temperature`` — matches the paper spec's "Sample Ĉ ~ q_phi"
+       and the inference-time use case for offline data synthesis)
+    2. Feed prompt + CoT to p -> generate answer (greedy — we want
+       p_theta's most likely response given the CoT, not a noisy sample)
     3. Check if p's answer matches ground truth
     """
     device = next(p.parameters()).device
@@ -80,11 +84,12 @@ def compute_fcr(
             q_prefix_ids[i, offset:] = torch.tensor(ids, device=device)
             q_prefix_mask[i, offset:] = True
 
-        # q generates CoT
+        # q generates CoT (sampled, matching the inference-time regime)
         q_completions = generate_hard_tokens(
             net=q,
             token_ids=q_prefix_ids,
-            sampling_strategy="greedy",
+            sampling_strategy="sample",
+            temperature=q_temperature,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             max_tokens_generated=max_tokens_generated,

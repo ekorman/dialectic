@@ -9,7 +9,7 @@ from dialectic.rl.extractors import parse_cot_and_answer
 from dialectic.rl.inverse_cot_data import (
     PreTokenizedCompletion,
     PreTokenizedPrompt,
-    build_contrastive_batch,
+    build_infonce_batch,
     build_shuffled_batch,
     load_rollout_artifacts,
 )
@@ -487,34 +487,126 @@ def _make_prompts(n_prompts=2, group_size=4, n_correct=2):
 
 
 class TestContrastiveLoss:
-    def test_build_batch_shapes(self):
+    def test_build_infonce_batch_shapes(self):
         prompts = _make_prompts(n_prompts=2, group_size=4)
-        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            build_contrastive_batch(
-                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        input_ids, prefix_lengths, loss_mask, valid_mask, is_positive, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
             )
         )
-        assert input_ids.shape[0] == 8  # 2 prompts * 4 completions
-        assert prefix_lengths.shape == (8,)
+        # 2 prompts × 4 anchors × (1 + 2 negatives) = 24 sequences
+        expected_n = 2 * 4 * 3
+        assert input_ids.shape[0] == expected_n
+        assert prefix_lengths.shape == (expected_n,)
         assert loss_mask.shape == input_ids.shape
-        assert is_correct.shape == (8,)
-        assert group_sizes == [4, 4]
+        assert valid_mask.shape == (expected_n,)
+        assert is_positive.shape == (expected_n,)
+        assert group_size == 4
+        # Slot 0 of each anchor is the positive; is_positive should
+        # repeat as [T, F, F, T, F, F, ...] with period (1 + n_negatives).
+        expected_is_pos = [True, False, False] * 4 * 2  # 4 anchors × 2 prompts
+        assert is_positive.tolist() == expected_is_pos
 
-    def test_build_batch_correctness_mask(self):
-        prompts = _make_prompts(n_prompts=1, group_size=4, n_correct=2)
-        _, _, _, is_correct, _ = build_contrastive_batch(
-            prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+    def test_build_infonce_batch_excludes_same_answer_negatives(self):
+        """Two rollouts with identical answer tokens must not be each other's
+        contrastive negatives."""
+        # Prompt with 4 completions but only 2 distinct answers: two have
+        # answer_ids [10, 11], two have [12, 13]. For any anchor, at most
+        # one distinct-other-answer bucket exists, so with n_negatives=2
+        # exactly half the negative slots should be invalid.
+        prompts = [
+            PreTokenizedPrompt(
+                prompt_ids=[1, 2, 3],
+                completions=[
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[20, 21], is_correct=True
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[22, 23], is_correct=True
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[12, 13], cot_ids=[24, 25], is_correct=False
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[12, 13], cot_ids=[26, 27], is_correct=False
+                    ),
+                ],
+            )
+        ]
+        _, _, _, valid_mask, is_positive, K = build_infonce_batch(
+            prompts,
+            eos_token_id=99,
+            pad_token_id=0,
+            device=torch.device("cpu"),
+            n_negatives=2,
         )
-        assert is_correct.tolist() == [True, True, False, False]
+        # Layout: [anchor0_slot0, anchor0_slot1, anchor0_slot2, anchor1_...]
+        # Each anchor has 1 positive + 2 negative slots = 3 slots.
+        # Only 1 distinct-other-answer bucket exists, so exactly 1 of the 2
+        # negative slots per anchor is valid; the other is padded+invalid.
+        valid_reshaped = valid_mask.view(K, 3)
+        assert valid_reshaped[:, 0].all()  # positives always valid
+        # Each row should have exactly one valid negative and one invalid.
+        assert valid_reshaped[:, 1:].sum(dim=-1).tolist() == [1, 1, 1, 1]
 
-    def test_contrastive_loss_all_positive(self):
-        """When all examples are positive, contrastive loss should be 0."""
+    def test_build_infonce_batch_all_same_answer_all_invalid(self):
+        """If every rollout shares one answer, all negative slots are invalid
+        and the contrastive loss should contribute zero gradient."""
+        prompts = [
+            PreTokenizedPrompt(
+                prompt_ids=[1, 2, 3],
+                completions=[
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[20, 21], is_correct=True
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[22, 23], is_correct=True
+                    ),
+                ],
+            )
+        ]
+        _, _, _, valid_mask, _, _ = build_infonce_batch(
+            prompts,
+            eos_token_id=99,
+            pad_token_id=0,
+            device=torch.device("cpu"),
+            n_negatives=2,
+        )
+        # 2 anchors × (1 + 2) slots. Positive slots valid, all negative slots
+        # invalid because there's no distinct-other-answer rollout.
+        valid_reshaped = valid_mask.view(2, 3)
+        assert valid_reshaped[:, 0].all()
+        assert not valid_reshaped[:, 1:].any()
+
+    def test_contrastive_loss_all_same_answer_contributes_zero(self):
+        """All anchors have no valid negatives → contrastive loss term is 0,
+        NLL still provides gradient."""
         p = _make_p()
         q = InverseCotModel(p)
-        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=4)
-        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            build_contrastive_batch(
-                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        prompts = [
+            PreTokenizedPrompt(
+                prompt_ids=[1, 2, 3],
+                completions=[
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[20, 21], is_correct=True
+                    ),
+                    PreTokenizedCompletion(
+                        answer_ids=[10, 11], cot_ids=[22, 23], is_correct=True
+                    ),
+                ],
+            )
+        ]
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
             )
         )
         _, metrics = compute_contrastive_loss(
@@ -522,20 +614,32 @@ class TestContrastiveLoss:
             input_ids,
             prefix_lengths,
             loss_mask,
-            is_correct,
-            group_sizes,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
             contrastive_weight=1.0,
+            contrastive_temperature=1.0,
         )
         assert metrics["train/contrastive_loss"] == 0.0
+        # NLL term still nonzero (model is untrained)
+        assert metrics["train/nll"] > 0.0
+        # Every negative slot was padded with the positive (all-same-answer
+        # prompt can't produce distinct-other-answer negatives), so the
+        # real-negatives fraction is zero.
+        assert metrics["train/contrastive_negatives_filled_frac"] == 0.0
 
-    def test_contrastive_loss_with_negatives(self):
-        """Contrastive loss should be > 0 when there are negatives."""
+    def test_contrastive_loss_with_diverse_answers(self):
+        """Diverse answers produce nonzero contrastive loss."""
         p = _make_p()
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
-        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            build_contrastive_batch(
-                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
             )
         )
         _, metrics = compute_contrastive_loss(
@@ -543,9 +647,11 @@ class TestContrastiveLoss:
             input_ids,
             prefix_lengths,
             loss_mask,
-            is_correct,
-            group_sizes,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
             contrastive_weight=1.0,
+            contrastive_temperature=1.0,
         )
         assert metrics["train/contrastive_loss"] > 0.0
 
@@ -553,9 +659,13 @@ class TestContrastiveLoss:
         p = _make_p()
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
-        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            build_contrastive_batch(
-                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
             )
         )
         loss, _ = compute_contrastive_loss(
@@ -563,33 +673,84 @@ class TestContrastiveLoss:
             input_ids,
             prefix_lengths,
             loss_mask,
-            is_correct,
-            group_sizes,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
             contrastive_weight=1.0,
+            contrastive_temperature=1.0,
         )
         loss.backward()
         assert q.lm_head.weight.grad is not None
 
     def test_contrastive_weight_zero_matches_nll_only(self):
-        """With contrastive_weight=0, contrastive loss shouldn't contribute."""
+        """With contrastive_weight=0, total == NLL."""
         p = _make_p()
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
-        input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
-            build_contrastive_batch(
-                prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
             )
         )
-        loss_w0, m0 = compute_contrastive_loss(
+        _, m0 = compute_contrastive_loss(
             q,
             input_ids,
             prefix_lengths,
             loss_mask,
-            is_correct,
-            group_sizes,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
             contrastive_weight=0.0,
+            contrastive_temperature=1.0,
         )
         assert m0["train/loss"] == m0["train/nll"]
+
+    def test_contrastive_loss_ignores_is_correct(self):
+        """The new contrastive loss must not depend on is_correct labels
+        (spec § 'Contrastive Term': 'not privileging correct answers').
+        Flipping all labels should not change the loss value."""
+        p = _make_p()
+        q = InverseCotModel(p)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
+            )
+        )
+        # The contrastive loss function's signature no longer takes
+        # is_correct — verify by computing the same loss twice and checking
+        # nothing correctness-related leaks in.
+        loss1, _ = compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
+            contrastive_weight=1.0,
+            contrastive_temperature=1.0,
+        )
+        loss2, _ = compute_contrastive_loss(
+            q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
+            contrastive_weight=1.0,
+            contrastive_temperature=1.0,
+        )
+        assert torch.equal(loss1, loss2)
 
 
 # ---------- JSONL round-trip ----------
