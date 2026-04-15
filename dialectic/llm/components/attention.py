@@ -42,6 +42,19 @@ def attention(
                 sdpa_mask = sdpa_mask & causal_mask
             else:
                 use_sdpa_causal = True
+
+    # NOTE on SDPA backend selection for custom (non-causal) masks:
+    # flash attention never accepts a custom mask. Memory-efficient
+    # attention was tested (via `torch.nn.attention.sdpa_kernel` forcing
+    # `SDPBackend.EFFICIENT_ATTENTION`) and refuses the prefix-LM
+    # `[B, 1, L, L]` mask shape on this hardware/torch combo, so the
+    # dispatcher falls back to the math backend. Math is O(L²) activation
+    # memory and noticeably slower than mem-efficient; if you want to
+    # recover that speedup, the path is `torch.nn.attention.flex_attention`
+    # (torch ≥2.5) with a `mask_mod` closure built from `prefix_lengths` —
+    # not a trivial drop-in because it requires routing through a separate
+    # `BlockMask` API. See the relevant conversation history for the full
+    # diagnosis and options.
     return nn.functional.scaled_dot_product_attention(
         q,
         k,
