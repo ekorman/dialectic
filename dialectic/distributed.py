@@ -64,11 +64,25 @@ def wrap_ddp(
     device_id: int,
     *,
     find_unused_parameters: bool = False,
+    static_graph: bool = True,
 ) -> DDP:
+    # `broadcast_buffers=False`: the frozen components in this codebase
+    # (embeddings, shared MLPs, RoPE sin/cos) never change during training,
+    # so the default per-iteration buffer broadcast is pure overhead.
+    # `gradient_as_bucket_view=True`: lets DDP alias `.grad` into its
+    # communication bucket instead of copying, cutting one full-gradient
+    # memcpy per step.
+    # `static_graph=True`: the forward graph doesn't change across steps,
+    # which lets DDP skip per-iteration autograd graph analysis and reuse
+    # bucket assignments. Turn off only if a caller introduces data-
+    # dependent branching into the forward.
     return DDP(
         model,
         device_ids=[device_id],
         find_unused_parameters=find_unused_parameters,
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True,
+        static_graph=static_graph,
     )
 
 

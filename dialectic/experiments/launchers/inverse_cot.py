@@ -133,15 +133,38 @@ def train_inverse_cot_countdown(
         total_metrics: dict[str, float] = {}
         local_episodes = 0
 
-        for _ in range(train_params.accumulation_steps):
-            indices = torch.randint(len(rollout_data), (local_batch_size,)).tolist()
-            batch_prompts = [rollout_data[i] for i in indices]
+        # Sample all prompts for this step up front and subsample their
+        # completions once, so we can length-sort across the full set
+        # before splitting into accumulation-step micro-batches. The
+        # prefix-LM attention is O(L²) in the batch's max sequence length,
+        # so grouping length-homogeneous prompts into the same micro-batch
+        # turns a single long-tail outlier from a per-step penalty into a
+        # per-chunk penalty — other chunks get tighter padding.
+        total_local_prompts = local_batch_size * train_params.accumulation_steps
+        indices = torch.randint(len(rollout_data), (total_local_prompts,)).tolist()
+        step_prompts = [rollout_data[i] for i in indices]
+        if inverse_cot_params.train_group_size is not None:
+            step_prompts = [
+                subsample_completions(pr, inverse_cot_params.train_group_size)
+                for pr in step_prompts
+            ]
 
-            if inverse_cot_params.train_group_size is not None:
-                batch_prompts = [
-                    subsample_completions(pr, inverse_cot_params.train_group_size)
-                    for pr in batch_prompts
-                ]
+        def _max_seq_len(pr) -> int:
+            # Upper bound on the longest sequence this prompt can emit in
+            # `build_infonce_batch`: prompt + (longest answer) + (longest
+            # cot) + eos. Conservative when the longest answer and longest
+            # cot come from different completions, but correct as an
+            # ordering key.
+            longest_ans = max(len(c.answer_ids) for c in pr.completions)
+            longest_cot = max(len(c.cot_ids) for c in pr.completions)
+            return len(pr.prompt_ids) + longest_ans + longest_cot + 1
+
+        step_prompts.sort(key=_max_seq_len)
+
+        for chunk_idx in range(train_params.accumulation_steps):
+            batch_prompts = step_prompts[
+                chunk_idx * local_batch_size : (chunk_idx + 1) * local_batch_size
+            ]
 
             input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
                 build_infonce_batch(

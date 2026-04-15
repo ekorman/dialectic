@@ -236,16 +236,16 @@ def build_contrastive_batch(
             all_prefix_lengths.append(len(prompt.prompt_ids) + len(comp.answer_ids))
             all_is_correct.append(comp.is_correct)
 
-    max_len = max(len(ids) for ids in all_ids)
-    N = len(all_ids)
-    input_ids = torch.full((N, max_len), pad_token_id, device=device)
-    for i, ids in enumerate(all_ids):
-        input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+    actual_lens = [len(ids) for ids in all_ids]
+    max_len = max(actual_lens)
+    # Build the padded [N, max_len] tensor in one CPU allocation + a single
+    # host→device copy, rather than N per-row `torch.tensor(...).to(device)`
+    # calls. Each of those calls was a separate small H2D transfer.
+    padded = [ids + [pad_token_id] * (max_len - len(ids)) for ids in all_ids]
+    input_ids = torch.tensor(padded, dtype=torch.long, device=device)
 
     prefix_lengths = torch.tensor(all_prefix_lengths, dtype=torch.long, device=device)
-    actual_lengths = torch.tensor(
-        [len(ids) for ids in all_ids], dtype=torch.long, device=device
-    )
+    actual_lengths = torch.tensor(actual_lens, dtype=torch.long, device=device)
     positions = torch.arange(max_len, device=device).unsqueeze(0)
     loss_mask = (positions >= prefix_lengths.unsqueeze(1)) & (
         positions < actual_lengths.unsqueeze(1)
@@ -413,17 +413,16 @@ def build_infonce_batch(
             f"build_infonce_batch produced {n_sequences} sequences, expected {expected}"
         )
 
-    max_len = max(len(ids) for ids in all_ids)
-    input_ids = torch.full(
-        (n_sequences, max_len), pad_token_id, dtype=torch.long, device=device
-    )
-    for i, ids in enumerate(all_ids):
-        input_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+    actual_lens = [len(ids) for ids in all_ids]
+    max_len = max(actual_lens)
+    # Build the padded [N, max_len] tensor in one CPU allocation + a single
+    # host→device copy, rather than N per-row `torch.tensor(...).to(device)`
+    # calls. Each of those calls was a separate small H2D transfer.
+    padded = [ids + [pad_token_id] * (max_len - len(ids)) for ids in all_ids]
+    input_ids = torch.tensor(padded, dtype=torch.long, device=device)
 
     prefix_lengths = torch.tensor(all_prefix_lens, dtype=torch.long, device=device)
-    actual_lengths = torch.tensor(
-        [len(ids) for ids in all_ids], dtype=torch.long, device=device
-    )
+    actual_lengths = torch.tensor(actual_lens, dtype=torch.long, device=device)
     positions = torch.arange(max_len, device=device).unsqueeze(0)
     loss_mask = (positions >= prefix_lengths.unsqueeze(1)) & (
         positions < actual_lengths.unsqueeze(1)
@@ -458,11 +457,12 @@ def build_shuffled_batch(
         pi + ai + ci + [eos_token_id]
         for pi, ai, ci in zip(all_prompt_ids, shuffled_answer, all_cot_ids)
     ]
-    N = len(shuffled_seqs)
-    s_max_len = max(len(s) for s in shuffled_seqs)
-    input_ids = torch.full((N, s_max_len), pad_token_id, device=device)
-    for i, ids in enumerate(shuffled_seqs):
-        input_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+    seq_lens = [len(s) for s in shuffled_seqs]
+    s_max_len = max(seq_lens)
+    # Single CPU allocation + one host→device copy instead of N per-row
+    # `torch.tensor(...).to(device)` calls.
+    padded = [s + [pad_token_id] * (s_max_len - len(s)) for s in shuffled_seqs]
+    input_ids = torch.tensor(padded, dtype=torch.long, device=device)
 
     prefix_lengths = torch.tensor(
         [len(pi) + len(ai) for pi, ai in zip(all_prompt_ids, shuffled_answer)],

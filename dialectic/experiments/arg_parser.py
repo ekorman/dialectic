@@ -41,7 +41,12 @@ def _add_dataclass_to_parser_(parser: argparse.ArgumentParser, dc: Type[T]) -> N
         arg_type = _arg_type(f.type)
 
         if arg_type is bool:
-            parser.add_argument(f"--{f.name.replace('_', '-')}", action="store_true")
+            default = f.default if f.default is not MISSING else False
+            parser.add_argument(
+                f"--{f.name.replace('_', '-')}",
+                action=argparse.BooleanOptionalAction,
+                default=default,
+            )
         else:
             parser.add_argument(
                 f"--{f.name.replace('_', '-')}",

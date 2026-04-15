@@ -88,15 +88,12 @@ class MultiStepSFTParams:
 class InverseCotParams:
     normalize_by_sequence_length: bool
     freeze_lm_head: bool
-    # NOTE: the arg parser treats every bool field as `action="store_true"`,
-    # so this `False` default is what you get whenever the CLI flag is
-    # absent — the dataclass default doesn't matter for CLI use. Pass
-    # `--gradient-checkpointing` on the CLI to enable. Strongly recommended
-    # whenever the InfoNCE contrastive term is active (the per-step batch
+    # Load-bearing for the InfoNCE contrastive term: the per-step batch
     # grows by `1 + contrastive_n_negatives` and the prefix-LM attention
     # mask forces SDPA's math backend, which materializes the full
-    # [N, H, L, L] scores matrix per layer — memory blows up fast).
-    gradient_checkpointing: bool = False
+    # [N, H, L, L] scores matrix per layer. Pass
+    # `--no-gradient-checkpointing` on the CLI to disable.
+    gradient_checkpointing: bool = True
     contrastive_weight: float = 1.0
     contrastive_n_negatives: int = 4
     contrastive_temperature: float = 1.0
