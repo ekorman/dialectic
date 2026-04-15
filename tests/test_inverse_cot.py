@@ -12,6 +12,7 @@ from dialectic.rl.inverse_cot_data import (
     build_infonce_batch,
     build_shuffled_batch,
     load_rollout_artifacts,
+    subsample_completions,
 )
 from dialectic.rl.inverse_cot_eval import expressions_match
 from dialectic.rl.inverse_cot_loss import compute_contrastive_loss, compute_nll_loss
@@ -895,6 +896,65 @@ class TestJsonlRoundTrip:
         loaded = by_split["train"]
         assert loaded[0].equation == "(1 + 2)"
         assert loaded[1].equation is None
+
+
+class TestSubsampleCompletionsRng:
+    def _prompt(self, k: int) -> PreTokenizedPrompt:
+        completions = [
+            PreTokenizedCompletion(
+                answer_ids=[10 + i],
+                cot_ids=[20 + i, 21 + i],
+                is_correct=(i % 2 == 0),
+            )
+            for i in range(k)
+        ]
+        return PreTokenizedPrompt(prompt_ids=[1, 2, 3], completions=completions)
+
+    def test_explicit_rng_is_reproducible(self):
+        import random as _random
+
+        prompt = self._prompt(16)
+        # Two independent calls with freshly-seeded rngs should produce
+        # byte-identical selections. This is the property val relies on
+        # to make its dataset deterministic across calls.
+        rng1 = _random.Random(42)
+        a = subsample_completions(prompt, k=8, rng=rng1)
+        rng2 = _random.Random(42)
+        b = subsample_completions(prompt, k=8, rng=rng2)
+        assert [c.answer_ids for c in a.completions] == [
+            c.answer_ids for c in b.completions
+        ]
+
+    def test_default_rng_uses_global_random(self):
+        import random as _random
+
+        prompt = self._prompt(16)
+        # With the default (rng=None), `subsample_completions` uses the
+        # global `random` module. Seeding it before each call gives the
+        # same result, proving the default path still taps global state.
+        _random.seed(123)
+        a = subsample_completions(prompt, k=8)
+        _random.seed(123)
+        b = subsample_completions(prompt, k=8)
+        assert [c.answer_ids for c in a.completions] == [
+            c.answer_ids for c in b.completions
+        ]
+
+    def test_explicit_rng_independent_of_global_state(self):
+        import random as _random
+
+        prompt = self._prompt(16)
+        rng = _random.Random(7)
+        a = subsample_completions(prompt, k=8, rng=rng)
+        # Advance the global random state between calls — shouldn't
+        # affect an explicit rng instance.
+        _random.random()
+        _random.random()
+        rng2 = _random.Random(7)
+        b = subsample_completions(prompt, k=8, rng=rng2)
+        assert [c.answer_ids for c in a.completions] == [
+            c.answer_ids for c in b.completions
+        ]
 
 
 class TestMaxCotTokensFilter:

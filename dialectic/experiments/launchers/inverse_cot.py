@@ -1,3 +1,5 @@
+import random
+
 import extty
 import torch
 
@@ -169,7 +171,13 @@ def train_inverse_cot_countdown(
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
             local_episodes += local_batch_size
 
-        torch.nn.utils.clip_grad_norm_(trainable_params, train_params.max_grad_norm)
+        # `clip_grad_norm_` returns the total grad norm *before* clipping,
+        # which is the interesting quantity — watching whether it spikes
+        # tells you if the optimizer is hitting instability or the loss
+        # landscape is changing character. Matches what GRPO logs.
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_params, train_params.max_grad_norm
+        ).item()
         opt.step()
 
         metrics = {
@@ -180,6 +188,7 @@ def train_inverse_cot_countdown(
         # wall-clock rate regardless of world_size.
         global_episodes = local_episodes * world_size
         metrics["train/episodes"] = global_episodes
+        metrics["train/grad_norm"] = grad_norm
         return StepFunctionReturn(n_episodes_processed=global_episodes, metrics=metrics)
 
     max_val = (
@@ -198,6 +207,19 @@ def train_inverse_cot_countdown(
         # post-step `barrier()` in `train_loop` while rank 0 runs val.
         q_raw.eval()
 
+        # Deterministic val dataset across calls:
+        # 1. Prompt selection is sequential over `val_rollout_data[:max_val]`
+        #    rather than `torch.randint`-sampled — same prompts in the same
+        #    order every val call.
+        # 2. `subsample_completions` receives a dedicated `random.Random`
+        #    seeded from the training seed, so completion subsampling within
+        #    each prompt is also reproducible across val calls.
+        # Generation paths (`generate_hard_tokens` for qualitative examples,
+        # `compute_fcr`) still use the global torch RNG, so their sampled
+        # outputs DO vary across val calls — that's intentional, it shows
+        # how q_phi's output distribution evolves during training.
+        val_rng = random.Random(train_params.seed + 1_000_000)
+
         all_nll: list[float] = []
         all_nll_correct: list[float] = []
         all_nll_incorrect: list[float] = []
@@ -207,12 +229,16 @@ def train_inverse_cot_countdown(
         n_episodes = 0
         while n_episodes < max_val:
             current_batch = min(train_params.val_batch_size, max_val - n_episodes)
-            indices = torch.randint(len(val_rollout_data), (current_batch,)).tolist()
-            batch_prompts = [val_rollout_data[i] for i in indices]
+            batch_prompts = val_rollout_data[n_episodes : n_episodes + current_batch]
+            if not batch_prompts:
+                break
+            current_batch = len(batch_prompts)
 
             if inverse_cot_params.train_group_size is not None:
                 batch_prompts = [
-                    subsample_completions(pr, inverse_cot_params.train_group_size)
+                    subsample_completions(
+                        pr, inverse_cot_params.train_group_size, rng=val_rng
+                    )
                     for pr in batch_prompts
                 ]
 
@@ -256,6 +282,7 @@ def train_inverse_cot_countdown(
                 pad_token_id=model_info.pad_token_id,
                 device=device,
                 n_negatives=inverse_cot_params.contrastive_n_negatives,
+                rng=val_rng,
             )
 
             _, step_metrics = compute_contrastive_loss(

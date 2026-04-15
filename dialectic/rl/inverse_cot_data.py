@@ -172,8 +172,27 @@ def load_rollout_artifacts(
     return by_split
 
 
-def subsample_completions(prompt: PreTokenizedPrompt, k: int) -> PreTokenizedPrompt:
-    """Subsample k completions, guaranteeing at least 1 positive and 1 negative."""
+def subsample_completions(
+    prompt: PreTokenizedPrompt,
+    k: int,
+    rng: random.Random | None = None,
+) -> PreTokenizedPrompt:
+    """Subsample k completions, guaranteeing at least 1 positive and 1 negative.
+
+    Parameters
+    ----------
+    prompt
+        The prompt whose completions to subsample.
+    k
+        Number of completions to keep.
+    rng
+        Optional ``random.Random`` instance used for all randomness inside
+        this call. ``None`` (the default) uses the global ``random`` module
+        state — preserving the nondeterministic behavior the training loop
+        relies on for batch diversity. Pass an explicit instance from the
+        val loop to make val reproducible across calls within a single run.
+    """
+    r = rng if rng is not None else random
     positives = [c for c in prompt.completions if c.is_correct]
     negatives = [c for c in prompt.completions if not c.is_correct]
 
@@ -181,15 +200,15 @@ def subsample_completions(prompt: PreTokenizedPrompt, k: int) -> PreTokenizedPro
         return prompt
 
     selected: list[PreTokenizedCompletion] = []
-    selected.append(random.choice(positives))
-    selected.append(random.choice(negatives))
+    selected.append(r.choice(positives))
+    selected.append(r.choice(negatives))
 
     remaining = [c for c in prompt.completions if c not in selected]
     n_extra = min(k - 2, len(remaining))
     if n_extra > 0:
-        selected.extend(random.sample(remaining, n_extra))
+        selected.extend(r.sample(remaining, n_extra))
 
-    random.shuffle(selected)
+    r.shuffle(selected)
     return PreTokenizedPrompt(prompt_ids=prompt.prompt_ids, completions=selected)
 
 
