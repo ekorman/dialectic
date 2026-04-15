@@ -1,6 +1,9 @@
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 
+from dialectic.distributed import unwrap_model
 from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
 
 
@@ -122,6 +125,7 @@ def compute_contrastive_loss(
     hidden_states = q(
         input_ids, attention_mask=attention_mask, return_hidden_states=True
     )
+    raw_q = cast(InverseCotModel, unwrap_model(q))
 
     # Standard causal-LM shift: the loss at position t predicts token t+1.
     shift_hidden = hidden_states[:, :-1]
@@ -139,7 +143,7 @@ def compute_contrastive_loss(
         chunk_targets = shift_targets[:, start:end]
         chunk_mask = shift_mask[:, start:end]
 
-        chunk_logits = q.lm_head(chunk_hidden)  # [N, chunk, V]
+        chunk_logits = raw_q.lm_head(chunk_hidden)  # [N, chunk, V]
         N_c, L_c, V = chunk_logits.shape
         # Cast to fp32 for numerically stable softmax over the full Qwen
         # vocab (~152k). Matches `_compute_log_probs_chunked` in the GRPO

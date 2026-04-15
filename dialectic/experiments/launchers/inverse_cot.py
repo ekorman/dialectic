@@ -1,6 +1,17 @@
 import extty
 import torch
 
+from dialectic.distributed import (
+    barrier,
+    cleanup,
+    get_device,
+    get_local_rank,
+    get_rank,
+    get_world_size,
+    init_distributed,
+    is_distributed,
+    wrap_ddp,
+)
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import InverseCotParams, TrainParams
@@ -32,12 +43,34 @@ def train_inverse_cot_countdown(
     prompt_collection: PromptCollection,
     dataset_artifacts: list[str],
 ):
-    torch.manual_seed(train_params.seed)
+    init_distributed()
+    rank = get_rank()
+    world_size = get_world_size()
+    # Per-rank seed offset de-correlates `torch.randint` draws so each rank
+    # samples a different training sub-batch. Without this, DDP all-reduces
+    # identical gradients across ranks and gains nothing from multi-GPU.
+    torch.manual_seed(train_params.seed + rank)
+    device = get_device()
+
+    batch_size = train_params.batch_size
+    if batch_size % world_size != 0:
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by world_size ({world_size})"
+        )
+    local_batch_size = batch_size // world_size
 
     model_info = MODEL_REGISTRY[train_params.model_name]
     tokenizer = model_info.load_tokenizer()
 
-    p, _ = load_model_and_opt(train_params=train_params)
+    # Barrier dance: non-main ranks wait at the first barrier so only rank 0
+    # downloads / extracts the checkpoint. Once rank 0 has it on local disk
+    # (via the extty cache), all ranks can load it independently without
+    # racing on the download.
+    if is_distributed() and not rank == 0:
+        barrier()
+    p, _ = load_model_and_opt(train_params=train_params, device=device)
+    if is_distributed() and rank == 0:
+        barrier()
     p.requires_grad_(False)
     p.eval()
 
@@ -45,16 +78,30 @@ def train_inverse_cot_countdown(
     q.use_gradient_checkpointing = inverse_cot_params.gradient_checkpointing
     if inverse_cot_params.freeze_lm_head:
         q.lm_head.requires_grad_(False)
-    device = next(p.parameters()).device
     dtype = next(p.parameters()).dtype
     q = q.to(device=device, dtype=dtype)
 
     trainable_params = [param for param in q.parameters() if param.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=train_params.lr)
 
-    total_params = sum(param.numel() for param in q.parameters())
+    # Capture the bare InverseCotModel BEFORE wrapping in DDP. `q_raw` is
+    # used for every forward path inside `_val_fn` (and `compute_fcr`)
+    # because val runs only on rank 0 via `train_loop`'s `is_main_process`
+    # gate — any forward through the DDP wrapper would trigger a
+    # buffer-broadcast collective that non-main ranks (sitting at the
+    # post-step `barrier()`) never enter, causing an NCCL hang. Training
+    # forwards still go through `q` (the wrapped version) so gradient
+    # all-reduce fires correctly on `.backward()`.
+    q_raw = q
+    if is_distributed():
+        q = wrap_ddp(q, get_local_rank())
+
+    total_params = sum(param.numel() for param in q_raw.parameters())
     trainable_count = sum(param.numel() for param in trainable_params)
-    log.info(f"q total params: {total_params:,}, trainable: {trainable_count:,}")
+    log.info(
+        f"q total params: {total_params:,}, trainable: {trainable_count:,} "
+        f"(rank {rank}/{world_size}, local_batch_size={local_batch_size})"
+    )
 
     by_split = load_rollout_artifacts(
         dataset_artifacts,
@@ -82,12 +129,10 @@ def train_inverse_cot_countdown(
         opt.zero_grad()
 
         total_metrics: dict[str, float] = {}
-        total_episodes = 0
+        local_episodes = 0
 
         for _ in range(train_params.accumulation_steps):
-            indices = torch.randint(
-                len(rollout_data), (train_params.batch_size,)
-            ).tolist()
+            indices = torch.randint(len(rollout_data), (local_batch_size,)).tolist()
             batch_prompts = [rollout_data[i] for i in indices]
 
             if inverse_cot_params.train_group_size is not None:
@@ -122,7 +167,7 @@ def train_inverse_cot_countdown(
 
             for k, v in step_metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
-            total_episodes += train_params.batch_size
+            local_episodes += local_batch_size
 
         torch.nn.utils.clip_grad_norm_(trainable_params, train_params.max_grad_norm)
         opt.step()
@@ -130,8 +175,12 @@ def train_inverse_cot_countdown(
         metrics = {
             k: v / train_params.accumulation_steps for k, v in total_metrics.items()
         }
-        metrics["train/episodes"] = total_episodes
-        return StepFunctionReturn(n_episodes_processed=total_episodes, metrics=metrics)
+        # Report the global episode count (across all ranks) so the
+        # `max_episodes` budget in `train_loop` converges at the same
+        # wall-clock rate regardless of world_size.
+        global_episodes = local_episodes * world_size
+        metrics["train/episodes"] = global_episodes
+        return StepFunctionReturn(n_episodes_processed=global_episodes, metrics=metrics)
 
     max_val = (
         train_params.val_episodes
@@ -140,7 +189,14 @@ def train_inverse_cot_countdown(
     )
 
     def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
-        q.eval()
+        # Val runs only on rank 0 via `train_loop`'s `is_main_process` gate
+        # (the whole val block is inside `if is_main_process() and
+        # extty.has_active_run():` in `training.py`). Every forward pass
+        # below therefore goes through `q_raw` — the bare InverseCotModel
+        # captured BEFORE the DDP wrap — so no DDP collective fires on a
+        # rank the other ranks never enter. Non-main ranks sit at the
+        # post-step `barrier()` in `train_loop` while rank 0 runs val.
+        q_raw.eval()
 
         all_nll: list[float] = []
         all_nll_correct: list[float] = []
@@ -175,7 +231,7 @@ def train_inverse_cot_countdown(
             )
 
             _, _, per_sample_nlls = compute_nll_loss(
-                q,
+                q_raw,
                 input_ids,
                 prefix_lengths,
                 loss_mask,
@@ -203,7 +259,7 @@ def train_inverse_cot_countdown(
             )
 
             _, step_metrics = compute_contrastive_loss(
-                q,
+                q_raw,
                 nce_input_ids,
                 nce_prefix_lengths,
                 nce_loss_mask,
@@ -226,7 +282,7 @@ def train_inverse_cot_countdown(
                     device,
                 )
                 _, nll_shuffled, _ = compute_nll_loss(
-                    q,
+                    q_raw,
                     s_input_ids,
                     s_prefix_lengths,
                     s_loss_mask,
@@ -248,7 +304,7 @@ def train_inverse_cot_countdown(
                     prefix_ids = input_ids[ex_offset, :prefix_len].unsqueeze(0)
 
                     q_completion = generate_hard_tokens(
-                        net=q,
+                        net=q_raw,
                         token_ids=prefix_ids,
                         sampling_strategy="sample",
                         temperature=train_params.temperature,
@@ -294,10 +350,12 @@ def train_inverse_cot_countdown(
             sum(all_nll_shuffled) / len(all_nll_shuffled) if all_nll_shuffled else 0.0
         )
 
-        # Forward Consistency Rate (FCR)
+        # Forward Consistency Rate (FCR) — uses `q_raw` for the same reason
+        # the other val forwards do: val runs only on rank 0 and must not
+        # touch the DDP wrapper.
         fcr_result = compute_fcr(
             p=p,
-            q=q,
+            q=q_raw,
             prompts=val_rollout_data[:max_val],
             tokenizer=tokenizer,
             eos_token_id=model_info.eos_token_id,
@@ -332,6 +390,7 @@ def train_inverse_cot_countdown(
         val_fn=_val_fn,
         val_envs=val_envs,
     )
+    cleanup()
 
 
 if __name__ == "__main__":

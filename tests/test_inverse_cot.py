@@ -682,6 +682,47 @@ class TestContrastiveLoss:
         loss.backward()
         assert q.lm_head.weight.grad is not None
 
+    def test_contrastive_loss_accepts_ddp_wrapped_model(self, monkeypatch):
+        import dialectic.distributed as distributed
+
+        class FakeDDP:
+            def __init__(self, module):
+                self.module = module
+
+            def __call__(self, *args, **kwargs):
+                return self.module(*args, **kwargs)
+
+        monkeypatch.setattr(distributed, "DDP", FakeDDP)
+
+        p = _make_p()
+        q = InverseCotModel(p)
+        wrapped_q = FakeDDP(q)
+        prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
+        input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
+            build_infonce_batch(
+                prompts,
+                eos_token_id=99,
+                pad_token_id=0,
+                device=torch.device("cpu"),
+                n_negatives=2,
+            )
+        )
+
+        loss, _ = compute_contrastive_loss(
+            wrapped_q,
+            input_ids,
+            prefix_lengths,
+            loss_mask,
+            valid_mask,
+            group_size=group_size,
+            n_negatives=2,
+            contrastive_weight=1.0,
+            contrastive_temperature=1.0,
+        )
+
+        loss.backward()
+        assert q.lm_head.weight.grad is not None
+
     def test_contrastive_weight_zero_matches_nll_only(self):
         """With contrastive_weight=0, total == NLL."""
         p = _make_p()
