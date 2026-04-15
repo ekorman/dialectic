@@ -24,7 +24,10 @@ class PreTokenizedPrompt:
 
 
 def load_rollout_artifacts(
-    artifact_names: list[str], tokenizer: Tokenizer
+    artifact_names: list[str],
+    tokenizer: Tokenizer,
+    max_cot_tokens: int | None = None,
+    min_completions_per_prompt: int = 2,
 ) -> dict[str, list[PreTokenizedPrompt]]:
     """Load rollout data from multiple artifacts, grouped by split.
 
@@ -36,6 +39,29 @@ def load_rollout_artifacts(
     prompts × 32 completions = ~13k strings per shard) this is ~10-30×
     faster because the tokenizers library parallelizes batch encoding
     across threads on the Rust side.
+
+    Parameters
+    ----------
+    artifact_names
+        Names of extty rollout artifacts to load.
+    tokenizer
+        Fast tokenizer for the target model. Will be reset (no padding,
+        no truncation) before use to protect against caller-side mutation.
+    max_cot_tokens
+        If set, drop completions whose tokenized CoT exceeds this length.
+        Training cost in the InfoNCE contrastive loss scales with the
+        max sequence length per batch squared (prefix-LM attention forces
+        SDPA's math backend, which materializes ``[N, H, L, L]`` scores),
+        so a single outlier CoT can blow the memory budget. Dropping long
+        tails at load time bounds ``L`` for every training batch.
+    min_completions_per_prompt
+        If a prompt has fewer than this many completions after the
+        ``max_cot_tokens`` filter, drop the whole prompt. Defaults to 2,
+        which is the floor required for the contrastive training loop
+        (one correct and one incorrect). If the caller uses a fixed
+        ``train_group_size``, pass that value here so post-filter prompts
+        retain enough rollouts to satisfy ``subsample_completions``'s
+        uniform-K requirement.
     """
     # Defensive: upstream code paths (notably `generate_from_text`) mutate
     # the caller's tokenizer to enable left-padding. `encode_batch` would
@@ -45,6 +71,8 @@ def load_rollout_artifacts(
     tokenizer.no_truncation()
 
     by_split: dict[str, list[PreTokenizedPrompt]] = {}
+    total_completions_dropped = 0
+    total_prompts_dropped = 0
     for name in artifact_names:
         data = extty.load_artifact(name)
         if not isinstance(data, bytes):
@@ -72,6 +100,9 @@ def load_rollout_artifacts(
 
         encoded = tokenizer.encode_batch(texts)
 
+        shard_kept = 0
+        shard_comp_dropped = 0
+        shard_prompt_dropped = 0
         for i, entry in enumerate(entries):
             prompt_ids = encoded[i].ids
             completions: list[PreTokenizedCompletion] = []
@@ -80,6 +111,9 @@ def load_rollout_artifacts(
                 answer_ids = encoded[cursor].ids
                 cot_ids = encoded[cursor + 1].ids
                 cursor += 2
+                if max_cot_tokens is not None and len(cot_ids) > max_cot_tokens:
+                    shard_comp_dropped += 1
+                    continue
                 completions.append(
                     PreTokenizedCompletion(
                         answer_ids=list(answer_ids),
@@ -87,6 +121,22 @@ def load_rollout_artifacts(
                         is_correct=comp["is_correct"],
                     )
                 )
+
+            # A prompt is useless to the contrastive training loop if it
+            # has fewer than `min_completions_per_prompt` total or if the
+            # filter removed all correct (or all incorrect) completions —
+            # `subsample_completions` needs at least one of each to build
+            # a mixed group.
+            has_correct = any(c.is_correct for c in completions)
+            has_incorrect = any(not c.is_correct for c in completions)
+            if (
+                len(completions) < min_completions_per_prompt
+                or not has_correct
+                or not has_incorrect
+            ):
+                shard_prompt_dropped += 1
+                continue
+
             equation = entry.get("equation")
             if equation and "=" in equation:
                 equation = equation.split("=")[0].strip()
@@ -98,9 +148,25 @@ def load_rollout_artifacts(
                     equation=equation,
                 )
             )
+            shard_kept += 1
 
-        log.info(f"Loaded {len(entries)} prompts from artifact '{name}'")
+        total_completions_dropped += shard_comp_dropped
+        total_prompts_dropped += shard_prompt_dropped
+        if shard_comp_dropped or shard_prompt_dropped:
+            log.info(
+                f"Loaded {shard_kept} prompts from artifact '{name}' "
+                f"(dropped {shard_comp_dropped} completions over max_cot_tokens={max_cot_tokens}, "
+                f"{shard_prompt_dropped} prompts with too few / unmixed completions)"
+            )
+        else:
+            log.info(f"Loaded {shard_kept} prompts from artifact '{name}'")
 
+    if total_completions_dropped or total_prompts_dropped:
+        log.info(
+            f"Length filter: dropped {total_completions_dropped} completions and "
+            f"{total_prompts_dropped} prompts across all shards "
+            f"(max_cot_tokens={max_cot_tokens}, min_completions_per_prompt={min_completions_per_prompt})"
+        )
     for split, prompts in sorted(by_split.items()):
         log.info(f"  {split}: {len(prompts)} prompts")
     return by_split

@@ -802,6 +802,10 @@ class TestJsonlRoundTrip:
 
         from dialectic.rl import inverse_cot_data
 
+        # Each prompt needs at least one correct AND one incorrect
+        # completion to pass `load_rollout_artifacts`'s mixed-correctness
+        # invariant (which `generate_inverse_cot_rollouts` already enforces
+        # at rollout generation time via `--n-pos-min 1 --n-neg-min 1`).
         entries = [
             {
                 "prompt_str": "solve this",
@@ -814,6 +818,11 @@ class TestJsonlRoundTrip:
                         "cot": "add them",
                         "answer": "<answer>1+2</answer>",
                         "is_correct": True,
+                    },
+                    {
+                        "cot": "subtract them",
+                        "answer": "<answer>2-1</answer>",
+                        "is_correct": False,
                     },
                 ],
             },
@@ -828,6 +837,11 @@ class TestJsonlRoundTrip:
                         "answer": "<answer>4*5</answer>",
                         "is_correct": True,
                     },
+                    {
+                        "cot": "add",
+                        "answer": "<answer>4+5</answer>",
+                        "is_correct": False,
+                    },
                 ],
             },
         ]
@@ -840,6 +854,106 @@ class TestJsonlRoundTrip:
         loaded = by_split["train"]
         assert loaded[0].equation == "(1 + 2)"
         assert loaded[1].equation is None
+
+
+class TestMaxCotTokensFilter:
+    def _jsonl_entry(
+        self,
+        prompt_idx: int,
+        correct_cot_len: int,
+        incorrect_cot_len: int,
+    ) -> dict:
+        # Build a fake rollout with exactly one correct + one incorrect
+        # completion, where each CoT is a string that tokenizes to roughly
+        # the requested number of tokens. Using "word " × N gives one
+        # token per repeat for the Qwen3 tokenizer in practice.
+        return {
+            "prompt_str": f"prompt {prompt_idx}",
+            "numbers": [1, 2],
+            "target": 3,
+            "split": "train",
+            "completions": [
+                {
+                    "cot": "word " * correct_cot_len,
+                    "answer": "<answer>a</answer>",
+                    "is_correct": True,
+                },
+                {
+                    "cot": "word " * incorrect_cot_len,
+                    "answer": "<answer>b</answer>",
+                    "is_correct": False,
+                },
+            ],
+        }
+
+    def test_max_cot_tokens_drops_long_completions(self, tokenizer, monkeypatch):
+        import json as _json
+
+        from dialectic.rl import inverse_cot_data
+
+        entries = [
+            # first prompt: both completions short → kept
+            self._jsonl_entry(0, correct_cot_len=10, incorrect_cot_len=10),
+            # second prompt: correct is long → dropped; only incorrect
+            # remains → prompt loses mixed-correctness → dropped
+            self._jsonl_entry(1, correct_cot_len=500, incorrect_cot_len=10),
+            # third prompt: both short again → kept
+            self._jsonl_entry(2, correct_cot_len=15, incorrect_cot_len=20),
+        ]
+        jsonl_bytes = "\n".join(_json.dumps(e) for e in entries).encode()
+        monkeypatch.setattr(
+            inverse_cot_data.extty, "load_artifact", lambda name: jsonl_bytes
+        )
+
+        by_split = load_rollout_artifacts(
+            ["test"],
+            tokenizer,
+            max_cot_tokens=100,
+            min_completions_per_prompt=2,
+        )
+        loaded = by_split["train"]
+        # 3 prompts loaded → 1 dropped for losing mixed correctness
+        assert len(loaded) == 2
+        prompt_strs = {tokenizer.decode(p.prompt_ids).strip() for p in loaded}
+        assert "prompt 0" in " ".join(prompt_strs)
+        assert "prompt 2" in " ".join(prompt_strs)
+        assert "prompt 1" not in " ".join(prompt_strs)
+
+    def test_max_cot_tokens_none_keeps_everything(self, tokenizer, monkeypatch):
+        import json as _json
+
+        from dialectic.rl import inverse_cot_data
+
+        entries = [self._jsonl_entry(0, 10, 500)]
+        jsonl_bytes = "\n".join(_json.dumps(e) for e in entries).encode()
+        monkeypatch.setattr(
+            inverse_cot_data.extty, "load_artifact", lambda name: jsonl_bytes
+        )
+
+        by_split = load_rollout_artifacts(["test"], tokenizer, max_cot_tokens=None)
+        assert len(by_split["train"]) == 1
+        assert len(by_split["train"][0].completions) == 2
+
+    def test_min_completions_per_prompt_drops_small_prompts(
+        self, tokenizer, monkeypatch
+    ):
+        import json as _json
+
+        from dialectic.rl import inverse_cot_data
+
+        entries = [
+            # prompt with only 2 completions, but we'll require 4 → dropped
+            self._jsonl_entry(0, 10, 10),
+        ]
+        jsonl_bytes = "\n".join(_json.dumps(e) for e in entries).encode()
+        monkeypatch.setattr(
+            inverse_cot_data.extty, "load_artifact", lambda name: jsonl_bytes
+        )
+
+        by_split = load_rollout_artifacts(
+            ["test"], tokenizer, min_completions_per_prompt=4
+        )
+        assert by_split.get("train", []) == []
 
 
 # ---------- build_shuffled_batch ----------

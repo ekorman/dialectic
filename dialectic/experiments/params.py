@@ -101,6 +101,13 @@ class InverseCotParams:
     contrastive_n_negatives: int = 4
     contrastive_temperature: float = 1.0
     train_group_size: int | None = None
+    # Drop any rollout completion whose tokenized CoT exceeds this length,
+    # and drop prompts that lose their positive/negative mix after filtering.
+    # Training cost scales with max batch sequence length squared (prefix-LM
+    # attention uses SDPA's math backend), so a single outlier CoT can OOM
+    # the training step. Pass a value that comfortably bounds the tail of
+    # your rollout dataset's CoT length distribution. ``None`` disables.
+    max_cot_tokens: int | None = None
 
 
 @dataclass

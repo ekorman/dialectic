@@ -56,7 +56,16 @@ def train_inverse_cot_countdown(
     trainable_count = sum(param.numel() for param in trainable_params)
     log.info(f"q total params: {total_params:,}, trainable: {trainable_count:,}")
 
-    by_split = load_rollout_artifacts(dataset_artifacts, tokenizer)
+    by_split = load_rollout_artifacts(
+        dataset_artifacts,
+        tokenizer,
+        max_cot_tokens=inverse_cot_params.max_cot_tokens,
+        # Ensure post-filter prompts retain enough rollouts for
+        # `subsample_completions`'s uniform-K assumption. Default to
+        # `train_group_size` if set, otherwise 2 (the minimum for the
+        # mixed-correctness constraint).
+        min_completions_per_prompt=inverse_cot_params.train_group_size or 2,
+    )
     rollout_data = by_split.get("train", [])
     val_rollout_data = by_split.get("val", [])
     if not rollout_data:
