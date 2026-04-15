@@ -59,8 +59,17 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
-def wrap_ddp(model: nn.Module, device_id: int) -> DDP:
-    return DDP(model, device_ids=[device_id], find_unused_parameters=True)
+def wrap_ddp(
+    model: nn.Module,
+    device_id: int,
+    *,
+    find_unused_parameters: bool = False,
+) -> DDP:
+    return DDP(
+        model,
+        device_ids=[device_id],
+        find_unused_parameters=find_unused_parameters,
+    )
 
 
 def all_gather_rewards(rewards: torch.Tensor) -> torch.Tensor:
