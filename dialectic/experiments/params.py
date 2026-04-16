@@ -96,7 +96,7 @@ class InverseCotParams:
     gradient_checkpointing: bool = True
     contrastive_weight: float = 1.0
     contrastive_n_negatives: int = 4
-    contrastive_temperature: float = 1.0
+    contrastive_temperature: float = 0.05
     train_group_size: int | None = None
     # Drop any rollout completion whose tokenized CoT exceeds this length,
     # and drop prompts that lose their positive/negative mix after filtering.

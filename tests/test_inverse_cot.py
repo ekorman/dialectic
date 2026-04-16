@@ -956,6 +956,42 @@ class TestSubsampleCompletionsRng:
             c.answer_ids for c in b.completions
         ]
 
+    def test_returns_exactly_k_with_duplicate_completions(self):
+        # Regression: two rollouts with byte-identical (answer_ids, cot_ids,
+        # is_correct) triggered dataclass value-equality in the old
+        # `c not in selected` path, shrinking the "remaining" pool and
+        # yielding fewer than k completions. Uniform-K assertion downstream
+        # in `build_infonce_batch` then blew up with mismatched group sizes.
+        import random as _random
+
+        dup_correct = PreTokenizedCompletion(
+            answer_ids=[10], cot_ids=[20, 21], is_correct=True
+        )
+        completions = [
+            dup_correct,
+            dup_correct,  # byte-identical duplicate of the first
+            PreTokenizedCompletion(answer_ids=[11], cot_ids=[22, 23], is_correct=True),
+            PreTokenizedCompletion(answer_ids=[12], cot_ids=[24, 25], is_correct=False),
+            PreTokenizedCompletion(answer_ids=[13], cot_ids=[26, 27], is_correct=False),
+            PreTokenizedCompletion(answer_ids=[14], cot_ids=[28, 29], is_correct=False),
+            PreTokenizedCompletion(answer_ids=[15], cot_ids=[30, 31], is_correct=False),
+            PreTokenizedCompletion(answer_ids=[16], cot_ids=[32, 33], is_correct=False),
+        ]
+        prompt = PreTokenizedPrompt(prompt_ids=[1, 2, 3], completions=completions)
+        assert len(prompt.completions) == 8
+
+        # Run many trials to exercise all random draws; each must return
+        # exactly k completions regardless of which duplicate gets picked.
+        rng = _random.Random(0)
+        for _ in range(50):
+            out = subsample_completions(prompt, k=8, rng=rng)
+            assert len(out.completions) == 8, (
+                f"expected 8 completions, got {len(out.completions)}"
+            )
+            # And the mixed-correctness guarantee still holds.
+            assert any(c.is_correct for c in out.completions)
+            assert any(not c.is_correct for c in out.completions)
+
 
 class TestMaxCotTokensFilter:
     def _jsonl_entry(

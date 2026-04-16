@@ -191,23 +191,38 @@ def subsample_completions(
         state — preserving the nondeterministic behavior the training loop
         relies on for batch diversity. Pass an explicit instance from the
         val loop to make val reproducible across calls within a single run.
+
+    Notes
+    -----
+    Selection is done on **indices** rather than on completion *objects* so
+    duplicate completions (two rollouts that happened to produce byte-
+    identical ``(answer_ids, cot_ids, is_correct)`` tuples) don't break the
+    "remaining" computation. Under dataclass value-equality, ``c not in
+    selected`` would treat all duplicates as already-selected once one was
+    picked, shrinking the remaining pool and producing fewer than ``k``
+    output completions — which then trips ``build_infonce_batch``'s
+    uniform-K assertion downstream. Works correctly with or without
+    duplicates.
     """
     r = rng if rng is not None else random
-    positives = [c for c in prompt.completions if c.is_correct]
-    negatives = [c for c in prompt.completions if not c.is_correct]
+    pos_indices = [i for i, c in enumerate(prompt.completions) if c.is_correct]
+    neg_indices = [i for i, c in enumerate(prompt.completions) if not c.is_correct]
 
-    if not positives or not negatives:
+    if not pos_indices or not neg_indices:
         return prompt
 
-    selected: list[PreTokenizedCompletion] = []
-    selected.append(r.choice(positives))
-    selected.append(r.choice(negatives))
+    selected_indices: set[int] = set()
+    selected_indices.add(r.choice(pos_indices))
+    selected_indices.add(r.choice(neg_indices))
 
-    remaining = [c for c in prompt.completions if c not in selected]
-    n_extra = min(k - 2, len(remaining))
+    remaining_indices = [
+        i for i in range(len(prompt.completions)) if i not in selected_indices
+    ]
+    n_extra = min(k - 2, len(remaining_indices))
     if n_extra > 0:
-        selected.extend(r.sample(remaining, n_extra))
+        selected_indices.update(r.sample(remaining_indices, n_extra))
 
+    selected = [prompt.completions[i] for i in selected_indices]
     r.shuffle(selected)
     return PreTokenizedPrompt(prompt_ids=prompt.prompt_ids, completions=selected)
 
