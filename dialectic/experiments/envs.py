@@ -121,7 +121,7 @@ def load_countdown_dataset_artifacts(
     """
     all_problems: list[tuple[EnvResponse[Countdown], dict]] = []
     for name in artifact_names:
-        data = extty.load_artifact(name)
+        data = extty.load_artifact(name, cache=True)
         if not isinstance(data, bytes):
             raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
         count = 0

@@ -49,7 +49,7 @@ def _load_dataset_problems(
     artifact_name: str,
     prompt_template: str,
 ) -> list[tuple[EnvResponse[Countdown], dict]]:
-    data = extty.load_artifact(artifact_name)
+    data = extty.load_artifact(artifact_name, cache=True)
     if not isinstance(data, bytes):
         raise ValueError(f"Expected bytes from artifact, got {type(data)}")
 

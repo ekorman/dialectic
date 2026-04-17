@@ -40,7 +40,7 @@ def _load_dataset_problems(
     Returns list of (env_response, extra_fields) tuples, where extra_fields
     contains passthrough fields like 'split' and 'equation'.
     """
-    data = extty.load_artifact(artifact_name)
+    data = extty.load_artifact(artifact_name, cache=True)
     if not isinstance(data, bytes):
         raise ValueError(f"Expected bytes from artifact, got {type(data)}")
 

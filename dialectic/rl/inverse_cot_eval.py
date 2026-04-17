@@ -23,6 +23,9 @@ def expressions_match(pred: str, gt: str) -> bool:
     return abs(pred_val - gt_val) < 1e-6
 
 
+HARD_PROMPT_THRESHOLD = 0.25
+
+
 @dataclass
 class FCRResult:
     fcr: float
@@ -31,6 +34,9 @@ class FCRResult:
     fcr_all_incorrect: float
     fcr_all_incorrect_total: int
     fcr_all_incorrect_correct: int
+    p_baseline: float
+    fcr_hard: float
+    fcr_hard_total: int
 
 
 @torch.no_grad()
@@ -64,6 +70,9 @@ def compute_fcr(
     fcr_correct = 0
     fcr_all_incorrect_total = 0
     fcr_all_incorrect_correct = 0
+    fcr_hard_total = 0
+    fcr_hard_correct = 0
+    p_correct_rates: list[float] = []
 
     for batch_start in range(0, len(fcr_prompts), batch_size):
         batch = fcr_prompts[batch_start : batch_start + batch_size]
@@ -142,6 +151,9 @@ def compute_fcr(
                 and expressions_match(extracted, pr.equation)
             )
 
+            p_rate = sum(c.is_correct for c in pr.completions) / len(pr.completions)
+            p_correct_rates.append(p_rate)
+
             fcr_total += 1
             if is_match:
                 fcr_correct += 1
@@ -151,6 +163,11 @@ def compute_fcr(
                 if is_match:
                     fcr_all_incorrect_correct += 1
 
+            if p_rate <= HARD_PROMPT_THRESHOLD:
+                fcr_hard_total += 1
+                if is_match:
+                    fcr_hard_correct += 1
+
     return FCRResult(
         fcr=fcr_correct / max(fcr_total, 1),
         fcr_total=fcr_total,
@@ -158,4 +175,7 @@ def compute_fcr(
         fcr_all_incorrect=fcr_all_incorrect_correct / max(fcr_all_incorrect_total, 1),
         fcr_all_incorrect_total=fcr_all_incorrect_total,
         fcr_all_incorrect_correct=fcr_all_incorrect_correct,
+        p_baseline=sum(p_correct_rates) / max(len(p_correct_rates), 1),
+        fcr_hard=fcr_hard_correct / max(fcr_hard_total, 1),
+        fcr_hard_total=fcr_hard_total,
     )

@@ -1,7 +1,7 @@
 import sys
 import time
 from copy import deepcopy
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 import extty
 import torch
@@ -9,28 +9,15 @@ import torch.nn as nn
 from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
-from dialectic.distributed import (
-    all_gather_rewards,
-    get_rank,
-    get_world_size,
-    unwrap_model,
-)
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import PreFill
-from dialectic.llm.vllm_weight_sync import sync_weights_to_vllm
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import (
-    generate_rollout_batch_vllm,
-    generate_soft_rollout_batch,
-)
+from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
 from dialectic.rl.types import A, E, RewardResult, T
 from dialectic.training import StepFunctionReturn, train_loop
-
-if TYPE_CHECKING:
-    from vllm import LLM
 
 
 def aggregate_reward_components(
@@ -190,7 +177,7 @@ def _compute_log_probs_chunked(
         chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
         chunk_targets = target_tokens[:, chunk_start:chunk_end]
 
-        chunk_logits = unwrap_model(net).lm_head(chunk_hidden)
+        chunk_logits = net.lm_head(chunk_hidden)
 
         BG, L_chunk, V = chunk_logits.shape
         chunk_log_probs = -torch.nn.functional.cross_entropy(
@@ -352,7 +339,6 @@ def collect_micro_batch(
     *,
     net: BaseTransformer,
     ref_net: BaseTransformer | None,
-    llm: "LLM",
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -368,18 +354,9 @@ def collect_micro_batch(
     logprob_chunk_size: int = 0,
     use_bf16: bool = False,
 ) -> dict:
-    """Collect a single micro-batch of data for gradient accumulation.
-
-    Sampling is done by ``llm`` (a vLLM engine built via
-    :func:`build_vllm_for_training`). The engine's weights must already be
-    in sync with ``net`` — the training loop calls
-    :func:`sync_weights_to_vllm` after each optimizer step to maintain this
-    invariant. Log-prob recomputation (``ref_log_probs``, ``old_log_probs``)
-    still goes through the dialectic ``net``/``ref_net`` forward pass.
-    """
-    device = next(net.parameters()).device
-    rollout = generate_rollout_batch_vllm(
-        llm=llm,
+    """Collect a single micro-batch of data for gradient accumulation."""
+    rollout = generate_rollout_batch(
+        net=net,
         env=env,
         reward_fn=reward_fn,
         state_to_str=state_to_str,
@@ -391,8 +368,10 @@ def collect_micro_batch(
         group_size=group_size,
         temperature=temperature,
         max_tokens_generated=max_tokens_generated,
-        device=device,
+        use_bf16=use_bf16,
     )
+
+    device = next(net.parameters()).device
     t_logprobs_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -462,7 +441,6 @@ def create_grpo_step_fn(
     device: torch.device,
     advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
     warmup_steps: int = 0,
-    post_update_hook: Callable[[], None] | None = None,
 ):
     if mu > 1 and eps is None:
         raise RuntimeError(
@@ -486,7 +464,7 @@ def create_grpo_step_fn(
                 and (step % update_ref_net_batch_cadence == 0)
             )
         ):
-            ref_net = deepcopy(unwrap_model(net))
+            ref_net = deepcopy(net)
 
         t_gen_total = 0.0
         t_logprobs_total = 0.0
@@ -501,12 +479,7 @@ def create_grpo_step_fn(
         all_rewards = torch.cat(
             [mb["rewards"] for mb in micro_batches], dim=1
         )  # [G, B*accum]
-        all_rewards_global = all_gather_rewards(all_rewards)
-        global_advs_full = advantage_fn(all_rewards_global)
-        rank, local_size = get_rank(), all_rewards.shape[1]
-        global_advs: Float[torch.Tensor, "G B*accum"] = global_advs_full[
-            :, rank * local_size : (rank + 1) * local_size
-        ]
+        global_advs: Float[torch.Tensor, "G B*accum"] = advantage_fn(all_rewards)
 
         t_opt_start = time.perf_counter()
         total_loss = 0.0
@@ -670,14 +643,8 @@ def create_grpo_step_fn(
                 logprob_recompute_max_diffs
             )
 
-        if post_update_hook is not None:
-            t_sync_start = time.perf_counter()
-            post_update_hook()
-            metrics["train/weight_sync_time"] = time.perf_counter() - t_sync_start
-
         return StepFunctionReturn(
-            n_episodes_processed=all_rewards.shape[1] * get_world_size(),
-            metrics=metrics,
+            n_episodes_processed=all_rewards.shape[1], metrics=metrics
         )
 
     return _step
@@ -698,7 +665,7 @@ def create_grpo_val_fn(
 ):
     def _val(env: Env):
         return evaluate(
-            net=unwrap_model(net),
+            net=net,
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -743,7 +710,6 @@ def _grpo_train_loop(
     val_envs: list[Env],
     val_freq: int = 0,
     warmup_steps: int = 0,
-    post_update_hook: Callable[[], None] | None = None,
 ) -> None:
     device = next(net.parameters()).device
 
@@ -765,7 +731,6 @@ def _grpo_train_loop(
         device=device,
         advantage_fn=advantage_fn,
         warmup_steps=warmup_steps,
-        post_update_hook=post_update_hook,
     )
 
     train_loop(
@@ -784,7 +749,6 @@ def train_grpo(
     *,
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
-    llm: "LLM",
     env: Env[T, A],  # assume single step
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -814,13 +778,15 @@ def train_grpo(
     val_freq: int = 0,
     warmup_steps: int = 0,
 ) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
     collect_old_log_probs = eps is not None
 
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer | None) -> dict:
         return collect_micro_batch(
             net=net,
             ref_net=ref_net,
-            llm=llm,
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -836,9 +802,6 @@ def train_grpo(
             use_bf16=use_bf16,
             collect_old_log_probs=collect_old_log_probs,
         )
-
-    def post_update_hook() -> None:
-        sync_weights_to_vllm(llm, net)
 
     def recompute_fn(
         net: BaseTransformer, mb: dict
@@ -886,7 +849,6 @@ def train_grpo(
         val_envs=val_envs,
         val_fn=val_fn,
         warmup_steps=warmup_steps,
-        post_update_hook=post_update_hook,
     )
 
 
@@ -1011,8 +973,7 @@ def _compute_soft_log_probs_chunked(
 ) -> Float[torch.Tensor, "B G L_c"]:
     batch_size, group_size, seq_len, D = stacked_embeddings.shape
     BG = batch_size * group_size
-    raw_net = unwrap_model(net)
-    V = raw_net.vocab_size
+    V = net.vocab_size
 
     flat_embeddings = stacked_embeddings.view(BG, seq_len, D)
     flat_shadow_ids = stacked_shadow_ids.view(BG, seq_len)
@@ -1030,7 +991,7 @@ def _compute_soft_log_probs_chunked(
     comp_shadow_ids = flat_shadow_ids[:, l_prompt:]
     comp_embeddings = flat_embeddings[:, l_prompt:]
     comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
-    W = raw_net.embed_tokens.weight
+    W = net.embed_tokens.weight
 
     if chunk_size == 0:
         chunk_size = completion_len
@@ -1040,7 +1001,7 @@ def _compute_soft_log_probs_chunked(
         chunk_end = min(chunk_start + chunk_size, completion_len)
 
         chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
-        chunk_logits = raw_net.lm_head(chunk_hidden)
+        chunk_logits = net.lm_head(chunk_hidden)
         chunk_shadow_ids = comp_shadow_ids[:, chunk_start:chunk_end]
         chunk_embeddings = comp_embeddings[:, chunk_start:chunk_end]
         chunk_masks = comp_masks[:, chunk_start:chunk_end]
@@ -1205,9 +1166,7 @@ def collect_soft_micro_batch(
         if normalize_soft_pdf_by_dim:
             gaussian_dist_mean = (-2.0 * soft_lp_vals).mean().item()
         else:
-            gaussian_dist_mean = (
-                (-2.0 * soft_lp_vals / unwrap_model(net).d).mean().item()
-            )
+            gaussian_dist_mean = (-2.0 * soft_lp_vals / net.d).mean().item()
     else:
         soft_lp_mean = soft_lp_std = gaussian_dist_mean = 0.0
 
@@ -1283,6 +1242,9 @@ def train_soft_grpo(
     val_freq: int = 0,
     warmup_steps: int = 0,
 ) -> None:
+    if use_bf16:
+        net = net.to(dtype=torch.bfloat16)
+
     collect_old_log_probs = eps is not None
 
     def collect_fn(net: BaseTransformer, ref_net: BaseTransformer) -> dict:

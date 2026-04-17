@@ -88,22 +88,9 @@ class MultiStepSFTParams:
 class InverseCotParams:
     normalize_by_sequence_length: bool
     freeze_lm_head: bool
-    # Load-bearing for the InfoNCE contrastive term: the per-step batch
-    # grows by `1 + contrastive_n_negatives` and the prefix-LM attention
-    # mask forces SDPA's math backend, which materializes the full
-    # [N, H, L, L] scores matrix per layer. Pass
-    # `--no-gradient-checkpointing` on the CLI to disable.
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     contrastive_weight: float = 1.0
-    contrastive_n_negatives: int = 4
-    contrastive_temperature: float = 0.05
     train_group_size: int | None = None
-    # Drop any rollout completion whose tokenized CoT exceeds this length,
-    # and drop prompts that lose their positive/negative mix after filtering.
-    # Training cost scales with max batch sequence length squared (prefix-LM
-    # attention uses SDPA's math backend), so a single outlier CoT can OOM
-    # the training step. Pass a value that comfortably bounds the tail of
-    # your rollout dataset's CoT length distribution. ``None`` disables.
     max_cot_tokens: int | None = None
 
 

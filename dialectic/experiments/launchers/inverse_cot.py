@@ -27,7 +27,6 @@ from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
 from dialectic.rl.inverse_cot_data import (
     build_contrastive_batch,
-    build_infonce_batch,
     build_shuffled_batch,
     load_rollout_artifacts,
     subsample_completions,
@@ -113,7 +112,7 @@ def train_inverse_cot_countdown(
         # `subsample_completions`'s uniform-K assumption. Default to
         # `train_group_size` if set, otherwise 2 (the minimum for the
         # mixed-correctness constraint).
-        min_completions_per_prompt=inverse_cot_params.train_group_size or 2,
+        min_completions_per_prompt=2,
     )
     rollout_data = by_split.get("train", [])
     val_rollout_data = by_split.get("val", [])
@@ -132,6 +131,8 @@ def train_inverse_cot_countdown(
 
         total_metrics: dict[str, float] = {}
         local_episodes = 0
+        max_seq_len = 0
+        max_batch_cost = 0
 
         # Sample all prompts for this step up front and subsample their
         # completions once, so we can length-sort across the full set
@@ -166,13 +167,12 @@ def train_inverse_cot_countdown(
                 chunk_idx * local_batch_size : (chunk_idx + 1) * local_batch_size
             ]
 
-            input_ids, prefix_lengths, loss_mask, valid_mask, _, group_size = (
-                build_infonce_batch(
+            input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
+                build_contrastive_batch(
                     batch_prompts,
-                    eos_token_id=model_info.eos_token_id,
-                    pad_token_id=model_info.pad_token_id,
-                    device=device,
-                    n_negatives=inverse_cot_params.contrastive_n_negatives,
+                    model_info.eos_token_id,
+                    model_info.pad_token_id,
+                    device,
                 )
             )
 
@@ -181,15 +181,16 @@ def train_inverse_cot_countdown(
                 input_ids,
                 prefix_lengths,
                 loss_mask,
-                valid_mask,
-                group_size=group_size,
-                n_negatives=inverse_cot_params.contrastive_n_negatives,
+                is_correct,
+                group_sizes,
                 contrastive_weight=inverse_cot_params.contrastive_weight,
-                contrastive_temperature=inverse_cot_params.contrastive_temperature,
                 logprob_chunk_size=train_params.logprob_chunk_size,
             )
             (loss / train_params.accumulation_steps).backward()
 
+            n, l = input_ids.shape
+            max_seq_len = max(max_seq_len, l)
+            max_batch_cost = max(max_batch_cost, n * l * l)
             for k, v in step_metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
             local_episodes += local_batch_size
@@ -212,6 +213,8 @@ def train_inverse_cot_countdown(
         global_episodes = local_episodes * world_size
         metrics["train/episodes"] = global_episodes
         metrics["train/grad_norm"] = grad_norm
+        metrics["train/max_seq_len"] = max_seq_len
+        metrics["train/max_batch_cost"] = max_batch_cost
         return StepFunctionReturn(n_episodes_processed=global_episodes, metrics=metrics)
 
     max_val = (
@@ -265,12 +268,7 @@ def train_inverse_cot_countdown(
                     for pr in batch_prompts
                 ]
 
-            # Two separate batches at val time: the old
-            # `build_contrastive_batch` for per-sample NLL diagnostics
-            # (stratified by correctness) and a fresh `build_infonce_batch`
-            # for the training-style NLL + InfoNCE metric. They share
-            # prompt data but lay out sequences differently.
-            input_ids, prefix_lengths, loss_mask, is_correct, _ = (
+            input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
                 build_contrastive_batch(
                     batch_prompts,
                     model_info.eos_token_id,
@@ -292,32 +290,14 @@ def train_inverse_cot_countdown(
                 else:
                     all_nll_incorrect.append(sample_nll)
 
-            (
-                nce_input_ids,
-                nce_prefix_lengths,
-                nce_loss_mask,
-                nce_valid_mask,
-                _,
-                nce_group_size,
-            ) = build_infonce_batch(
-                batch_prompts,
-                eos_token_id=model_info.eos_token_id,
-                pad_token_id=model_info.pad_token_id,
-                device=device,
-                n_negatives=inverse_cot_params.contrastive_n_negatives,
-                rng=val_rng,
-            )
-
             _, step_metrics = compute_contrastive_loss(
                 q_raw,
-                nce_input_ids,
-                nce_prefix_lengths,
-                nce_loss_mask,
-                nce_valid_mask,
-                group_size=nce_group_size,
-                n_negatives=inverse_cot_params.contrastive_n_negatives,
+                input_ids,
+                prefix_lengths,
+                loss_mask,
+                is_correct,
+                group_sizes,
                 contrastive_weight=inverse_cot_params.contrastive_weight,
-                contrastive_temperature=inverse_cot_params.contrastive_temperature,
                 logprob_chunk_size=train_params.logprob_chunk_size,
             )
             all_nll.append(step_metrics["train/nll"])
@@ -387,7 +367,6 @@ def train_inverse_cot_countdown(
 
             n_episodes += current_batch
 
-        nll_mean = sum(all_nll) / len(all_nll) if all_nll else 0.0
         nll_correct_mean = (
             sum(all_nll_correct) / len(all_nll_correct) if all_nll_correct else 0.0
         )
@@ -418,7 +397,7 @@ def train_inverse_cot_countdown(
 
         return EvaluationResult(
             n_episodes=n_episodes,
-            reward_mean=nll_mean,
+            reward_mean=fcr_result.fcr,
             reward_std=0.0,
             component_means={
                 "nll_correct": nll_correct_mean,
@@ -427,6 +406,9 @@ def train_inverse_cot_countdown(
                 "fcr": fcr_result.fcr,
                 "fcr_all_incorrect": fcr_result.fcr_all_incorrect,
                 "fcr_n_all_incorrect": fcr_result.fcr_all_incorrect_total,
+                "p_baseline": fcr_result.p_baseline,
+                "fcr_hard": fcr_result.fcr_hard,
+                "fcr_hard_total": fcr_result.fcr_hard_total,
             },
         ), examples
 

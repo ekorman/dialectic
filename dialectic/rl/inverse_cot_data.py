@@ -74,7 +74,7 @@ def load_rollout_artifacts(
     total_completions_dropped = 0
     total_prompts_dropped = 0
     for name in artifact_names:
-        data = extty.load_artifact(name)
+        data = extty.load_artifact(name, cache=True)
         if not isinstance(data, bytes):
             raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
 
@@ -122,25 +122,24 @@ def load_rollout_artifacts(
                     )
                 )
 
-            # A prompt is useless to the contrastive training loop if it
-            # has fewer than `min_completions_per_prompt` total or if the
-            # filter removed all correct (or all incorrect) completions —
-            # `subsample_completions` needs at least one of each to build
-            # a mixed group.
-            has_correct = any(c.is_correct for c in completions)
-            has_incorrect = any(not c.is_correct for c in completions)
-            if (
-                len(completions) < min_completions_per_prompt
-                or not has_correct
-                or not has_incorrect
-            ):
-                shard_prompt_dropped += 1
-                continue
-
             equation = entry.get("equation")
             if equation and "=" in equation:
                 equation = equation.split("=")[0].strip()
             split = entry.get("split", "train")
+
+            if split == "train":
+                has_correct = any(c.is_correct for c in completions)
+                has_incorrect = any(not c.is_correct for c in completions)
+                if (
+                    len(completions) < min_completions_per_prompt
+                    or not has_correct
+                    or not has_incorrect
+                ):
+                    shard_prompt_dropped += 1
+                    continue
+            elif not completions:
+                shard_prompt_dropped += 1
+                continue
             by_split.setdefault(split, []).append(
                 PreTokenizedPrompt(
                     prompt_ids=list(prompt_ids),
@@ -168,7 +167,17 @@ def load_rollout_artifacts(
             f"(max_cot_tokens={max_cot_tokens}, min_completions_per_prompt={min_completions_per_prompt})"
         )
     for split, prompts in sorted(by_split.items()):
-        log.info(f"  {split}: {len(prompts)} prompts")
+        n_all_correct = sum(
+            1 for p in prompts if all(c.is_correct for c in p.completions)
+        )
+        n_all_incorrect = sum(
+            1 for p in prompts if all(not c.is_correct for c in p.completions)
+        )
+        n_mixed = len(prompts) - n_all_correct - n_all_incorrect
+        log.info(
+            f"  {split}: {len(prompts)} prompts "
+            f"({n_mixed} mixed, {n_all_correct} all-correct, {n_all_incorrect} all-incorrect)"
+        )
     return by_split
 
 
@@ -282,99 +291,83 @@ def build_infonce_batch(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
     int,
 ]:
     """Build a batch laid out for InfoNCE-style contrastive training.
 
-    For each prompt's K rollouts, emits 1 + ``n_negatives`` sequences per
-    anchor: the positive pair ``(P, A_i, C_i)`` at slot 0, followed by
-    ``n_negatives`` contrastive pairs ``(P, A_j, C_i)`` at slots 1..M, where
-    the ``A_j`` are drawn uniformly without replacement from rollouts whose
-    *answer token sequence differs* from the anchor's answer. Rollouts
-    sharing the same answer as the anchor are excluded from the negative
-    candidate pool (per paper_spec.md § "Contrastive Term").
+    Only **correct** completions serve as anchors. For each correct anchor,
+    the positive pair is ``(P, A_correct, C_i)`` at slot 0, followed by
+    ``n_negatives`` contrastive pairs ``(P, A_wrong_j, C_i)`` at slots
+    1..M, where the ``A_wrong_j`` are drawn from answer buckets whose
+    rollouts are **incorrect**.
 
-    Requires uniform group size across prompts in ``prompts``. The training
-    launcher enforces this by always setting ``train_group_size``.
+    Layout of the returned flat-batch tensor, with ``A = n_anchors``
+    (total correct completions across all prompts), ``M = n_negatives``,
+    slots = ``1 + M``::
 
-    Layout of the returned flat-batch tensor, with ``B = len(prompts)``,
-    ``K = group_size``, ``M = n_negatives``, slots = ``1 + M``::
+        flat_idx = a * slots + s
 
-        flat_idx = p * K * slots + k * slots + s
-
-    So reshaping any per-sequence tensor via ``.view(B, K, slots)`` gives
-    the prompt × anchor × slot layout the loss function expects.
+    Reshaping via ``.view(A, slots)`` gives the anchor × slot layout.
 
     Parameters
     ----------
     prompts
-        Per-prompt rollout groups. All prompts must have the same number of
-        completions.
+        Per-prompt rollout groups.
     eos_token_id, pad_token_id
         Special-token ids for sequence termination and right-padding.
     device
         Target device for the returned tensors.
     n_negatives
-        Number of negative answer-conditionings to score per anchor. If a
-        prompt has fewer than ``n_negatives`` distinct other answers, the
-        missing slots are filled with the positive sequence and marked
-        ``valid=False`` so they contribute nothing to the InfoNCE softmax.
+        Number of negative (incorrect) answer-conditionings per anchor.
+        If a prompt has fewer than ``n_negatives`` distinct incorrect
+        answer keys, the missing slots are filled with the positive
+        sequence and marked ``valid=False``.
     rng
         Optional ``random.Random`` instance for reproducible negative
-        sampling. Defaults to the module-level ``random``.
+        sampling. Defaults to a fresh instance.
 
     Returns
     -------
     input_ids : torch.Tensor
-        Packed ``[B*K*(1+M), L]`` right-padded token tensor.
+        Packed ``[A*(1+M), L]`` right-padded token tensor.
     prefix_lengths : torch.Tensor
-        Per-sequence prefix length ``|P| + |A_j|`` (end of the read-only
-        bidirectional prefix, start of the loss-masked CoT region).
+        Per-sequence prefix length ``|P| + |A_j|``.
     loss_mask : torch.Tensor
-        ``[B*K*(1+M), L]`` bool tensor, True over the CoT + EOS region.
+        ``[A*(1+M), L]`` bool tensor, True over the CoT + EOS region.
     valid_mask : torch.Tensor
-        ``[B*K*(1+M)]`` bool tensor marking slots that contain a real
-        (positive or distinct-answer negative) sequence. Invalid slots
-        exist only as padding when a prompt has fewer than ``n_negatives``
-        distinct other answers.
-    is_positive : torch.Tensor
-        ``[B*K*(1+M)]`` bool tensor, True exactly at slot-0 positions.
-    group_size : int
-        ``K``, returned for the caller's convenience (e.g. reshape).
+        ``[A*(1+M)]`` bool tensor marking real (non-padding) slots.
+    n_anchors : int
+        Total number of correct-completion anchors across all prompts.
     """
     if rng is None:
         rng = random.Random()
 
-    k_values = [len(p.completions) for p in prompts]
-    if not k_values:
+    if not prompts:
         raise ValueError("build_infonce_batch requires at least one prompt")
-    if len(set(k_values)) != 1:
-        raise ValueError(
-            f"build_infonce_batch requires uniform group size across prompts; "
-            f"got {sorted(set(k_values))}. Set train_group_size to force this."
-        )
-    group_size = k_values[0]
+
     slots_per_anchor = 1 + n_negatives
 
     all_ids: list[list[int]] = []
     all_prefix_lens: list[int] = []
     all_valid: list[bool] = []
-    all_is_positive: list[bool] = []
+    n_anchors = 0
 
     for prompt in prompts:
-        # Bucket completion indices by answer-token identity. Two rollouts
-        # that happened to produce the same answer string (e.g. the same
-        # countdown equation) share a bucket and are mutually excluded as
-        # negatives.
         answer_buckets: dict[tuple[int, ...], list[int]] = {}
         for idx, comp in enumerate(prompt.completions):
             key = tuple(comp.answer_ids)
             answer_buckets.setdefault(key, []).append(idx)
 
-        for anchor_idx in range(group_size):
-            anchor = prompt.completions[anchor_idx]
-            anchor_key = tuple(anchor.answer_ids)
+        incorrect_keys = [
+            k
+            for k in answer_buckets
+            if not prompt.completions[answer_buckets[k][0]].is_correct
+        ]
+
+        for anchor in prompt.completions:
+            if not anchor.is_correct:
+                continue
+            n_anchors += 1
 
             pos_seq = (
                 prompt.prompt_ids + anchor.answer_ids + anchor.cot_ids + [eos_token_id]
@@ -384,13 +377,11 @@ def build_infonce_batch(
             all_ids.append(pos_seq)
             all_prefix_lens.append(pos_prefix_len)
             all_valid.append(True)
-            all_is_positive.append(True)
 
-            other_answer_keys = [k for k in answer_buckets if k != anchor_key]
-            if len(other_answer_keys) > n_negatives:
-                picked = rng.sample(other_answer_keys, n_negatives)
+            if len(incorrect_keys) > n_negatives:
+                picked = rng.sample(incorrect_keys, n_negatives)
             else:
-                picked = list(other_answer_keys)
+                picked = list(incorrect_keys)
                 rng.shuffle(picked)
             n_real_negatives = len(picked)
 
@@ -409,20 +400,13 @@ def build_infonce_batch(
                     all_ids.append(neg_seq)
                     all_prefix_lens.append(neg_prefix_len)
                     all_valid.append(True)
-                    all_is_positive.append(False)
                 else:
-                    # Not enough distinct other answers — pad with the
-                    # positive sequence and mark invalid so the softmax
-                    # denominator ignores it. Filling with the positive
-                    # (rather than garbage) keeps the tensor padding honest
-                    # and means the forward pass never sees OOB token ids.
                     all_ids.append(pos_seq)
                     all_prefix_lens.append(pos_prefix_len)
                     all_valid.append(False)
-                    all_is_positive.append(False)
 
     n_sequences = len(all_ids)
-    expected = len(prompts) * group_size * slots_per_anchor
+    expected = n_anchors * slots_per_anchor
     if n_sequences != expected:
         raise RuntimeError(
             f"build_infonce_batch produced {n_sequences} sequences, expected {expected}"
@@ -430,9 +414,6 @@ def build_infonce_batch(
 
     actual_lens = [len(ids) for ids in all_ids]
     max_len = max(actual_lens)
-    # Build the padded [N, max_len] tensor in one CPU allocation + a single
-    # host→device copy, rather than N per-row `torch.tensor(...).to(device)`
-    # calls. Each of those calls was a separate small H2D transfer.
     padded = [ids + [pad_token_id] * (max_len - len(ids)) for ids in all_ids]
     input_ids = torch.tensor(padded, dtype=torch.long, device=device)
 
@@ -443,9 +424,8 @@ def build_infonce_batch(
         positions < actual_lengths.unsqueeze(1)
     )
     valid_mask = torch.tensor(all_valid, dtype=torch.bool, device=device)
-    is_positive = torch.tensor(all_is_positive, dtype=torch.bool, device=device)
 
-    return input_ids, prefix_lengths, loss_mask, valid_mask, is_positive, group_size
+    return input_ids, prefix_lengths, loss_mask, valid_mask, n_anchors
 
 
 def build_shuffled_batch(

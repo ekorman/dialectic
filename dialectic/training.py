@@ -101,26 +101,26 @@ def run_validation(
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
-    reward_means: list[float] = []
+    val_means: list[float] = []
 
     for env in val_envs:
         env.reseed()
         label = str(env)
         result, examples = val_fn(env)
 
-        metrics[f"val/{label}/reward_mean"] = result.reward_mean
-        metrics[f"val/{label}/reward_std"] = result.reward_std
+        metrics[f"val/{label}/mean"] = result.reward_mean
+        metrics[f"val/{label}/std"] = result.reward_std
         for comp_name, comp_val in result.component_means.items():
-            metrics[f"val/{label}/reward/{comp_name}"] = comp_val
+            metrics[f"val/{label}/{comp_name}"] = comp_val
         if examples:
             metrics[f"val/{label}/example"] = extty.BatchExample(
                 prompts=[e.prompt for e in examples],
                 responses=[e.responses for e in examples],
                 rewards=[e.rewards for e in examples],
             )
-        reward_means.append(result.reward_mean)
+        val_means.append(result.reward_mean)
 
-    if reward_means:
-        metrics["val/reward_mean"] = sum(reward_means) / len(reward_means)
+    if val_means:
+        metrics["val/mean"] = sum(val_means) / len(val_means)
 
     return metrics
