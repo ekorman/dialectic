@@ -51,7 +51,7 @@ class InverseCotModel(nn.Module):
     Decoder layers are reversed: MLP before attention.
     """
 
-    def __init__(self, p: BaseTransformer):
+    def __init__(self, p: BaseTransformer, unfreeze_mlp: bool = False):
         super().__init__()
         self.d = p.d
         self.vocab_size = p.vocab_size
@@ -86,13 +86,23 @@ class InverseCotModel(nn.Module):
                 fresh_attn.rope_sin = p_layer.self_attn.rope_sin
                 fresh_attn.rope_cos = p_layer.self_attn.rope_cos
 
-            p_layer.mlp.requires_grad_(False)
-            p_layer.post_attention_layernorm.requires_grad_(False)
+            if unfreeze_mlp:
+                import copy
+
+                layer_mlp = copy.deepcopy(p_layer.mlp)
+                layer_mlp.requires_grad_(True)
+                layer_pre_mlp_norm = copy.deepcopy(p_layer.post_attention_layernorm)
+                layer_pre_mlp_norm.requires_grad_(True)
+            else:
+                layer_mlp = p_layer.mlp
+                layer_pre_mlp_norm = p_layer.post_attention_layernorm
+                layer_mlp.requires_grad_(False)
+                layer_pre_mlp_norm.requires_grad_(False)
 
             self.layers.append(
                 ReversedDecoderLayer(
-                    shared_mlp=p_layer.mlp,
-                    shared_pre_mlp_norm=p_layer.post_attention_layernorm,
+                    shared_mlp=layer_mlp,
+                    shared_pre_mlp_norm=layer_pre_mlp_norm,
                     self_attn=fresh_attn,
                     post_mlp_norm=RMSNorm(p.d, eps=rms_norm_eps),
                 )

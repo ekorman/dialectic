@@ -51,6 +51,7 @@ def train_inverse_cot_countdown(
     # samples a different training sub-batch. Without this, DDP all-reduces
     # identical gradients across ranks and gains nothing from multi-GPU.
     torch.manual_seed(train_params.seed + rank)
+    random.seed(train_params.seed + rank)
     device = get_device()
 
     batch_size = train_params.batch_size
@@ -75,7 +76,7 @@ def train_inverse_cot_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    q = InverseCotModel(p)
+    q = InverseCotModel(p, unfreeze_mlp=inverse_cot_params.unfreeze_mlp)
     q.use_gradient_checkpointing = inverse_cot_params.gradient_checkpointing
     if inverse_cot_params.freeze_lm_head:
         q.lm_head.requires_grad_(False)
