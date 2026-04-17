@@ -1,4 +1,5 @@
 import random
+from dataclasses import replace
 
 import extty
 import torch
@@ -64,13 +65,28 @@ def train_inverse_cot_countdown(
     model_info = MODEL_REGISTRY[train_params.model_name]
     tokenizer = model_info.load_tokenizer()
 
+    forward_run = inverse_cot_params.forward_ckpt_run
+    forward_step = inverse_cot_params.forward_ckpt_step
+    if forward_run is None or forward_step is None:
+        raise ValueError(
+            "Must specify forward model checkpoint via "
+            "--forward-ckpt-run and --forward-ckpt-step"
+        )
+
     # Barrier dance: non-main ranks wait at the first barrier so only rank 0
     # downloads / extracts the checkpoint. Once rank 0 has it on local disk
     # (via the extty cache), all ranks can load it independently without
     # racing on the download.
     if is_distributed() and not rank == 0:
         barrier()
-    p, _ = load_model_and_opt(train_params=train_params, device=device)
+
+    p_params = replace(
+        train_params,
+        start_ckpt_run=forward_run,
+        start_ckpt_step=forward_step,
+        load_ckpt_opt=False,
+    )
+    p, _ = load_model_and_opt(train_params=p_params, device=device)
     if is_distributed() and rank == 0:
         barrier()
     p.requires_grad_(False)
@@ -85,6 +101,20 @@ def train_inverse_cot_countdown(
 
     trainable_params = [param for param in q.parameters() if param.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=train_params.lr)
+
+    start_step = 0
+    if train_params.start_ckpt_run is not None:
+        if train_params.start_ckpt_step is None:
+            raise ValueError("--start-ckpt-step required with --start-ckpt-run")
+        project, run_name = train_params.start_ckpt_run.rsplit("/", 1)
+        ckpt = extty.load_checkpoint_from(
+            project=project, run_name=run_name, step=train_params.start_ckpt_step
+        )
+        q.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            opt.load_state_dict(ckpt["optimizer_state_dict"])
+        start_step = train_params.start_ckpt_step
+        log.info(f"Resumed q from {train_params.start_ckpt_run} step {start_step}")
 
     # Capture the bare InverseCotModel BEFORE wrapping in DDP. `q_raw` is
     # used for every forward path inside `_val_fn` (and `compute_fcr`)
@@ -424,6 +454,7 @@ def train_inverse_cot_countdown(
         train_step=_train_step,
         val_fn=_val_fn,
         val_envs=val_envs,
+        start_step=start_step,
     )
     cleanup()
 

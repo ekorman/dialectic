@@ -38,13 +38,14 @@ def train_loop(
     train_step: Callable[[int], StepFunctionReturn],
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
     val_envs: Sequence[Env],
+    start_step: int = 0,
 ):
     global _sigterm_received
     _sigterm_received = False
     prev_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
 
     n_episodes = 0
-    step = 0
+    step = start_step
     try:
         while n_episodes < max_episodes:
             start_time = time.perf_counter()

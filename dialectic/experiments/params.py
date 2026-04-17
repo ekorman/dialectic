@@ -94,6 +94,8 @@ class InverseCotParams:
     train_group_size: int | None = None
     max_cot_tokens: int | None = None
     unfreeze_mlp: bool = False
+    forward_ckpt_run: str | None = None
+    forward_ckpt_step: int | None = None
 
 
 @dataclass
