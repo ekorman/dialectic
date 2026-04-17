@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -22,7 +23,7 @@ def init_distributed() -> bool:
     if "RANK" not in os.environ:
         return False
 
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     _distributed_active = True

@@ -57,9 +57,10 @@ def compute_contrastive_loss(
     is_correct: torch.Tensor,
     group_sizes: list[int],
     contrastive_weight: float,
+    contrastive_margin: float = 1.0,
     logprob_chunk_size: int = 64,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """NLL (correct-only) + contrastive loss over grouped completions.
+    """NLL (correct-only) + margin contrastive loss over grouped completions.
 
     Expects the batch layout produced by
     :func:`dialectic.rl.inverse_cot_data.build_contrastive_batch`: each
@@ -68,11 +69,12 @@ def compute_contrastive_loss(
 
     - **NLL term**: mean per-sequence NLL over correct completions only,
       averaged across prompts.
-    - **Contrastive term**: per prompt, ``-log(Σ_correct exp(s) / Σ_all
-      exp(s))`` where ``s`` is the per-sequence average logprob. Pushes
-      the model to assign higher logprob to correct rollouts than
-      incorrect ones. Prompts with all-correct or all-incorrect
-      completions contribute zero contrastive loss.
+    - **Contrastive term**: per prompt, ``max(0, margin - (mean_correct_logprob
+      - mean_incorrect_logprob))``. Pushes the model to assign at least
+      ``margin`` nats/token higher average logprob to correct rollouts
+      than incorrect ones. Unlike the logsumexp-ratio formulation, this
+      keeps providing gradient even after the model can discriminate,
+      as long as the gap is below the margin.
 
     Parameters
     ----------
@@ -84,12 +86,16 @@ def compute_contrastive_loss(
         Number of completions per prompt (from ``build_contrastive_batch``).
     contrastive_weight
         ``λ`` in the combined loss.
+    contrastive_margin
+        Target gap in per-token average logprob between correct and
+        incorrect rollouts.
 
     Returns
     -------
     tuple[torch.Tensor, dict[str, float]]
         ``(total_loss, metrics)`` where metrics reports ``train/nll``,
-        ``train/contrastive_loss``, and ``train/loss``.
+        ``train/contrastive_loss``, ``train/contrastive_gap``, and
+        ``train/loss``.
     """
     seq_len = input_ids.shape[1]
     device = input_ids.device
@@ -132,6 +138,7 @@ def compute_contrastive_loss(
 
     nll_losses: list[torch.Tensor] = []
     contrastive_losses: list[torch.Tensor] = []
+    contrastive_gaps: list[torch.Tensor] = []
     offset = 0
     for gs in group_sizes:
         group_nll = per_seq_avg_nll[offset : offset + gs]
@@ -142,9 +149,11 @@ def compute_contrastive_loss(
             nll_losses.append(group_nll[group_correct].mean())
 
         if contrastive_weight > 0 and group_correct.any() and not group_correct.all():
-            log_numerator = torch.logsumexp(group_logprob[group_correct], dim=0)
-            log_denominator = torch.logsumexp(group_logprob, dim=0)
-            contrastive_losses.append(-(log_numerator - log_denominator))
+            correct_mean = group_logprob[group_correct].mean()
+            incorrect_mean = group_logprob[~group_correct].mean()
+            gap = correct_mean - incorrect_mean
+            contrastive_gaps.append(gap.detach())
+            contrastive_losses.append(torch.clamp(contrastive_margin - gap, min=0.0))
 
         offset += gs
 
@@ -158,11 +167,17 @@ def compute_contrastive_loss(
         if contrastive_losses
         else torch.tensor(0.0, device=device)
     )
+    contrastive_gap = (
+        sum(g.item() for g in contrastive_gaps) / len(contrastive_gaps)
+        if contrastive_gaps
+        else 0.0
+    )
     total_loss = nll_loss + contrastive_weight * contrastive_loss
 
     metrics = {
         "train/nll": nll_loss.item(),
         "train/contrastive_loss": contrastive_loss.item(),
+        "train/contrastive_gap": contrastive_gap,
         "train/loss": total_loss.item(),
     }
     return total_loss, metrics

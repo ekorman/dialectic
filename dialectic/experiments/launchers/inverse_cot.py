@@ -185,6 +185,7 @@ def train_inverse_cot_countdown(
                 is_correct,
                 group_sizes,
                 contrastive_weight=inverse_cot_params.contrastive_weight,
+                contrastive_margin=inverse_cot_params.contrastive_margin,
                 logprob_chunk_size=train_params.logprob_chunk_size,
             )
             (loss / train_params.accumulation_steps).backward()
@@ -299,6 +300,7 @@ def train_inverse_cot_countdown(
                 is_correct,
                 group_sizes,
                 contrastive_weight=inverse_cot_params.contrastive_weight,
+                contrastive_margin=inverse_cot_params.contrastive_margin,
                 logprob_chunk_size=train_params.logprob_chunk_size,
             )
             all_nll.append(step_metrics["train/nll"])

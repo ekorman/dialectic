@@ -90,6 +90,7 @@ class InverseCotParams:
     freeze_lm_head: bool
     gradient_checkpointing: bool = False
     contrastive_weight: float = 1.0
+    contrastive_margin: float = 1.0
     train_group_size: int | None = None
     max_cot_tokens: int | None = None
     unfreeze_mlp: bool = False

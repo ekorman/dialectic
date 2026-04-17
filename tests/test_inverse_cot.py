@@ -488,7 +488,9 @@ def _make_prompts(n_prompts=2, group_size=4, n_correct=2):
 
 
 class TestContrastiveLoss:
-    def _build_and_compute(self, prompts, q, contrastive_weight=1.0):
+    def _build_and_compute(
+        self, prompts, q, contrastive_weight=1.0, contrastive_margin=1.0
+    ):
         input_ids, prefix_lengths, loss_mask, is_correct, group_sizes = (
             build_contrastive_batch(
                 prompts, eos_token_id=99, pad_token_id=0, device=torch.device("cpu")
@@ -502,6 +504,7 @@ class TestContrastiveLoss:
             is_correct,
             group_sizes,
             contrastive_weight=contrastive_weight,
+            contrastive_margin=contrastive_margin,
         )
 
     def test_all_correct_contributes_zero_contrastive(self):
@@ -526,12 +529,13 @@ class TestContrastiveLoss:
         assert metrics["train/nll"] > 0.0
 
     def test_mixed_correctness_produces_nonzero_contrastive(self):
-        """Mixed correct/incorrect completions produce nonzero contrastive."""
+        """Mixed correct/incorrect with large margin produces nonzero contrastive."""
         p = _make_p()
         q = InverseCotModel(p)
         prompts = _make_prompts(n_prompts=2, group_size=4, n_correct=2)
-        _, metrics = self._build_and_compute(prompts, q)
+        _, metrics = self._build_and_compute(prompts, q, contrastive_margin=100.0)
         assert metrics["train/contrastive_loss"] > 0.0
+        assert "train/contrastive_gap" in metrics
 
     def test_nll_only_on_correct(self):
         """NLL should only include correct completions."""
