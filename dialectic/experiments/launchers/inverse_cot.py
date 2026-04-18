@@ -1,5 +1,4 @@
 import random
-from dataclasses import replace
 
 import extty
 import torch
@@ -80,13 +79,15 @@ def train_inverse_cot_countdown(
     if is_distributed() and not rank == 0:
         barrier()
 
-    p_params = replace(
-        train_params,
+    p, _ = load_model_and_opt(
+        model_name=train_params.model_name,
         start_ckpt_run=forward_run,
         start_ckpt_step=forward_step,
-        load_ckpt_opt=False,
+        device=device,
+        use_bf16=train_params.use_bf16,
+        compile_model=train_params.compile_model,
+        load_opt=False,
     )
-    p, _ = load_model_and_opt(train_params=p_params, device=device)
     if is_distributed() and rank == 0:
         barrier()
     p.requires_grad_(False)
