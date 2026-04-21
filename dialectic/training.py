@@ -1,3 +1,4 @@
+import random
 import signal
 import time
 from dataclasses import dataclass
@@ -61,9 +62,14 @@ def train_loop(
                 extty.log(metrics, step=step)
 
                 if step % save_ckpt_freq == 0:
+                    ckpt_state = unwrap_model(net).state_dict()
+                    ckpt_state["_rng_torch"] = torch.random.get_rng_state()
+                    ckpt_state["_rng_python"] = random.getstate()
+                    if torch.cuda.is_available():
+                        ckpt_state["_rng_cuda"] = torch.cuda.get_rng_state()
                     extty.save_checkpoint(
                         step=step,
-                        state_dict=unwrap_model(net).state_dict(),
+                        state_dict=ckpt_state,
                         optimizer_state_dict=opt.state_dict(),
                     )
                 if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
@@ -88,9 +94,14 @@ def train_loop(
         signal.signal(signal.SIGTERM, prev_handler)
 
     if is_main_process() and step % save_ckpt_freq != 0 and extty.has_active_run():
+        ckpt_state = unwrap_model(net).state_dict()
+        ckpt_state["_rng_torch"] = torch.random.get_rng_state()
+        ckpt_state["_rng_python"] = random.getstate()
+        if torch.cuda.is_available():
+            ckpt_state["_rng_cuda"] = torch.cuda.get_rng_state()
         extty.save_checkpoint(
             step=step,
-            state_dict=unwrap_model(net).state_dict(),
+            state_dict=ckpt_state,
             optimizer_state_dict=opt.state_dict(),
         )
 

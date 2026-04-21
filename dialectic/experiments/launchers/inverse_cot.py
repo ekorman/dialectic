@@ -93,7 +93,20 @@ def train_inverse_cot_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    q = InverseCotModel(p, unfreeze_mlp=inverse_cot_params.unfreeze_mlp)
+    if inverse_cot_params.full_finetune or inverse_cot_params.finetune_freeze_mlp:
+        import copy
+
+        q = copy.deepcopy(p)
+        q.requires_grad_(True)
+        q.embed_tokens.requires_grad_(False)
+        if inverse_cot_params.finetune_freeze_mlp:
+            for layer in q.layers:
+                layer.mlp.requires_grad_(False)
+                layer.post_attention_layernorm.requires_grad_(False)
+        for layer in q.layers:
+            layer.self_attn.causal = False
+    else:
+        q = InverseCotModel(p, unfreeze_mlp=inverse_cot_params.unfreeze_mlp)
     q.use_gradient_checkpointing = inverse_cot_params.gradient_checkpointing
     if inverse_cot_params.freeze_lm_head:
         q.lm_head.requires_grad_(False)
@@ -111,9 +124,22 @@ def train_inverse_cot_countdown(
         ckpt = extty.load_checkpoint_from(
             project=project, run_name=run_name, step=train_params.start_ckpt_step
         )
-        q.load_state_dict(ckpt["model_state_dict"])
+        state_dict = ckpt["model_state_dict"]
+        rng_torch = state_dict.pop("_rng_torch", None)
+        rng_python = state_dict.pop("_rng_python", None)
+        rng_cuda = state_dict.pop("_rng_cuda", None)
+        q.load_state_dict(state_dict)
         if "optimizer_state_dict" in ckpt:
+            log.info(
+                f"Loading optimizer from from {train_params.start_ckpt_run} step {start_step}"
+            )
             opt.load_state_dict(ckpt["optimizer_state_dict"])
+        if rng_torch is not None:
+            torch.random.set_rng_state(rng_torch)
+        if rng_python is not None:
+            random.setstate(rng_python)
+        if rng_cuda is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state(rng_cuda)
         start_step = train_params.start_ckpt_step
         log.info(f"Resumed q from {train_params.start_ckpt_run} step {start_step}")
 

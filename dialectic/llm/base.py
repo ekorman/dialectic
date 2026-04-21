@@ -49,6 +49,8 @@ class BaseTransformer(nn.Module):
         if tie_weights:
             self.lm_head.weight = self.embed_tokens.weight
 
+        self.use_gradient_checkpointing = False
+
     def forward(
         self,
         x: Int[torch.Tensor, "B L"]
@@ -67,8 +69,18 @@ class BaseTransformer(nn.Module):
             if soft_token_noise is not None:
                 x += soft_token_noise
 
+        use_ckpt = (
+            self.use_gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        )
         for layer, kv_cache in zip(self.layers, kv_caches or [None] * len(self.layers)):
-            x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
+            if use_ckpt:
+                x = torch.utils.checkpoint.checkpoint(
+                    layer, x, kv_cache, attention_mask, use_reentrant=False
+                )
+            else:
+                x = layer(x, kv_cache=kv_cache, attention_mask=attention_mask)
 
         x = self.norm(x)
 

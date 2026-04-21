@@ -33,7 +33,7 @@ def load_model_and_opt(
             project=project,
             run_name=run_name,
             step=start_ckpt_step,
-            load_optimizer=True,
+            load_optimizer=load_opt,
         )
         net.load_state_dict(ckpt["model_state_dict"])
 

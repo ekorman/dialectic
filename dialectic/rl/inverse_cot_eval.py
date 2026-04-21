@@ -39,6 +39,97 @@ class FCRResult:
     fcr_hard_total: int
 
 
+@dataclass
+class BaselineResult:
+    accuracy: float
+    total: int
+    correct: int
+    hard_accuracy: float
+    hard_total: int
+
+
+@torch.no_grad()
+def compute_baseline(
+    *,
+    p: BaseTransformer,
+    prompts: list[PreTokenizedPrompt],
+    tokenizer: Tokenizer,
+    eos_token_id: int,
+    pad_token_id: int,
+    max_tokens_generated: int,
+    batch_size: int,
+    use_bf16: bool = False,
+    temperature: float = 1.0,
+) -> BaselineResult:
+    """Evaluate p generating from scratch (no q involvement).
+
+    For each prompt, p generates its own CoT + answer. Checks if p's
+    answer matches the ground truth equation.
+    """
+    device = next(p.parameters()).device
+    baseline_prompts = [pr for pr in prompts if pr.equation is not None]
+
+    total = 0
+    correct = 0
+    hard_total = 0
+    hard_correct = 0
+
+    for batch_start in range(0, len(baseline_prompts), batch_size):
+        batch = baseline_prompts[batch_start : batch_start + batch_size]
+        B = len(batch)
+
+        max_prompt_len = max(len(pr.prompt_ids) for pr in batch)
+        token_ids = torch.full((B, max_prompt_len), pad_token_id, device=device)
+        attention_mask = torch.zeros(B, max_prompt_len, dtype=torch.bool, device=device)
+        for i, pr in enumerate(batch):
+            offset = max_prompt_len - len(pr.prompt_ids)
+            token_ids[i, offset:] = torch.tensor(pr.prompt_ids, device=device)
+            attention_mask[i, offset:] = True
+
+        completions = generate_hard_tokens(
+            net=p,
+            token_ids=token_ids,
+            sampling_strategy="sample" if temperature > 0 else "greedy",
+            temperature=max(temperature, 1e-6),
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            max_tokens_generated=max_tokens_generated,
+            use_kv_cache=True,
+            attention_mask=attention_mask,
+            use_bf16=use_bf16,
+        ).tokens
+        prompt_len = token_ids.shape[1]
+        completion_strs = tokenizer.decode_batch(completions[:, prompt_len:].tolist())
+
+        for i in range(B):
+            pr = batch[i]
+            extracted = extract_from_answer_tags(completion_strs[i])
+            is_match = (
+                extracted is not None
+                and pr.equation is not None
+                and expressions_match(extracted, pr.equation)
+            )
+
+            p_rate = sum(c.is_correct for c in pr.completions) / len(pr.completions)
+
+            total += 1
+            if is_match:
+                correct += 1
+
+            if p_rate <= HARD_PROMPT_THRESHOLD:
+                hard_total += 1
+                if is_match:
+                    hard_correct += 1
+
+    return BaselineResult(
+        accuracy=correct / max(total, 1),
+        total=total,
+        correct=correct,
+        hard_accuracy=hard_correct / max(hard_total, 1),
+        hard_total=hard_total,
+    )
+
+
 @torch.no_grad()
 def compute_fcr(
     *,

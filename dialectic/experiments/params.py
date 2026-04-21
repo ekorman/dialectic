@@ -93,6 +93,8 @@ class InverseCotParams:
     train_group_size: int | None = None
     max_cot_tokens: int | None = None
     unfreeze_mlp: bool = False
+    full_finetune: bool = False
+    finetune_freeze_mlp: bool = False
     forward_ckpt_run: str | None = None
     forward_ckpt_step: int | None = None
 
@@ -100,18 +102,20 @@ class InverseCotParams:
 @dataclass
 class InverseCotEvalParams:
     model_name: str
-    batch_size: int
-    seed: int
-    temperature: float
-    max_tokens_generated: int
-    q_ckpt_run: str
-    q_ckpt_step: int
-    dataset_artifact: str
-    split: str
-    q_max_tokens_generated: int
+    forward_ckpt_run: str
+    forward_ckpt_step: int
     use_bf16: bool
-    start_ckpt_run: str | None = None
-    start_ckpt_step: int | None = None
+    q_ckpt_run: str | None = None
+    q_ckpt_step: int | None = None
+    seed: int = 42
+    split: str = "val"
+    batch_size: int = 16
+    max_tokens_generated: int = 500
+    temperature: float = 0.7
+    full_finetune: bool = False
+    finetune_freeze_mlp: bool = False
+    unfreeze_mlp: bool = False
+    baseline_only: bool = False
 
 
 @dataclass
