@@ -119,6 +119,48 @@ class InverseCotEvalParams:
 
 
 @dataclass
+class GenerateQCotParams:
+    model_name: str
+    forward_ckpt_run: str
+    forward_ckpt_step: int
+    q_ckpt_run: str
+    q_ckpt_step: int
+    use_bf16: bool
+    batch_size: int = 16
+    max_tokens_generated: int = 500
+    temperature: float = 0.3
+    seed: int = 42
+    full_finetune: bool = False
+    finetune_freeze_mlp: bool = False
+    unfreeze_mlp: bool = False
+
+
+@dataclass
+class SftParams:
+    model_name: str
+    start_ckpt_run: str
+    start_ckpt_step: int
+    use_bf16: bool
+    batch_size: int
+    lr: float
+    max_episodes: int
+    max_grad_norm: float = 10.0
+    seed: int = 20
+    temperature: float = 1.0
+    val_freq: int = 500
+    val_batch_size: int = 16
+    val_episodes: int | None = None
+    save_ckpt_freq: int = sys.maxsize
+    accumulation_steps: int = 1
+    compile_model: bool = False
+    fcr_filter: bool = False
+    use_rollout_data: bool = False
+    warmup_steps: int = 0
+    max_tokens_generated: int = 500
+    val_rollout_artifact: str | None = None
+
+
+@dataclass
 class DatasetGenParams:
     n_examples: int
     train_pct: float
