@@ -209,6 +209,40 @@ def train_sft_inverse_cot_countdown(
     if not train_data:
         raise ValueError("No training data found")
 
+    # Load q for importance weighting
+    q_model = None
+    if sft_params.importance_weight:
+        if sft_params.q_ckpt_run is None or sft_params.q_ckpt_step is None:
+            raise ValueError(
+                "--q-ckpt-run and --q-ckpt-step required with --importance-weight"
+            )
+        import copy
+
+        from dialectic.llm.inverse_cot import InverseCotModel
+
+        if sft_params.q_full_finetune:
+            q_model = copy.deepcopy(p_raw)
+            for layer in q_model.layers:
+                layer.self_attn.causal = False
+        else:
+            q_model = InverseCotModel(p_raw)
+        q_model = q_model.to(device=device, dtype=next(p_raw.parameters()).dtype)
+        q_project, q_run_name = sft_params.q_ckpt_run.split("/")
+        q_ckpt = extty.load_checkpoint_from(
+            project=q_project,
+            run_name=q_run_name,
+            step=sft_params.q_ckpt_step,
+            load_optimizer=False,
+        )
+        q_state = q_ckpt["model_state_dict"]
+        q_state.pop("_rng_torch", None)
+        q_state.pop("_rng_python", None)
+        q_state.pop("_rng_cuda", None)
+        q_model.load_state_dict(q_state)
+        q_model.eval()
+        q_model.requires_grad_(False)
+        log.info(f"Loaded q from {sft_params.q_ckpt_run} step {sft_params.q_ckpt_step}")
+
     # Load original rollout data for val accuracy evaluation
     val_prompts = []
     if sft_params.val_rollout_artifact is not None:
@@ -240,11 +274,31 @@ def train_sft_inverse_cot_countdown(
             shift_mask = loss_mask[:, 1:]
 
             B, L, V = shift_logits.shape
-            per_token_loss = F.cross_entropy(
+            p_log_probs = -F.cross_entropy(
                 shift_logits.reshape(B * L, V),
                 shift_targets.reshape(B * L),
                 reduction="none",
             ).reshape(B, L)
+
+            if q_model is not None:
+                with torch.no_grad():
+                    q_logits = q_model(input_ids, return_all_logits=True)
+                q_shift_logits = q_logits[:, :-1]
+                q_log_probs = -F.cross_entropy(
+                    q_shift_logits.reshape(B * L, V),
+                    shift_targets.reshape(B * L),
+                    reduction="none",
+                ).reshape(B, L)
+
+                ratio = torch.exp(p_log_probs.detach() - q_log_probs)
+                clipped_ratio = torch.clamp(
+                    ratio,
+                    1.0 - sft_params.importance_eps,
+                    1.0 + sft_params.importance_eps,
+                )
+                per_token_loss = -clipped_ratio * p_log_probs
+            else:
+                per_token_loss = -p_log_probs
 
             masked_loss = per_token_loss * shift_mask
             seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
