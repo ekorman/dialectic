@@ -1,7 +1,7 @@
 import sys
 import time
 from copy import deepcopy
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import extty
 import torch
@@ -15,9 +15,16 @@ from dialectic.rl.env import Env
 from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
+from dialectic.rl.rollout import (
+    generate_rollout_batch,
+    generate_rollout_batch_vllm,
+    generate_soft_rollout_batch,
+)
 from dialectic.rl.types import A, E, RewardResult, T
 from dialectic.training import StepFunctionReturn, train_loop
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 
 def aggregate_reward_components(
@@ -339,6 +346,7 @@ def collect_micro_batch(
     *,
     net: BaseTransformer,
     ref_net: BaseTransformer | None,
+    llm: "LLM | None" = None,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -355,23 +363,39 @@ def collect_micro_batch(
     use_bf16: bool = False,
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
-    rollout = generate_rollout_batch(
-        net=net,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        extractor=extractor,
-        batch_size=batch_size,
-        group_size=group_size,
-        temperature=temperature,
-        max_tokens_generated=max_tokens_generated,
-        use_bf16=use_bf16,
-    )
-
     device = next(net.parameters()).device
+    if llm is not None:
+        rollout = generate_rollout_batch_vllm(
+            llm=llm,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+            device=device,
+        )
+    else:
+        rollout = generate_rollout_batch(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+            use_bf16=use_bf16,
+        )
     t_logprobs_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -435,6 +459,8 @@ def create_grpo_step_fn(
     batch_size: int,
     group_size: int,
     normalize_by_sequence_length: bool,
+    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
+    llm: "LLM | None" = None,
     accumulation_steps: int,
     max_grad_norm: float,
     use_bf16: bool,
@@ -469,6 +495,7 @@ def create_grpo_step_fn(
         t_gen_total = 0.0
         t_logprobs_total = 0.0
         micro_batches: list[dict] = []
+        all_bwd_metrics: list[dict] = []
 
         for _ in range(accumulation_steps):
             micro_batch = collect_fn(net, ref_net)
@@ -527,6 +554,11 @@ def create_grpo_step_fn(
                 scaled_loss = loss / accumulation_steps
                 scaled_loss.backward()
 
+                if backward_loss_fn is not None:
+                    bwd_loss, bwd_metrics = backward_loss_fn(micro_batch)
+                    (bwd_loss / accumulation_steps).backward()
+                    all_bwd_metrics.append(bwd_metrics)
+
                 total_loss += loss.item() / accumulation_steps
                 total_main_loss += main_loss / accumulation_steps
                 if kl_loss is not None:
@@ -541,6 +573,10 @@ def create_grpo_step_fn(
             opt.step()
             if scheduler is not None:
                 scheduler.step()
+            if llm is not None:
+                from dialectic.llm.vllm_weight_sync import sync_weights_to_vllm
+
+                sync_weights_to_vllm(llm, net)
 
         t_opt = time.perf_counter() - t_opt_start
         current_lr = opt.param_groups[0]["lr"]
@@ -642,6 +678,12 @@ def create_grpo_step_fn(
             metrics["train/logprob_recompute_max_diff"] = max(
                 logprob_recompute_max_diffs
             )
+        if all_bwd_metrics:
+            all_keys = set().union(*(m.keys() for m in all_bwd_metrics))
+            for key in all_keys:
+                vals = [m[key] for m in all_bwd_metrics if key in m]
+                if vals:
+                    metrics[key] = sum(vals) / len(vals)
 
         return StepFunctionReturn(
             n_episodes_processed=all_rewards.shape[1], metrics=metrics
@@ -710,6 +752,8 @@ def _grpo_train_loop(
     val_envs: list[Env],
     val_freq: int = 0,
     warmup_steps: int = 0,
+    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
+    llm: "LLM | None" = None,
 ) -> None:
     device = next(net.parameters()).device
 
@@ -731,6 +775,8 @@ def _grpo_train_loop(
         device=device,
         advantage_fn=advantage_fn,
         warmup_steps=warmup_steps,
+        backward_loss_fn=backward_loss_fn,
+        llm=llm,
     )
 
     train_loop(
@@ -777,6 +823,8 @@ def train_grpo(
     val_batch_size: int,
     val_freq: int = 0,
     warmup_steps: int = 0,
+    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
+    llm: "LLM | None" = None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -787,6 +835,7 @@ def train_grpo(
         return collect_micro_batch(
             net=net,
             ref_net=ref_net,
+            llm=llm,
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -849,6 +898,8 @@ def train_grpo(
         val_envs=val_envs,
         val_fn=val_fn,
         warmup_steps=warmup_steps,
+        backward_loss_fn=backward_loss_fn,
+        llm=llm,
     )
 
 

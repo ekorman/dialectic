@@ -160,12 +160,12 @@ def compute_contrastive_loss(
     nll_loss = (
         torch.stack(nll_losses).mean()
         if nll_losses
-        else torch.tensor(0.0, device=device)
+        else torch.tensor(0.0, device=device, requires_grad=True)
     )
     contrastive_loss = (
         torch.stack(contrastive_losses).mean()
         if contrastive_losses
-        else torch.tensor(0.0, device=device)
+        else torch.tensor(0.0, device=device, requires_grad=True)
     )
     contrastive_gap = (
         sum(g.item() for g in contrastive_gaps) / len(contrastive_gaps)

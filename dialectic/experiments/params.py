@@ -27,6 +27,15 @@ class TrainParams:
 
 
 @dataclass
+class BackwardParams:
+    backward_weight: float = 0.0
+    contrastive_weight: float = 1.0
+    contrastive_margin: float = 1.0
+    backward_system_prompt: str = "You are given a problem and its answer. Generate step-by-step reasoning that derives the answer."
+    backward_temperature: float = 1.0
+
+
+@dataclass
 class GRPOParams:
     group_size: int
     advantage_fn_type: Literal["grpo", "rloo"]
