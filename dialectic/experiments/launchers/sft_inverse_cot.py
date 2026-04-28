@@ -206,6 +206,23 @@ def train_sft_inverse_cot_countdown(
     )
     train_data = by_split.get("train", [])
     val_data = by_split.get("val", [])
+
+    if sft_params.mix_rollout_artifact is not None:
+        from dialectic.experiments.arg_parser import resolve_artifact_glob as _resolve
+
+        mix_names = _resolve(sft_params.mix_rollout_artifact)
+        mix_split = _load_sft_data(
+            mix_names,
+            tokenizer,
+            eos_token_id=model_info.eos_token_id,
+            use_rollout_data=True,
+        )
+        mix_train = mix_split.get("train", [])
+        log.info(
+            f"Mixing {len(mix_train)} rollout examples with {len(train_data)} q-cot examples"
+        )
+        train_data = train_data + mix_train
+
     if not train_data:
         raise ValueError("No training data found")
 

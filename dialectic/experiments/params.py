@@ -192,6 +192,7 @@ class SftParams:
     compile_model: bool = False
     fcr_filter: bool = False
     use_rollout_data: bool = False
+    mix_rollout_artifact: str | None = None
     warmup_steps: int = 0
     max_tokens_generated: int = 500
     val_rollout_artifact: str | None = None
