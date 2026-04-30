@@ -45,39 +45,71 @@ def _load_sft_data(
     Returns dict mapping split name to list of tokenized examples.
     Each example has: prompt_ids, response_ids, full_ids.
     """
+    import time as _time
+
     by_split: dict[str, list[dict]] = {}
 
+    tokenizer.no_padding()
+    tokenizer.no_truncation()
+
     for name in artifact_names:
+        t0 = _time.perf_counter()
         data = extty.load_artifact(name, cache=True)
         if not isinstance(data, bytes):
             raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
+        log.info(f"Downloaded artifact '{name}' in {_time.perf_counter() - t0:.1f}s")
 
-        for line in data.decode().splitlines():
-            if not line.strip():
-                continue
-            entry = json.loads(line)
+        t1 = _time.perf_counter()
+        entries = [
+            json.loads(line) for line in data.decode().splitlines() if line.strip()
+        ]
+        log.info(f"Parsed {len(entries)} entries in {_time.perf_counter() - t1:.1f}s")
 
-            if use_rollout_data:
-                prompt_str = entry["prompt_str"]
-                prompt_ids = tokenizer.encode(prompt_str).ids
+        t2 = _time.perf_counter()
+        if use_rollout_data:
+            # Batch tokenize: collect all strings first, encode in one call
+            prompt_strs: list[str] = []
+            response_strs: list[str] = []
+            entry_indices: list[int] = []
+            splits: list[str] = []
+
+            for i, entry in enumerate(entries):
                 split = entry.get("split", "train")
                 for comp in entry["completions"]:
                     if not comp["is_correct"]:
                         continue
-                    cot = comp["cot"]
-                    answer = comp["answer"]
-                    response_str = f"<think>\n{cot.strip()}\n</think>\n\n{answer}"
-                    response_ids = tokenizer.encode(response_str).ids
-                    full_ids = prompt_ids + response_ids + [eos_token_id]
-                    by_split.setdefault(split, []).append(
-                        {
-                            "prompt_ids": prompt_ids,
-                            "response_ids": response_ids,
-                            "full_ids": full_ids,
-                            "prefix_len": len(prompt_ids),
-                        }
+                    prompt_strs.append(entry["prompt_str"])
+                    response_strs.append(
+                        f"<think>\n{comp['cot'].strip()}\n</think>\n\n{comp['answer']}"
                     )
-            else:
+                    entry_indices.append(i)
+                    splits.append(split)
+
+            log.info(
+                f"Collected {len(prompt_strs)} correct completions in {_time.perf_counter() - t2:.1f}s"
+            )
+            t3 = _time.perf_counter()
+
+            prompt_encs = tokenizer.encode_batch(prompt_strs)
+            response_encs = tokenizer.encode_batch(response_strs)
+            log.info(
+                f"Batch tokenized {len(prompt_strs)} pairs in {_time.perf_counter() - t3:.1f}s"
+            )
+
+            for idx in range(len(prompt_strs)):
+                prompt_ids = list(prompt_encs[idx].ids)
+                response_ids = list(response_encs[idx].ids)
+                full_ids = prompt_ids + response_ids + [eos_token_id]
+                by_split.setdefault(splits[idx], []).append(
+                    {
+                        "prompt_ids": prompt_ids,
+                        "response_ids": response_ids,
+                        "full_ids": full_ids,
+                        "prefix_len": len(prompt_ids),
+                    }
+                )
+        else:
+            for entry in entries:
                 if fcr_filter and not entry.get("fcr_correct", False):
                     continue
 
@@ -307,13 +339,20 @@ def train_sft_inverse_cot_countdown(
                     reduction="none",
                 ).reshape(B, L)
 
-                ratio = torch.exp(p_log_probs.detach() - q_log_probs)
-                clipped_ratio = torch.clamp(
-                    ratio,
+                # Sequence-level importance weight: p(C|P) / q(C|A*,P)
+                seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
+                p_seq_logprob = (p_log_probs.detach() * shift_mask).sum(
+                    dim=1
+                ) / seq_lengths
+                q_seq_logprob = (q_log_probs * shift_mask).sum(dim=1) / seq_lengths
+                seq_ratio = torch.exp(p_seq_logprob - q_seq_logprob)
+                clipped_seq_ratio = torch.clamp(
+                    seq_ratio,
                     1.0 - sft_params.importance_eps,
                     1.0 + sft_params.importance_eps,
                 )
-                per_token_loss = -clipped_ratio * p_log_probs
+                # Apply one weight per sequence to all tokens
+                per_token_loss = -clipped_seq_ratio.unsqueeze(1) * p_log_probs
             else:
                 per_token_loss = -p_log_probs
 
