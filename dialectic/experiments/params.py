@@ -125,6 +125,7 @@ class InverseCotEvalParams:
     finetune_freeze_mlp: bool = False
     unfreeze_mlp: bool = False
     baseline_only: bool = False
+    n_samples: int = 1
 
 
 @dataclass

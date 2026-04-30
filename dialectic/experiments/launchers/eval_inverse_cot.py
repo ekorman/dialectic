@@ -35,7 +35,11 @@ def eval_inverse_cot_countdown(
         step=eval_params.forward_ckpt_step,
         load_optimizer=False,
     )
-    p.load_state_dict(p_ckpt["model_state_dict"])
+    p_state = p_ckpt["model_state_dict"]
+    p_state.pop("_rng_torch", None)
+    p_state.pop("_rng_python", None)
+    p_state.pop("_rng_cuda", None)
+    p.load_state_dict(p_state)
     dtype = torch.bfloat16 if eval_params.use_bf16 else torch.float32
     p = p.to(device=device, dtype=dtype)
     p.requires_grad_(False)
@@ -59,16 +63,20 @@ def eval_inverse_cot_countdown(
             batch_size=eval_params.batch_size,
             use_bf16=eval_params.use_bf16,
             temperature=eval_params.temperature,
+            n_samples=eval_params.n_samples,
         )
 
-        log.info(
-            f"Baseline results ({result.total} prompts, temp={eval_params.temperature}):"
+        n_label = (
+            f"pass@{eval_params.n_samples}" if eval_params.n_samples > 1 else "accuracy"
         )
         log.info(
-            f"  accuracy:      {result.accuracy:.4f} ({result.correct}/{result.total})"
+            f"Baseline results ({result.total} prompts, temp={eval_params.temperature}, n={eval_params.n_samples}):"
         )
         log.info(
-            f"  hard_accuracy: {result.hard_accuracy:.4f} ({result.hard_total} hard prompts)"
+            f"  {n_label}:      {result.accuracy:.4f} ({result.correct}/{result.total})"
+        )
+        log.info(
+            f"  hard_{n_label}: {result.hard_accuracy:.4f} ({result.hard_total} hard prompts)"
         )
 
         if extty.has_active_run():
@@ -78,6 +86,7 @@ def eval_inverse_cot_countdown(
                     "baseline_hard_accuracy": result.hard_accuracy,
                     "baseline_hard_total": result.hard_total,
                     "n_prompts": result.total,
+                    "n_samples": eval_params.n_samples,
                 },
                 step=0,
             )

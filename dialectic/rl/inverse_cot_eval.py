@@ -60,11 +60,13 @@ def compute_baseline(
     batch_size: int,
     use_bf16: bool = False,
     temperature: float = 1.0,
+    n_samples: int = 1,
 ) -> BaselineResult:
     """Evaluate p generating from scratch (no q involvement).
 
-    For each prompt, p generates its own CoT + answer. Checks if p's
-    answer matches the ground truth equation.
+    For each prompt, p generates ``n_samples`` completions. A prompt
+    counts as correct if **any** of the N samples produces the right
+    answer (pass@N).
     """
     device = next(p.parameters()).device
     baseline_prompts = [pr for pr in prompts if pr.equation is not None]
@@ -86,39 +88,53 @@ def compute_baseline(
             token_ids[i, offset:] = torch.tensor(pr.prompt_ids, device=device)
             attention_mask[i, offset:] = True
 
-        completions = generate_hard_tokens(
-            net=p,
-            token_ids=token_ids,
-            sampling_strategy="sample" if temperature > 0 else "greedy",
-            temperature=max(temperature, 1e-6),
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            max_tokens_generated=max_tokens_generated,
-            use_kv_cache=True,
-            attention_mask=attention_mask,
-            use_bf16=use_bf16,
-        ).tokens
-        prompt_len = token_ids.shape[1]
-        completion_strs = tokenizer.decode_batch(completions[:, prompt_len:].tolist())
+        per_prompt_correct = [False] * B
+        for _sample in range(n_samples):
+            completions = generate_hard_tokens(
+                net=p,
+                token_ids=token_ids,
+                sampling_strategy="sample" if temperature > 0 else "greedy",
+                temperature=max(temperature, 1e-6),
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                max_tokens_generated=max_tokens_generated,
+                use_kv_cache=True,
+                attention_mask=attention_mask,
+                use_bf16=use_bf16,
+            ).tokens
+            prompt_len = token_ids.shape[1]
+            completion_strs = tokenizer.decode_batch(
+                completions[:, prompt_len:].tolist()
+            )
+
+            for i in range(B):
+                if per_prompt_correct[i]:
+                    continue
+                pr = batch[i]
+                extracted = extract_from_answer_tags(completion_strs[i])
+                is_match = (
+                    extracted is not None
+                    and pr.equation is not None
+                    and expressions_match(extracted, pr.equation)
+                )
+                if is_match:
+                    per_prompt_correct[i] = True
 
         for i in range(B):
             pr = batch[i]
-            extracted = extract_from_answer_tags(completion_strs[i])
-            is_match = (
-                extracted is not None
-                and pr.equation is not None
-                and expressions_match(extracted, pr.equation)
+            p_rate = (
+                sum(c.is_correct for c in pr.completions) / len(pr.completions)
+                if pr.completions
+                else 0.0
             )
 
-            p_rate = sum(c.is_correct for c in pr.completions) / len(pr.completions)
-
             total += 1
-            if is_match:
+            if per_prompt_correct[i]:
                 correct += 1
 
             if p_rate <= HARD_PROMPT_THRESHOLD:
                 hard_total += 1
-                if is_match:
+                if per_prompt_correct[i]:
                     hard_correct += 1
 
     return BaselineResult(
