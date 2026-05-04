@@ -19,7 +19,6 @@ from dialectic.distributed import (
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import SftParams
-from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.env import Env
@@ -73,15 +72,16 @@ def _load_sft_data(
             entry_indices: list[int] = []
             splits: list[str] = []
 
+            cot_only_strs: list[str] = []
             for i, entry in enumerate(entries):
                 split = entry.get("split", "train")
                 for comp in entry["completions"]:
                     if not comp["is_correct"]:
                         continue
+                    cot_str = f"<think>\n{comp['cot'].strip()}\n</think>\n\n"
                     prompt_strs.append(entry["prompt_str"])
-                    response_strs.append(
-                        f"<think>\n{comp['cot'].strip()}\n</think>\n\n{comp['answer']}"
-                    )
+                    response_strs.append(cot_str + comp["answer"])
+                    cot_only_strs.append(cot_str)
                     entry_indices.append(i)
                     splits.append(split)
 
@@ -92,6 +92,7 @@ def _load_sft_data(
 
             prompt_encs = tokenizer.encode_batch(prompt_strs)
             response_encs = tokenizer.encode_batch(response_strs)
+            cot_encs = tokenizer.encode_batch(cot_only_strs)
             log.info(
                 f"Batch tokenized {len(prompt_strs)} pairs in {_time.perf_counter() - t3:.1f}s"
             )
@@ -99,6 +100,7 @@ def _load_sft_data(
             for idx in range(len(prompt_strs)):
                 prompt_ids = list(prompt_encs[idx].ids)
                 response_ids = list(response_encs[idx].ids)
+                cot_len = len(cot_encs[idx].ids)
                 full_ids = prompt_ids + response_ids + [eos_token_id]
                 by_split.setdefault(splits[idx], []).append(
                     {
@@ -106,6 +108,7 @@ def _load_sft_data(
                         "response_ids": response_ids,
                         "full_ids": full_ids,
                         "prefix_len": len(prompt_ids),
+                        "cot_len": cot_len,
                     }
                 )
         else:
@@ -118,10 +121,10 @@ def _load_sft_data(
                 answer = entry["answer"]
                 split = entry.get("split", "train")
 
-                response_str = (
-                    f"<think>\n{cot.strip()}\n</think>\n\n<answer> {answer} </answer>"
-                )
+                cot_str = f"<think>\n{cot.strip()}\n</think>\n\n"
+                response_str = cot_str + f"<answer> {answer} </answer>"
                 response_ids = tokenizer.encode(response_str).ids
+                cot_len = len(tokenizer.encode(cot_str).ids)
 
                 full_ids = prompt_ids + response_ids + [eos_token_id]
 
@@ -131,6 +134,7 @@ def _load_sft_data(
                         "response_ids": response_ids,
                         "full_ids": full_ids,
                         "prefix_len": len(prompt_ids),
+                        "cot_len": cot_len,
                     }
                 )
 
@@ -147,13 +151,11 @@ def _load_sft_data(
 
 
 def _build_sft_batch(
-    examples: list[dict],
-    pad_token_id: int,
-    device: torch.device,
+    examples: list[dict], pad_token_id: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build a padded batch from SFT examples.
 
-    Returns (input_ids, loss_mask).
+    Returns (input_ids, loss_mask)
     """
     max_len = max(len(ex["full_ids"]) for ex in examples)
 
@@ -166,12 +168,13 @@ def _build_sft_batch(
     prefix_lens = torch.tensor(
         [ex["prefix_len"] for ex in examples], dtype=torch.long, device=device
     )
-    actual_lens = torch.tensor(
+
+    end_lens = torch.tensor(
         [len(ex["full_ids"]) for ex in examples], dtype=torch.long, device=device
     )
     positions = torch.arange(max_len, device=device).unsqueeze(0)
     loss_mask = (positions >= prefix_lens.unsqueeze(1)) & (
-        positions < actual_lens.unsqueeze(1)
+        positions < end_lens.unsqueeze(1)
     )
 
     return input_ids, loss_mask
@@ -239,6 +242,7 @@ def train_sft_inverse_cot_countdown(
     train_data = by_split.get("train", [])
     val_data = by_split.get("val", [])
 
+    mix_train: list[dict] = []
     if sft_params.mix_rollout_artifact is not None:
         from dialectic.experiments.arg_parser import resolve_artifact_glob as _resolve
 
@@ -251,9 +255,10 @@ def train_sft_inverse_cot_countdown(
         )
         mix_train = mix_split.get("train", [])
         log.info(
-            f"Mixing {len(mix_train)} rollout examples with {len(train_data)} q-cot examples"
+            f"Mixing {len(mix_train)} rollout examples with {len(train_data)} q-cot examples "
+            f"(mix_ratio={sft_params.mix_ratio}: {sft_params.mix_ratio:.0%} q-cot, "
+            f"{1 - sft_params.mix_ratio:.0%} rollout per batch)"
         )
-        train_data = train_data + mix_train
 
     if not train_data:
         raise ValueError("No training data found")
@@ -307,14 +312,27 @@ def train_sft_inverse_cot_countdown(
         opt.zero_grad()
 
         total_loss_val = 0.0
+        total_kl_val = 0.0
         local_episodes = 0
 
         for _ in range(sft_params.accumulation_steps):
-            indices = torch.randint(len(train_data), (local_batch_size,)).tolist()
-            batch_examples = [train_data[i] for i in indices]
+            if mix_train:
+                n_q = max(1, int(local_batch_size * sft_params.mix_ratio))
+                n_p = local_batch_size - n_q
+                q_indices = torch.randint(len(train_data), (n_q,)).tolist()
+                p_indices = torch.randint(len(mix_train), (n_p,)).tolist()
+                batch_examples = [train_data[i] for i in q_indices] + [
+                    mix_train[i] for i in p_indices
+                ]
+            else:
+                indices = torch.randint(len(train_data), (local_batch_size,)).tolist()
+                batch_examples = [train_data[i] for i in indices]
 
             input_ids, loss_mask = _build_sft_batch(
-                batch_examples, model_info.pad_token_id, device
+                batch_examples,
+                model_info.pad_token_id,
+                device,
+                cot_only_loss=sft_params.cot_only_loss,
             )
 
             logits = p(input_ids, return_all_logits=True)
@@ -358,10 +376,13 @@ def train_sft_inverse_cot_countdown(
 
             masked_loss = per_token_loss * shift_mask
             seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
-            loss = (masked_loss.sum(dim=1) / seq_lengths).mean()
+            nll_loss = (masked_loss.sum(dim=1) / seq_lengths).mean()
 
-            (loss / sft_params.accumulation_steps).backward()
-            total_loss_val += loss.item()
+            (nll_loss / sft_params.accumulation_steps).backward()
+
+            kl_loss_val = 0.0
+            total_loss_val += nll_loss.item()
+            total_kl_val += kl_loss_val
             local_episodes += local_batch_size
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -370,13 +391,16 @@ def train_sft_inverse_cot_countdown(
         opt.step()
 
         global_episodes = local_episodes * world_size
+        metrics = {
+            "train/nll_loss": total_loss_val / sft_params.accumulation_steps,
+            "train/grad_norm": grad_norm,
+            "train/episodes": global_episodes,
+        }
+
+        metrics["train/loss"] = total_loss_val / sft_params.accumulation_steps
         return StepFunctionReturn(
             n_episodes_processed=global_episodes,
-            metrics={
-                "train/loss": total_loss_val / sft_params.accumulation_steps,
-                "train/grad_norm": grad_norm,
-                "train/episodes": global_episodes,
-            },
+            metrics=metrics,
         )
 
     def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
@@ -415,7 +439,7 @@ def train_sft_inverse_cot_countdown(
                 n_batches += 1
             component_means["val_loss"] = total_val_loss / max(n_batches, 1)
 
-        # Accuracy: have p generate from scratch on val prompts
+        # Accuracy: have p generate from scratch on val prompts via vLLM
         examples: list[extty.Example] = []
         if val_prompts:
             eval_prompts = val_prompts[:max_val]
@@ -432,49 +456,6 @@ def train_sft_inverse_cot_countdown(
             )
             component_means["accuracy"] = baseline_result.accuracy
             component_means["hard_accuracy"] = baseline_result.hard_accuracy
-
-            # Qualitative examples: generate from p on first few val prompts
-            n_examples = min(20, len(eval_prompts))
-            example_prompts = eval_prompts[:n_examples]
-            max_prompt_len = max(len(pr.prompt_ids) for pr in example_prompts)
-            ex_ids = torch.full(
-                (n_examples, max_prompt_len), model_info.pad_token_id, device=device
-            )
-            ex_mask = torch.zeros(
-                n_examples, max_prompt_len, dtype=torch.bool, device=device
-            )
-            for i, pr in enumerate(example_prompts):
-                offset = max_prompt_len - len(pr.prompt_ids)
-                ex_ids[i, offset:] = torch.tensor(pr.prompt_ids, device=device)
-                ex_mask[i, offset:] = True
-
-            with torch.no_grad():
-                ex_completions = generate_hard_tokens(
-                    net=p_raw,
-                    token_ids=ex_ids,
-                    sampling_strategy="sample"
-                    if sft_params.temperature > 0
-                    else "greedy",
-                    temperature=max(sft_params.temperature, 1e-6),
-                    eos_token_id=model_info.eos_token_id,
-                    pad_token_id=model_info.pad_token_id,
-                    max_tokens_generated=sft_params.max_tokens_generated,
-                    use_kv_cache=True,
-                    attention_mask=ex_mask,
-                    use_bf16=sft_params.use_bf16,
-                ).tokens
-            ex_strs = tokenizer.decode_batch(
-                ex_completions[:, max_prompt_len:].tolist()
-            )
-            for i in range(n_examples):
-                prompt_str = tokenizer.decode(example_prompts[i].prompt_ids)
-                examples.append(
-                    extty.Example(
-                        prompt=prompt_str,
-                        responses=[f"[p's generation] {ex_strs[i]}"],
-                        rewards=[{"equation": example_prompts[i].equation or ""}],
-                    )
-                )
 
         return EvaluationResult(
             n_episodes=max_val,

@@ -28,6 +28,7 @@ def load_rollout_artifacts(
     tokenizer: Tokenizer,
     max_cot_tokens: int | None = None,
     min_completions_per_prompt: int = 2,
+    filter_train_split: bool = True,
 ) -> dict[str, list[PreTokenizedPrompt]]:
     """Load rollout data from multiple artifacts, grouped by split.
 
@@ -127,7 +128,7 @@ def load_rollout_artifacts(
                 equation = equation.split("=")[0].strip()
             split = entry.get("split", "train")
 
-            if split == "train":
+            if split == "train" and filter_train_split:
                 has_correct = any(c.is_correct for c in completions)
                 has_incorrect = any(not c.is_correct for c in completions)
                 if (

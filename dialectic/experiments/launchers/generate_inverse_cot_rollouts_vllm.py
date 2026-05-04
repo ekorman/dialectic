@@ -137,6 +137,7 @@ def generate_inverse_cot_rollouts_vllm(
                 project=project,
                 run_name=run_name,
                 step=rollout_gen_params.start_ckpt_step,
+                load_optimizer=False,
             )["model_state_dict"]
         )
     net.eval()

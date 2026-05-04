@@ -8,8 +8,12 @@ from dialectic.experiments.params import InverseCotEvalParams
 from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
+from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
-from dialectic.rl.inverse_cot_eval import compute_baseline, compute_fcr
+from dialectic.rl.inverse_cot_eval import (
+    compute_fcr,
+    expressions_match,
+)
 
 
 @extty.experiment(project="eval-inverse-cot")
@@ -46,24 +50,84 @@ def eval_inverse_cot_countdown(
     p.eval()
 
     # Load data
-    by_split = load_rollout_artifacts(dataset_artifacts, tokenizer)
+    by_split = load_rollout_artifacts(
+        dataset_artifacts, tokenizer, filter_train_split=False
+    )
     prompts = by_split.get(eval_params.split, [])
     if not prompts:
         raise ValueError(f"No data found for split={eval_params.split}")
     log.info(f"Evaluating on {len(prompts)} prompts (split={eval_params.split})")
 
     if eval_params.baseline_only:
-        result = compute_baseline(
-            p=p,
-            prompts=prompts,
+        from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
+        from dialectic.rl.inverse_cot_eval import HARD_PROMPT_THRESHOLD, BaselineResult
+
+        llm = load_dialectic_qwen_as_vllm(
+            p,
             tokenizer=tokenizer,
             eos_token_id=model_info.eos_token_id,
             pad_token_id=model_info.pad_token_id,
-            max_tokens_generated=eval_params.max_tokens_generated,
-            batch_size=eval_params.batch_size,
-            use_bf16=eval_params.use_bf16,
-            temperature=eval_params.temperature,
-            n_samples=eval_params.n_samples,
+            max_model_len=eval_params.max_tokens_generated + 1024,
+            gpu_memory_utilization=0.90,
+            dtype="bfloat16" if eval_params.use_bf16 else "float16",
+            seed=eval_params.seed,
+        )
+        del p
+        torch.cuda.empty_cache()
+
+        from vllm import SamplingParams, TokensPrompt
+
+        baseline_prompts = [pr for pr in prompts if pr.equation is not None]
+        sampling_params = SamplingParams(
+            n=eval_params.n_samples,
+            temperature=eval_params.temperature if eval_params.temperature > 0 else 0.0,
+            max_tokens=eval_params.max_tokens_generated,
+            stop_token_ids=[model_info.eos_token_id],
+            seed=eval_params.seed,
+        )
+
+        vllm_outputs = llm.generate(
+            [TokensPrompt(prompt_token_ids=pr.prompt_ids) for pr in baseline_prompts],
+            sampling_params,
+            use_tqdm=True,
+        )
+
+        total = 0
+        correct = 0
+        hard_total = 0
+        hard_correct = 0
+
+        for pr, out in zip(baseline_prompts, vllm_outputs):
+            p_rate = (
+                sum(c.is_correct for c in pr.completions) / len(pr.completions)
+                if pr.completions
+                else 0.0
+            )
+            any_correct = False
+            for sample in out.outputs:
+                extracted = extract_from_answer_tags(sample.text)
+                if (
+                    extracted is not None
+                    and pr.equation is not None
+                    and expressions_match(extracted, pr.equation)
+                ):
+                    any_correct = True
+                    break
+
+            total += 1
+            if any_correct:
+                correct += 1
+            if p_rate <= HARD_PROMPT_THRESHOLD:
+                hard_total += 1
+                if any_correct:
+                    hard_correct += 1
+
+        result = BaselineResult(
+            accuracy=correct / max(total, 1),
+            total=total,
+            correct=correct,
+            hard_accuracy=hard_correct / max(hard_total, 1),
+            hard_total=hard_total,
         )
 
         n_label = (

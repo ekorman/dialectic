@@ -14,13 +14,10 @@ def expressions_match(pred: str, gt: str) -> bool:
     """Check if two arithmetic expressions evaluate to the same value."""
     try:
         gt_val = eval(gt, {"__builtins__": {}}, {})
-    except Exception:
-        return False
-    try:
         pred_val = eval(pred, {"__builtins__": {}}, {})
+        return abs(pred_val - gt_val) < 1e-6
     except Exception:
         return False
-    return abs(pred_val - gt_val) < 1e-6
 
 
 HARD_PROMPT_THRESHOLD = 0.25
