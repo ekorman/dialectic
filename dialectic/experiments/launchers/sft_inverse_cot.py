@@ -329,10 +329,7 @@ def train_sft_inverse_cot_countdown(
                 batch_examples = [train_data[i] for i in indices]
 
             input_ids, loss_mask = _build_sft_batch(
-                batch_examples,
-                model_info.pad_token_id,
-                device,
-                cot_only_loss=sft_params.cot_only_loss,
+                batch_examples, model_info.pad_token_id, device
             )
 
             logits = p(input_ids, return_all_logits=True)
