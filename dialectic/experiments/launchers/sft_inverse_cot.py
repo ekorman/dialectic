@@ -450,14 +450,26 @@ def train_sft_inverse_cot_countdown(
                 batch_size=sft_params.val_batch_size,
                 use_bf16=sft_params.use_bf16,
                 temperature=sft_params.temperature,
+                n_samples=sft_params.val_pass_at_n,
             )
-            component_means["accuracy"] = baseline_result.accuracy
-            component_means["hard_accuracy"] = baseline_result.hard_accuracy
+            n_label = (
+                f"pass@{sft_params.val_pass_at_n}"
+                if sft_params.val_pass_at_n > 1
+                else "accuracy"
+            )
+            component_means[n_label] = baseline_result.accuracy
+            component_means[f"hard_{n_label}"] = baseline_result.hard_accuracy
 
+        n_label = (
+            f"pass@{sft_params.val_pass_at_n}"
+            if sft_params.val_pass_at_n > 1
+            else "accuracy"
+        )
         return EvaluationResult(
             n_episodes=max_val,
             reward_mean=component_means.get(
-                "accuracy", component_means.get("val_loss", 0.0)
+                n_label,
+                component_means.get("accuracy", component_means.get("val_loss", 0.0)),
             ),
             reward_std=0.0,
             component_means=component_means,

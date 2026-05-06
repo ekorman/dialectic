@@ -198,6 +198,7 @@ class SftParams:
     warmup_steps: int = 0
     max_tokens_generated: int = 500
     val_rollout_artifact: str | None = None
+    val_pass_at_n: int = 1
     importance_weight: bool = False
     importance_eps: float = 0.2
     q_ckpt_run: str | None = None
