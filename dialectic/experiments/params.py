@@ -126,6 +126,10 @@ class InverseCotEvalParams:
     unfreeze_mlp: bool = False
     baseline_only: bool = False
     n_samples: int = 1
+    lora_rank: int | None = None
+    lora_alpha: float = 16.0
+    lora_target_modules: str = "all"
+    max_prompts: int | None = None
 
 
 @dataclass
@@ -199,11 +203,17 @@ class SftParams:
     max_tokens_generated: int = 500
     val_rollout_artifact: str | None = None
     val_pass_at_n: int = 1
+    freeze_embeddings: bool = False
     importance_weight: bool = False
     importance_eps: float = 0.2
     q_ckpt_run: str | None = None
     q_ckpt_step: int | None = None
     q_full_finetune: bool = False
+    lora_rank: int | None = None
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_modules: str = "all"
+    entropy_beta: float = 0.0
 
 
 @dataclass

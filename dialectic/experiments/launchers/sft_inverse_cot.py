@@ -218,20 +218,67 @@ def train_sft_inverse_cot_countdown(
     if is_distributed() and rank == 0:
         barrier()
 
-    trainable_params = list(p.parameters())
+    if sft_params.lora_rank is not None:
+        from dialectic.llm.lora import (
+            DEFAULT_TARGET_MODULES,
+            apply_lora,
+            freeze_base_params,
+        )
+
+        targets = DEFAULT_TARGET_MODULES
+        if sft_params.lora_target_modules == "attn":
+            targets = ("q_proj", "k_proj", "v_proj", "o_proj")
+        elif sft_params.lora_target_modules == "mlp":
+            targets = ("gate_proj", "up_proj", "down_proj")
+
+        apply_lora(
+            p,
+            rank=sft_params.lora_rank,
+            alpha=sft_params.lora_alpha,
+            dropout=sft_params.lora_dropout,
+            target_modules=targets,
+        )
+        freeze_base_params(p)
+
+    if sft_params.freeze_embeddings:
+        p.embed_tokens.requires_grad_(False)
+    trainable_params = [pa for pa in p.parameters() if pa.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=sft_params.lr)
+
+    scheduler = None
+    if sft_params.warmup_steps > 0:
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        warmup = LinearLR(
+            opt, start_factor=1e-8, end_factor=1.0, total_iters=sft_params.warmup_steps
+        )
+        total_steps = sft_params.max_episodes // (
+            sft_params.batch_size * sft_params.accumulation_steps
+        )
+        cosine = CosineAnnealingLR(
+            opt, T_max=max(total_steps - sft_params.warmup_steps, 1)
+        )
+        scheduler = SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[sft_params.warmup_steps]
+        )
+        log.info(
+            f"LR schedule: warmup {sft_params.warmup_steps} steps, cosine decay over {total_steps} total steps"
+        )
 
     p_raw = p
     if is_distributed():
         p = wrap_ddp(p, get_local_rank())
 
     total_params = sum(pa.numel() for pa in p_raw.parameters())
+    trainable_count = sum(pa.numel() for pa in trainable_params)
     log.info(
-        f"p total params: {total_params:,} "
+        f"p total params: {total_params:,}, trainable: {trainable_count:,} "
         f"(rank {rank}/{world_size}, local_batch_size={local_batch_size})"
     )
 
-    # Load SFT data
+    # Load SFT data (rank 0 downloads first, others wait for cache)
+    if is_distributed() and rank != 0:
+        barrier()
     by_split = _load_sft_data(
         dataset_artifacts,
         tokenizer,
@@ -259,6 +306,9 @@ def train_sft_inverse_cot_countdown(
             f"(mix_ratio={sft_params.mix_ratio}: {sft_params.mix_ratio:.0%} q-cot, "
             f"{1 - sft_params.mix_ratio:.0%} rollout per batch)"
         )
+
+    if is_distributed() and rank == 0:
+        barrier()
 
     if not train_data:
         raise ValueError("No training data found")
@@ -312,7 +362,7 @@ def train_sft_inverse_cot_countdown(
         opt.zero_grad()
 
         total_loss_val = 0.0
-        total_kl_val = 0.0
+        total_entropy_val = 0.0
         local_episodes = 0
 
         for _ in range(sft_params.accumulation_steps):
@@ -375,26 +425,40 @@ def train_sft_inverse_cot_countdown(
             seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
             nll_loss = (masked_loss.sum(dim=1) / seq_lengths).mean()
 
-            (nll_loss / sft_params.accumulation_steps).backward()
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            probs = log_probs.exp()
+            token_entropy = -(probs * log_probs).sum(dim=-1)
+            mean_entropy = (token_entropy * shift_mask).sum(dim=1) / seq_lengths
+            entropy_val = mean_entropy.mean().item()
 
-            kl_loss_val = 0.0
+            if sft_params.entropy_beta > 0:
+                loss = nll_loss - sft_params.entropy_beta * mean_entropy.mean()
+            else:
+                loss = nll_loss
+
+            (loss / sft_params.accumulation_steps).backward()
+
             total_loss_val += nll_loss.item()
-            total_kl_val += kl_loss_val
+            total_entropy_val += entropy_val
             local_episodes += local_batch_size
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
             trainable_params, sft_params.max_grad_norm
         ).item()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
 
         global_episodes = local_episodes * world_size
         metrics = {
             "train/nll_loss": total_loss_val / sft_params.accumulation_steps,
             "train/grad_norm": grad_norm,
             "train/episodes": global_episodes,
+            "train/lr": opt.param_groups[0]["lr"],
         }
 
         metrics["train/loss"] = total_loss_val / sft_params.accumulation_steps
+        metrics["train/entropy"] = total_entropy_val / sft_params.accumulation_steps
         return StepFunctionReturn(
             n_episodes_processed=global_episodes,
             metrics=metrics,
@@ -402,6 +466,21 @@ def train_sft_inverse_cot_countdown(
 
     def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
         p_raw.eval()
+
+        # Merge LoRA weights for faster generation, restore after
+        if sft_params.lora_rank is not None:
+            from dialectic.llm.lora import LoRALinear
+
+            lora_state: list[tuple[torch.nn.Module, str, LoRALinear]] = []
+            for _, module in p_raw.named_modules():
+                for attr_name, child in list(module.named_children()):
+                    if isinstance(child, LoRALinear):
+                        lora_state.append((module, attr_name, child))
+                        merged = child.base
+                        merged.weight.data += (
+                            child.scaling * child.lora_B.weight @ child.lora_A.weight
+                        )
+                        setattr(module, attr_name, merged)
 
         max_val = sft_params.val_episodes or max(len(val_data), len(val_prompts))
         component_means: dict[str, float] = {}
@@ -440,6 +519,8 @@ def train_sft_inverse_cot_countdown(
         examples: list[extty.Example] = []
         if val_prompts:
             eval_prompts = val_prompts[:max_val]
+            val_rng_state = torch.random.get_rng_state()
+            torch.manual_seed(42)
             baseline_result = compute_baseline(
                 p=p_raw,
                 prompts=eval_prompts,
@@ -459,12 +540,24 @@ def train_sft_inverse_cot_countdown(
             )
             component_means[n_label] = baseline_result.accuracy
             component_means[f"hard_{n_label}"] = baseline_result.hard_accuracy
+            torch.random.set_rng_state(val_rng_state)
 
         n_label = (
             f"pass@{sft_params.val_pass_at_n}"
             if sft_params.val_pass_at_n > 1
             else "accuracy"
         )
+        # Restore LoRA layers after val
+        if sft_params.lora_rank is not None:
+            for module, attr_name, lora_child in lora_state:
+                # Undo the merge
+                lora_child.base.weight.data -= (
+                    lora_child.scaling
+                    * lora_child.lora_B.weight
+                    @ lora_child.lora_A.weight
+                )
+                setattr(module, attr_name, lora_child)
+
         return EvaluationResult(
             n_episodes=max_val,
             reward_mean=component_means.get(

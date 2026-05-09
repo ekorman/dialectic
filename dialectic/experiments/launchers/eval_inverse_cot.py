@@ -43,7 +43,27 @@ def eval_inverse_cot_countdown(
     p_state.pop("_rng_torch", None)
     p_state.pop("_rng_python", None)
     p_state.pop("_rng_cuda", None)
-    p.load_state_dict(p_state)
+
+    if eval_params.lora_rank is not None:
+        from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
+
+        targets = DEFAULT_TARGET_MODULES
+        if eval_params.lora_target_modules == "attn":
+            targets = ("q_proj", "k_proj", "v_proj", "o_proj")
+        elif eval_params.lora_target_modules == "mlp":
+            targets = ("gate_proj", "up_proj", "down_proj")
+        apply_lora(
+            p,
+            rank=eval_params.lora_rank,
+            alpha=eval_params.lora_alpha,
+            target_modules=targets,
+        )
+        p.load_state_dict(p_state)
+        merge_lora(p)
+        log.info(f"Loaded and merged LoRA weights (rank={eval_params.lora_rank})")
+    else:
+        p.load_state_dict(p_state)
+
     dtype = torch.bfloat16 if eval_params.use_bf16 else torch.float32
     p = p.to(device=device, dtype=dtype)
     p.requires_grad_(False)
