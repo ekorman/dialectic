@@ -362,7 +362,6 @@ def train_sft_inverse_cot_countdown(
         opt.zero_grad()
 
         total_loss_val = 0.0
-        total_entropy_val = 0.0
         local_episodes = 0
 
         for _ in range(sft_params.accumulation_steps):
@@ -425,21 +424,11 @@ def train_sft_inverse_cot_countdown(
             seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
             nll_loss = (masked_loss.sum(dim=1) / seq_lengths).mean()
 
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            probs = log_probs.exp()
-            token_entropy = -(probs * log_probs).sum(dim=-1)
-            mean_entropy = (token_entropy * shift_mask).sum(dim=1) / seq_lengths
-            entropy_val = mean_entropy.mean().item()
-
-            if sft_params.entropy_beta > 0:
-                loss = nll_loss - sft_params.entropy_beta * mean_entropy.mean()
-            else:
-                loss = nll_loss
+            loss = nll_loss
 
             (loss / sft_params.accumulation_steps).backward()
 
             total_loss_val += nll_loss.item()
-            total_entropy_val += entropy_val
             local_episodes += local_batch_size
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -458,7 +447,7 @@ def train_sft_inverse_cot_countdown(
         }
 
         metrics["train/loss"] = total_loss_val / sft_params.accumulation_steps
-        metrics["train/entropy"] = total_entropy_val / sft_params.accumulation_steps
+
         return StepFunctionReturn(
             n_episodes_processed=global_episodes,
             metrics=metrics,

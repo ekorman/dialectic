@@ -207,7 +207,6 @@ class SftParams:
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
     lora_target_modules: str = "all"
-    entropy_beta: float = 0.0
 
 
 @dataclass
