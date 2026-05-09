@@ -76,171 +76,6 @@ def check_and_apply_prefill(
     return torch.cat([token_ids, new_tensors], -1), attention_mask
 
 
-class _HardGenerator:
-    def __init__(
-        self,
-        sampling_strategy: Literal["greedy", "sample"] | None = "sample",
-        temperature: float = 1.0,
-        eos_token_id: int = 151645,
-        pad_token_id: int = 151643,
-        prefill: PreFill | None = None,
-    ):
-        self.sampling_strategy = sampling_strategy
-        self.temperature = temperature
-        self.eos_token_id = eos_token_id
-        self.pad_token_id = pad_token_id
-        self.prefill = prefill
-
-    def init_state(
-        self,
-        initial_input: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ):
-        self.all_tokens = initial_input
-        self.device = initial_input.device
-        self.batch_size = initial_input.shape[0]
-        self.attention_mask = attention_mask
-        self._finished = torch.zeros(
-            initial_input.shape[0], dtype=torch.bool, device=self.device
-        )
-        self.n_generated = 0
-        if self.prefill is not None:
-            self.prefill = self.prefill.to(self.device)
-
-    def get_next_inputs(self, logits: Float[torch.Tensor, "B 1 V"]) -> bool:
-        if self.sampling_strategy == "greedy":
-            next_token = logits.argmax(-1)
-        else:
-            scaled_logits = logits / self.temperature
-            probs = torch.softmax(scaled_logits.squeeze(1).float(), dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-
-        next_token = torch.where(
-            self._finished.unsqueeze(-1),
-            torch.full_like(next_token, self.pad_token_id),
-            next_token,
-        )
-
-        self.all_tokens = torch.cat([self.all_tokens, next_token], 1)
-
-        self._finished = self._finished | (self.all_tokens[:, -1] == self.eos_token_id)
-        if self.finished:
-            return True
-
-        if self.attention_mask is not None:
-            new_mask = ~self._finished.unsqueeze(-1)
-            self.attention_mask = torch.cat([self.attention_mask, new_mask], 1)
-
-        if self.prefill:
-            self.all_tokens, self.attention_mask = check_and_apply_prefill(
-                token_ids=self.all_tokens,
-                prefill=self.prefill,
-                pad_token_id=self.pad_token_id,
-                attention_mask=self.attention_mask,
-            )
-
-            self._finished = self._finished | (
-                self.all_tokens[:, -1] == self.eos_token_id
-            )
-
-            if self.finished:
-                return True
-
-        return False
-
-    def generate(
-        self,
-        net: BaseTransformer,
-        token_ids: Int[Tensor, "B L"],
-        max_tokens_generated: int = sys.maxsize,
-        use_kv_cache: bool = True,
-        attention_mask: torch.Tensor | None = None,  # should be left-padded
-        use_bf16: bool = False,
-    ) -> HardTokenGeneratorOutput:
-        raw_net = unwrap_model(net)
-        if use_kv_cache:
-            kv_caches = [
-                KVCache(
-                    max_seq_len=max_tokens_generated
-                    * (1 + self._extra_tokens_per_step_bound)
-                    + token_ids.shape[1],
-                    num_heads=raw_net.attn_num_kv_heads,
-                    head_dim=raw_net.attn_head_d,
-                    device=next(raw_net.parameters()).device,
-                )
-                for _ in range(len(raw_net.layers))
-            ]
-        else:
-            kv_caches = None
-
-        device = token_ids.device
-        self.init_state(token_ids, attention_mask)
-        self.max_tokens_generated = max_tokens_generated
-
-        input_tokens = token_ids
-
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-        ):
-            while self.n_generated < max_tokens_generated:
-                logits: Float[torch.Tensor, "B 1 V"] = net(
-                    input_tokens,
-                    kv_caches=kv_caches,
-                    attention_mask=self.attention_mask,
-                )
-
-                prev_len = self.all_tokens.shape[1]
-                is_done = self.get_next_inputs(logits)
-
-                if is_done:
-                    break
-
-                if use_kv_cache:
-                    # When get_next_inputs adds >1 token (e.g. prefill), process
-                    # the intermediate ones through the model to keep the KV cache
-                    # in sync. Note: in batched generation, non-triggering elements
-                    # get pad tokens here which shifts their RoPE positions. This is
-                    # negligible for small fill lengths since the relative distances
-                    # between the element's own real tokens are preserved.
-                    n_new = self.all_tokens.shape[1] - prev_len
-                    for i in range(n_new - 1):
-                        mask = (
-                            self.attention_mask[:, : prev_len + i + 1]
-                            if self.attention_mask is not None
-                            else None
-                        )
-                        net(
-                            self.all_tokens[:, prev_len + i : prev_len + i + 1],
-                            kv_caches=kv_caches,
-                            attention_mask=mask,
-                        )
-                    input_tokens = self.all_tokens[:, -1:]
-                else:
-                    input_tokens = self.all_tokens
-
-                self.n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
-
-        # If we hit the generation limit before finishing, allow generators to
-        # append forced tokens (e.g., to trigger a hard-token switch).
-        if self.n_generated >= max_tokens_generated and not self.finished:
-            on_max_tokens_reached = getattr(self, "on_max_tokens_reached", None)
-            if callable(on_max_tokens_reached):
-                on_max_tokens_reached()
-        return HardTokenGeneratorOutput(
-            tokens=self.all_tokens, attention_mask=self.attention_mask
-        )
-
-    @property
-    def _extra_tokens_per_step_bound(self) -> int:
-        if self.prefill:
-            return len(self.prefill.filling)
-        return 0
-
-    @property
-    def finished(self) -> bool:
-        return bool(self._finished.all())
-
-
 @torch.inference_mode()
 def generate_hard_tokens(
     net: BaseTransformer,
@@ -261,15 +96,115 @@ def generate_hard_tokens(
     if pad_token_id is None:
         pad_token_id = eos_token_id
 
-    return _HardGenerator(
-        sampling_strategy=sampling_strategy,
-        temperature=temperature,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        prefill=prefill,
-    ).generate(
-        net, token_ids, max_tokens_generated, use_kv_cache, attention_mask, use_bf16
-    )
+    raw_net = unwrap_model(net)
+    device = token_ids.device
+    all_tokens = token_ids
+    finished = torch.zeros(token_ids.shape[0], dtype=torch.bool, device=device)
+    n_generated = 0
+    if prefill is not None:
+        prefill = prefill.to(device)
+        extra_tokens_per_step_bound = len(prefill.filling)
+    else:
+        extra_tokens_per_step_bound = 0
+
+    if use_kv_cache:
+        kv_caches = [
+            KVCache(
+                max_seq_len=max_tokens_generated * (1 + extra_tokens_per_step_bound)
+                + token_ids.shape[1],
+                num_heads=raw_net.attn_num_kv_heads,
+                head_dim=raw_net.attn_head_d,
+                device=next(raw_net.parameters()).device,
+            )
+            for _ in range(len(raw_net.layers))
+        ]
+    else:
+        kv_caches = None
+
+    def _get_next_inputs(logits: Float[torch.Tensor, "B 1 V"]) -> bool:
+        nonlocal finished, all_tokens, attention_mask
+
+        if sampling_strategy == "greedy":
+            next_token = logits.argmax(-1)
+        else:
+            scaled_logits = logits / temperature
+            probs = torch.softmax(scaled_logits.squeeze(1).float(), dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+        next_token = torch.where(
+            finished.unsqueeze(-1),
+            torch.full_like(next_token, pad_token_id),
+            next_token,
+        )
+
+        all_tokens = torch.cat([all_tokens, next_token], 1)
+
+        finished = finished | (all_tokens[:, -1] == eos_token_id)
+        if bool(finished.all()):
+            return True
+
+        if attention_mask is not None:
+            new_mask = ~finished.unsqueeze(-1)
+            attention_mask = torch.cat([attention_mask, new_mask], 1)
+
+        if prefill:
+            all_tokens, attention_mask = check_and_apply_prefill(
+                token_ids=all_tokens,
+                prefill=prefill,
+                pad_token_id=pad_token_id,
+                attention_mask=attention_mask,
+            )
+
+            finished = finished | (all_tokens[:, -1] == eos_token_id)
+
+            if bool(finished.all()):
+                return True
+
+        return False
+
+    input_tokens = token_ids
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+    ):
+        while n_generated < max_tokens_generated:
+            logits: Float[torch.Tensor, "B 1 V"] = net(
+                input_tokens,
+                kv_caches=kv_caches,
+                attention_mask=attention_mask,
+            )
+
+            prev_len = all_tokens.shape[1]
+            is_done = _get_next_inputs(logits)
+
+            if is_done:
+                break
+
+            if use_kv_cache:
+                # When get_next_inputs adds >1 token (e.g. prefill), process
+                # the intermediate ones through the model to keep the KV cache
+                # in sync. Note: in batched generation, non-triggering elements
+                # get pad tokens here which shifts their RoPE positions. This is
+                # negligible for small fill lengths since the relative distances
+                # between the element's own real tokens are preserved.
+                n_new = all_tokens.shape[1] - prev_len
+                for i in range(n_new - 1):
+                    mask = (
+                        attention_mask[:, : prev_len + i + 1]
+                        if attention_mask is not None
+                        else None
+                    )
+                    net(
+                        all_tokens[:, prev_len + i : prev_len + i + 1],
+                        kv_caches=kv_caches,
+                        attention_mask=mask,
+                    )
+                input_tokens = all_tokens[:, -1:]
+            else:
+                input_tokens = all_tokens
+
+            n_generated += 1  # counts generation steps, not tokens (prefill may add multiple per step)
+
+    return HardTokenGeneratorOutput(tokens=all_tokens, attention_mask=attention_mask)
 
 
 def generate_from_text(
