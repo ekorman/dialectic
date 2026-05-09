@@ -72,19 +72,22 @@ def train_loop(
                         state_dict=ckpt_state,
                         optimizer_state_dict=opt.state_dict(),
                     )
-                if val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes:
-                    log.info(f"Running evaluation at step {step}")
-                    raw_net = unwrap_model(net)
-                    was_training = raw_net.training
-                    raw_net.eval()
-                    val_start = time.perf_counter()
-                    val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
-                    val_time = time.perf_counter() - val_start
-                    if was_training:
-                        raw_net.train()
-                    val_metrics["val/time"] = val_time
-                    extty.log(val_metrics, step=step)
-                    log.info(f"Finished evaluation at step {step}")
+            should_val = (
+                val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes
+            )
+            if is_main_process() and should_val:
+                log.info(f"Running evaluation at step {step}")
+                raw_net = unwrap_model(net)
+                was_training = raw_net.training
+                raw_net.eval()
+                val_start = time.perf_counter()
+                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
+                val_time = time.perf_counter() - val_start
+                if was_training:
+                    raw_net.train()
+                val_metrics["val/time"] = val_time
+                extty.log(val_metrics, step=step)
+                log.info(f"Finished evaluation at step {step}")
             barrier()
 
             if _sigterm_received:
