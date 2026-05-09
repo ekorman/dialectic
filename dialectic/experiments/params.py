@@ -11,7 +11,7 @@ class TrainParams:
     accumulation_steps: int
     max_grad_norm: float
     max_episodes: int
-    max_tokens_generated: int  # seems optional for sum e.g. internal reasoning sftgert
+    max_tokens_generated: int
     compile_model: bool
     use_bf16: bool
     seed: int
@@ -45,12 +45,6 @@ class GRPOParams:
     mu: int = 1
     eps: float | None = None
     update_ref_net_batch_cadence: int | None = None
-
-
-@dataclass
-class SoftGRPOParams:
-    noise_std: float
-    normalize_soft_pdf_by_dim: bool
 
 
 @dataclass
