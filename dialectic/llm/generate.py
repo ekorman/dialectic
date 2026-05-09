@@ -121,9 +121,9 @@ def generate_hard_tokens(
     else:
         kv_caches = None
 
-    def _get_next_inputs(logits: Float[torch.Tensor, "B 1 V"]) -> bool:
-        nonlocal finished, all_tokens, attention_mask
-
+    def _update_state(
+        *, logits: Float[torch.Tensor, "B 1 V"], finished, all_tokens, attention_mask
+    ):
         if sampling_strategy == "greedy":
             next_token = logits.argmax(-1)
         else:
@@ -141,7 +141,7 @@ def generate_hard_tokens(
 
         finished = finished | (all_tokens[:, -1] == eos_token_id)
         if bool(finished.all()):
-            return True
+            return finished, all_tokens, attention_mask
 
         if attention_mask is not None:
             new_mask = ~finished.unsqueeze(-1)
@@ -157,10 +157,7 @@ def generate_hard_tokens(
 
             finished = finished | (all_tokens[:, -1] == eos_token_id)
 
-            if bool(finished.all()):
-                return True
-
-        return False
+        return finished, all_tokens, attention_mask
 
     input_tokens = token_ids
     with torch.autocast(
@@ -174,9 +171,14 @@ def generate_hard_tokens(
             )
 
             prev_len = all_tokens.shape[1]
-            is_done = _get_next_inputs(logits)
+            finished, all_tokens, attention_mask = _update_state(
+                logits=logits,
+                finished=finished,
+                all_tokens=all_tokens,
+                attention_mask=attention_mask,
+            )
 
-            if is_done:
+            if bool(finished.all()):
                 break
 
             if use_kv_cache:
