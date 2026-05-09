@@ -35,14 +35,6 @@ class HardTokenGeneratorOutput:
     attention_mask: Bool[torch.Tensor, "B L"] | None
 
 
-@dataclass
-class SoftTokenGeneratorOutput:
-    embeddings: Float[torch.Tensor, "B L D"]
-    shadow_ids: Int[torch.Tensor, "B L"]
-    attention_mask: Bool[torch.Tensor, "B L"] | None
-    hard_tokens_mask: Bool[torch.Tensor, "B L"]
-
-
 def check_and_apply_prefill(
     token_ids: Int[torch.Tensor, "B L"],
     prefill: PreFill,

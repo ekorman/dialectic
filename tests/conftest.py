@@ -21,7 +21,10 @@ def MockGenerateModel():
             self.embed_tokens = torch.nn.Embedding(vocab_size, 2)
 
         def forward(
-            self, input_ids, kv_caches=None, attention_mask=None, soft_token_noise=None
+            self,
+            input_ids,
+            kv_caches=None,
+            attention_mask=None,
         ):
             tokens = self.token_schedule[self.step].to(input_ids.device)
             self.step += 1

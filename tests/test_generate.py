@@ -5,7 +5,6 @@ from dialectic.llm.generate import (
     PreFill,
     check_and_apply_prefill,
     generate_hard_tokens,
-    generate_soft_tokens,
 )
 
 
@@ -86,75 +85,6 @@ def test_generate_from_tokens_preserves_eos_batch(MockGenerateModel):
         pad_token_id,
         eos_token_id,
     ]
-
-
-def test_generate_from_tokens_stopping_condition_partial_batch_soft(MockGenerateModel):
-    pad_token_id = 9
-    eos_token_id = 2
-    vocab_size = 12
-    token_ids = torch.tensor([[4, 5], [6, 7], [8, 9]])
-    token_schedule = [
-        torch.tensor([3, 4, eos_token_id]),
-        torch.tensor([5, 6, 7]),
-        torch.tensor([6, 7, 8]),
-        torch.tensor([7, 8, 9]),
-    ]
-
-    model = MockGenerateModel(
-        token_schedule=token_schedule, vocab_size=vocab_size
-    ).eval()
-
-    max_tokens_generated = 4
-    output = generate_soft_tokens(
-        net=model,
-        token_ids=token_ids,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-    )
-
-    assert output.shadow_ids.shape == torch.Size((3, 2 + max_tokens_generated))
-    generated_ids = output.shadow_ids[:, 2:]
-
-    assert generated_ids[2, 0] == eos_token_id
-    assert (generated_ids[2, 1:] == pad_token_id).all()
-
-    assert (generated_ids[:2] != pad_token_id).all()
-
-
-def test_generate_from_tokens_stopping_condition_full_batch_soft(MockGenerateModel):
-    pad_token_id = 8
-    eos_token_id = 2
-    vocab_size = 12
-    token_ids = torch.tensor([[4, 5], [6, 7], [8, 9]])
-    token_schedule = [
-        torch.tensor([eos_token_id, 5, 6]),
-        torch.tensor([7, eos_token_id, 8]),
-        torch.tensor([9, 10, eos_token_id]),
-    ]
-
-    model = MockGenerateModel(
-        token_schedule=token_schedule, vocab_size=vocab_size
-    ).eval()
-
-    max_tokens_generated = 5
-    output = generate_soft_tokens(
-        net=model,
-        token_ids=token_ids,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        max_tokens_generated=max_tokens_generated,
-        use_kv_cache=True,
-    )
-
-    assert output.shadow_ids.shape[1] < token_ids.shape[1] + max_tokens_generated
-    assert output.shadow_ids.shape == torch.Size((3, 5))
-    generated_ids = output.shadow_ids[:, 2:]
-
-    assert generated_ids[0].tolist() == [eos_token_id, pad_token_id, pad_token_id]
-    assert generated_ids[1].tolist() == [5, eos_token_id, pad_token_id]
-    assert generated_ids[2].tolist() == [6, 8, eos_token_id]
 
 
 def test_prefill_pos():
