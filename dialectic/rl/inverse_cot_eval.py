@@ -6,6 +6,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.inverse_cot import InverseCotModel
+from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import PreTokenizedPrompt
 
@@ -73,9 +74,15 @@ def compute_baseline(
     hard_total = 0
     hard_correct = 0
 
-    for batch_start in range(0, len(baseline_prompts), batch_size):
+    n_batches = (len(baseline_prompts) + batch_size - 1) // batch_size
+    for batch_idx, batch_start in enumerate(
+        range(0, len(baseline_prompts), batch_size)
+    ):
         batch = baseline_prompts[batch_start : batch_start + batch_size]
         B = len(batch)
+        log.info(
+            f"  val batch {batch_idx + 1}/{n_batches} ({batch_start}/{len(baseline_prompts)} prompts)"
+        )
 
         max_prompt_len = max(len(pr.prompt_ids) for pr in batch)
         token_ids = torch.full((B, max_prompt_len), pad_token_id, device=device)
