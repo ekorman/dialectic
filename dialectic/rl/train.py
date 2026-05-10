@@ -610,38 +610,6 @@ def create_grpo_step_fn(
                     )
                     / len(micro_batches)
                 }
-                if "hard_completion_ratio" in micro_batches[0]
-                else {}
-            ),
-            **(
-                {
-                    "train/hard_lp_mean": sum(
-                        mb["hard_lp_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/hard_lp_std": sum(mb["hard_lp_std"] for mb in micro_batches)
-                    / len(micro_batches),
-                    "train/soft_lp_mean": sum(
-                        mb["soft_lp_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/soft_lp_std": sum(mb["soft_lp_std"] for mb in micro_batches)
-                    / len(micro_batches),
-                    "train/gaussian_dist_mean": sum(
-                        mb["gaussian_dist_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/soft_tokens_per_seq": sum(
-                        mb["soft_tokens_per_seq"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/hard_tokens_per_seq": sum(
-                        mb["hard_tokens_per_seq"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                }
-                if "hard_lp_mean" in micro_batches[0]
-                else {}
             ),
             **{f"train/reward/{name}": mean for name, mean in component_means.items()},
         }
@@ -896,86 +864,6 @@ def _expand_attention_mask(
     full_mask[:, :l_prompt] = attention_mask
     full_mask = full_mask.unsqueeze(1).expand(-1, group_size, -1)
     return full_mask.reshape(batch_size * group_size, seq_len)
-
-
-def _compute_soft_log_probs_chunked(
-    *,
-    net: BaseTransformer,
-    stacked_embeddings: Float[torch.Tensor, "B G L D"],
-    stacked_shadow_ids: Integer[torch.Tensor, "B G L"],
-    stacked_masks: Bool[torch.Tensor, "B G L"],
-    attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    l_prompt: int,
-    noise_std: float,
-    temperature: float,
-    chunk_size: int,
-    normalize_soft_pdf_by_dim: bool,
-) -> Float[torch.Tensor, "B G L_c"]:
-    batch_size, group_size, seq_len, D = stacked_embeddings.shape
-    BG = batch_size * group_size
-    V = net.vocab_size
-
-    flat_embeddings = stacked_embeddings.view(BG, seq_len, D)
-    flat_shadow_ids = stacked_shadow_ids.view(BG, seq_len)
-
-    full_mask = _expand_attention_mask(attention_mask, batch_size, group_size, seq_len)
-
-    hidden_states = net(
-        flat_embeddings,
-        attention_mask=full_mask,
-        return_hidden_states=True,
-    )
-
-    completion_len = seq_len - l_prompt
-    hidden_for_completion = hidden_states[:, l_prompt - 1 : -1]
-    comp_shadow_ids = flat_shadow_ids[:, l_prompt:]
-    comp_embeddings = flat_embeddings[:, l_prompt:]
-    comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
-    W = net.embed_tokens.weight
-
-    if chunk_size == 0:
-        chunk_size = completion_len
-
-    log_probs_list = []
-    for chunk_start in range(0, completion_len, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, completion_len)
-
-        chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
-        chunk_logits = net.lm_head(chunk_hidden)
-        chunk_shadow_ids = comp_shadow_ids[:, chunk_start:chunk_end]
-        chunk_embeddings = comp_embeddings[:, chunk_start:chunk_end]
-        chunk_masks = comp_masks[:, chunk_start:chunk_end]
-
-        BG_c, L_chunk, _ = chunk_logits.shape
-
-        hard_lp = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG_c * L_chunk, V).float(),
-            chunk_shadow_ids.reshape(BG_c * L_chunk),
-            reduction="none",
-        ).reshape(BG_c, L_chunk)
-
-        device_type = chunk_embeddings.device.type
-        with torch.amp.autocast(device_type=device_type, enabled=False):
-            e_action = chunk_embeddings.float()
-            mu_new = (
-                torch.softmax(chunk_logits.float() / temperature, dim=-1) @ W.float()
-            )
-            soft_lp = -0.5 * ((e_action - mu_new) ** 2) / (noise_std**2)
-            if normalize_soft_pdf_by_dim:
-                soft_lp = soft_lp.mean(-1)
-            else:
-                soft_lp = soft_lp.sum(-1)
-
-        chunk_log_probs = torch.where(chunk_masks, hard_lp, soft_lp)
-        log_probs_list.append(chunk_log_probs)
-
-        del chunk_logits
-
-    log_probs_flat = torch.cat(log_probs_list, dim=1).view(
-        batch_size, group_size, completion_len
-    )
-
-    return log_probs_flat
 
 
 def make_per_cycle_backward_callback(

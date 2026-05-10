@@ -42,22 +42,6 @@ class RolloutBatch(Generic[T]):
     t_generation: float
 
 
-@dataclass
-class SoftRolloutBatch(Generic[T]):
-    env_responses: list[EnvResponse[T]]
-    prompts: list[str]
-    output_strs: list[list[str]]  # [G][B]
-    reward_results: list[list[RewardResult]]  # [G][B]
-    rewards: Float[torch.Tensor, "G B"]
-    completion_embeddings: list[Float[torch.Tensor, "B L D"]]  # len G
-    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]]  # len G
-    hard_tokens_mask: list[Bool[torch.Tensor, "B L"]]  # len G
-    noise_std: float
-    temperature: float
-    attention_mask: Bool[torch.Tensor, "B L_prompt"]
-    t_generation: float
-
-
 @torch.no_grad()
 def generate_rollout_batch(
     *,
