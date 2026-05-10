@@ -54,12 +54,6 @@ class RewardParams:
 
 
 @dataclass
-class MazeRewardParams:
-    validity_weight: float
-    distance_weight: float
-
-
-@dataclass
 class CountdownParams:
     n_larges: int | list[int]
     n_total: int | list[int]
@@ -124,34 +118,6 @@ class InverseCotEvalParams:
     lora_alpha: float = 16.0
     lora_target_modules: str = "all"
     max_prompts: int | None = None
-
-
-@dataclass
-class UnifiedInverseCotParams:
-    batch_size: int
-    lr: float
-    max_episodes: int
-    model_name: str
-    use_bf16: bool
-    group_size: int = 8
-    temperature: float = 1.0
-    max_tokens_generated: int = 500
-    max_grad_norm: float = 2.0
-    seed: int = 20
-    val_freq: int = 500
-    val_batch_size: int = 4
-    val_episodes: int | None = None
-    save_ckpt_freq: int = sys.maxsize
-    accumulation_steps: int = 1
-    contrastive_weight: float = 1.0
-    contrastive_margin: float = 1.0
-    forward_weight: float = 1.0
-    backward_weight: float = 1.0
-    backward_system_prompt: str = "You are given a problem and its answer. Generate step-by-step reasoning that derives the answer."
-    vllm_gpu_memory_utilization: float = 0.3
-    start_ckpt_run: str | None = None
-    start_ckpt_step: int | None = None
-    warmup_steps: int = 0
 
 
 @dataclass

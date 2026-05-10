@@ -18,7 +18,6 @@ from dialectic.distributed import (
 )
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import (
-    get_maze_env_reward_fn_extractor_val_envs,
     get_state_to_str,
     load_countdown_dataset_artifacts,
 )
@@ -26,7 +25,6 @@ from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import (
     BackwardParams,
     GRPOParams,
-    MazeRewardParams,
     RewardParams,
     TrainParams,
 )
@@ -38,7 +36,6 @@ from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.maze import MazeConfig
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import grpo_advantage, rloo_advantage, train_grpo
 
@@ -380,46 +377,9 @@ def train_grpo_countdown(
     )
 
 
-@extty.experiment(project="grpo-maze")
-def train_grpo_maze(
-    train_params: TrainParams,
-    grpo_params: GRPOParams,
-    reward_params: RewardParams,
-    maze_reward_params: MazeRewardParams,
-    maze_config: MazeConfig,
-    prompt_collection: PromptCollection,
-):
-    init_distributed()
-    rank = get_rank()
-
-    env, reward_fn, extractor, val_envs = get_maze_env_reward_fn_extractor_val_envs(
-        train_params=train_params,
-        reward_params=reward_params,
-        maze_reward_params=maze_reward_params,
-        maze_config=maze_config,
-        prompt_collection=prompt_collection,
-        env_seed=train_params.seed + rank * 10_000,
-    )
-
-    return _train_grpo(
-        train_params=train_params,
-        grpo_params=grpo_params,
-        env=env,
-        prompt_collection=prompt_collection,
-        reward_fn=reward_fn,
-        extractor=extractor,
-        val_envs=val_envs,
-    )
-
-
 if __name__ == "__main__":
     run_experiments_parser(
         [
-            Experiment(
-                env_name="maze",
-                fn=train_grpo_maze,
-                include_prompt_collection_id=True,
-            ),
             Experiment(
                 env_name="countdown",
                 fn=train_grpo_countdown,

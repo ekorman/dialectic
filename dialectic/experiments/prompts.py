@@ -35,16 +35,6 @@ class PromptCollection:
     assistant_prefill: str | None
 
 
-MAZE_INTERNAL_REASONING_PROMPT = PromptCollection(
-    system_prompt=None,
-    env_prompt=(
-        "Navigate the maze from Start to Goal. "
-        "Each line shows a cell and the directions you can move from it.\n\n"
-        "{maze}"
-    ),
-    assistant_prefill=None,
-)
-
 COUNTDOWN_INTERNAL_REASONING_PROMPT = PromptCollection(
     system_prompt=None,
     env_prompt=(
@@ -75,42 +65,6 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
             system_prompt=None,
             env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill=None,
-        ),
-    ],
-    "maze": [
-        PromptCollection(
-            system_prompt=None,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
-        ),
-        PromptCollection(
-            system_prompt=STHT_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill=None,
-        ),
-        PromptCollection(
-            system_prompt=SIMPLE_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill="Let me solve this step by step.",
         ),
     ],
     "math": [

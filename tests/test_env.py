@@ -3,13 +3,7 @@ import tempfile
 
 import pytest
 
-from dialectic.rl.env import (
-    ArithmeticEnv,
-    CountdownEnv,
-    EpisodeIsDoneError,
-    GSM8kEnv,
-    MazeEnv,
-)
+from dialectic.rl.env import ArithmeticEnv, CountdownEnv, EpisodeIsDoneError, GSM8kEnv
 from dialectic.rl.types import EnvResponse
 
 
@@ -186,57 +180,3 @@ class TestCountdownEnv:
             r2 = env2.reset()
             assert r1.data.numbers == r2.data.numbers
             assert r1.data.target == r2.data.target
-
-
-class TestMazeEnv:
-    def test_reset_returns_valid_response(self):
-        env = MazeEnv()
-        resp = env.reset()
-
-        assert resp.is_done
-        assert isinstance(resp.data.prompt, str)
-        assert "Maze" in resp.data.prompt
-        assert "Start:" in resp.data.prompt
-        assert "Goal:" in resp.data.prompt
-        assert resp.data.maze.solution_length > 0
-
-    def test_seed_reproducibility_at_reset(self):
-        env1 = MazeEnv()
-        env2 = MazeEnv()
-
-        resp1 = env1.reset(seed=42)
-        resp2 = env2.reset(seed=42)
-
-        assert resp1.data.maze.connections == resp2.data.maze.connections
-        assert resp1.data.maze.solution == resp2.data.maze.solution
-        assert resp1.data.prompt == resp2.data.prompt
-
-    def test_seed_reproducibility_at_init(self):
-        env1 = MazeEnv(seed=42)
-        env2 = MazeEnv(seed=42)
-
-        resps1 = [env1.reset() for _ in range(3)]
-        resps2 = [env2.reset() for _ in range(3)]
-
-        for r1, r2 in zip(resps1, resps2):
-            assert r1.data.maze.solution == r2.data.maze.solution
-
-    def test_step_raises(self):
-        env = MazeEnv()
-        env.reset()
-
-        with pytest.raises(EpisodeIsDoneError):
-            env.step(None)
-
-    def test_prompt_contains_maze_data(self):
-        env = MazeEnv()
-        resp = env.reset(seed=0)
-
-        assert "Path:" in resp.data.prompt
-        assert "(0,0)" in resp.data.prompt
-
-    def test_custom_prompt_template(self):
-        env = MazeEnv(prompt_template="Solve this:\n{maze}")
-        resp = env.reset()
-
-        assert resp.data.prompt.startswith("Solve this:")
