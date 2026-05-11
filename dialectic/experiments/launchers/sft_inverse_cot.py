@@ -1,4 +1,3 @@
-import copy
 import json
 import random
 
@@ -316,32 +315,6 @@ def train_sft_inverse_cot_countdown(
 
     # Load q for importance weighting
     q_model = None
-    if sft_params.importance_weight:
-        if sft_params.q_ckpt_run is None or sft_params.q_ckpt_step is None:
-            raise ValueError(
-                "--q-ckpt-run and --q-ckpt-step required with --importance-weight"
-            )
-
-        q_model = copy.deepcopy(p_raw)
-        for layer in q_model.layers:
-            layer.self_attn.causal = False
-
-        q_model = q_model.to(device=device, dtype=next(p_raw.parameters()).dtype)
-        q_project, q_run_name = sft_params.q_ckpt_run.split("/")
-        q_ckpt = extty.load_checkpoint_from(
-            project=q_project,
-            run_name=q_run_name,
-            step=sft_params.q_ckpt_step,
-            load_optimizer=False,
-        )
-        q_state = q_ckpt["model_state_dict"]
-        q_state.pop("_rng_torch", None)
-        q_state.pop("_rng_python", None)
-        q_state.pop("_rng_cuda", None)
-        q_model.load_state_dict(q_state)
-        q_model.eval()
-        q_model.requires_grad_(False)
-        log.info(f"Loaded q from {sft_params.q_ckpt_run} step {sft_params.q_ckpt_step}")
 
     # Load original rollout data for val accuracy evaluation
     val_prompts = []
