@@ -5,15 +5,11 @@ import torch
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.params import InverseCotEvalParams
-from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
-from dialectic.rl.inverse_cot_eval import (
-    compute_fcr,
-    expressions_match,
-)
+from dialectic.rl.inverse_cot_eval import compute_fcr, expressions_match
 
 
 @extty.experiment(project="eval-inverse-cot")
@@ -176,13 +172,10 @@ def eval_inverse_cot_countdown(
             )
         return
 
-    # Build q
-    if eval_params.full_finetune or eval_params.finetune_freeze_mlp:
-        q = copy.deepcopy(p)
-        for layer in q.layers:
-            layer.self_attn.causal = False
-    else:
-        q = InverseCotModel(p, unfreeze_mlp=eval_params.unfreeze_mlp)
+    q = copy.deepcopy(p)
+    for layer in q.layers:
+        layer.self_attn.causal = False
+
     q = q.to(device=device, dtype=dtype)
 
     # Load q checkpoint

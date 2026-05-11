@@ -1,14 +1,13 @@
-from typing import cast
-
 import torch
 import torch.nn.functional as F
 
 from dialectic.distributed import unwrap_model
-from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
+from dialectic.llm.base import BaseTransformer
+from dialectic.llm.inverse_cot import create_prefix_lm_mask
 
 
 def compute_nll_loss(
-    q: InverseCotModel,
+    q: BaseTransformer,
     input_ids: torch.Tensor,
     prefix_lengths: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -50,7 +49,7 @@ def compute_nll_loss(
 
 
 def compute_contrastive_loss(
-    q: InverseCotModel,
+    q: BaseTransformer,
     input_ids: torch.Tensor,
     prefix_lengths: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -105,7 +104,7 @@ def compute_contrastive_loss(
     hidden_states = q(
         input_ids, attention_mask=attention_mask, return_hidden_states=True
     )
-    raw_q = cast(InverseCotModel, unwrap_model(q))
+    raw_q = unwrap_model(q)
 
     shift_hidden = hidden_states[:, :-1]
     shift_targets = input_ids[:, 1:]

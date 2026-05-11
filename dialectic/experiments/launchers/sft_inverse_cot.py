@@ -1,3 +1,4 @@
+import copy
 import json
 import random
 
@@ -320,16 +321,11 @@ def train_sft_inverse_cot_countdown(
             raise ValueError(
                 "--q-ckpt-run and --q-ckpt-step required with --importance-weight"
             )
-        import copy
 
-        from dialectic.llm.inverse_cot import InverseCotModel
+        q_model = copy.deepcopy(p_raw)
+        for layer in q_model.layers:
+            layer.self_attn.causal = False
 
-        if sft_params.q_full_finetune:
-            q_model = copy.deepcopy(p_raw)
-            for layer in q_model.layers:
-                layer.self_attn.causal = False
-        else:
-            q_model = InverseCotModel(p_raw)
         q_model = q_model.to(device=device, dtype=next(p_raw.parameters()).dtype)
         q_project, q_run_name = sft_params.q_ckpt_run.split("/")
         q_ckpt = extty.load_checkpoint_from(

@@ -90,7 +90,6 @@ class InverseCotParams:
     train_group_size: int | None = None
     max_cot_tokens: int | None = None
     unfreeze_mlp: bool = False
-    full_finetune: bool = False
     finetune_freeze_mlp: bool = False
     forward_ckpt_run: str | None = None
     forward_ckpt_step: int | None = None
@@ -109,7 +108,6 @@ class InverseCotEvalParams:
     batch_size: int = 16
     max_tokens_generated: int = 500
     temperature: float = 0.7
-    full_finetune: bool = False
     finetune_freeze_mlp: bool = False
     unfreeze_mlp: bool = False
     baseline_only: bool = False
@@ -132,7 +130,6 @@ class GenerateQCotParams:
     max_tokens_generated: int = 500
     temperature: float = 0.3
     seed: int = 42
-    full_finetune: bool = False
     finetune_freeze_mlp: bool = False
     unfreeze_mlp: bool = False
 
@@ -168,7 +165,6 @@ class SftParams:
     importance_eps: float = 0.2
     q_ckpt_run: str | None = None
     q_ckpt_step: int | None = None
-    q_full_finetune: bool = False
     lora_rank: int | None = None
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0

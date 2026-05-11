@@ -11,7 +11,6 @@ from tqdm import tqdm
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.params import GenerateQCotParams
 from dialectic.llm.generate import generate_hard_tokens
-from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -48,13 +47,10 @@ def generate_q_cot_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    # Build q
-    if gen_params.full_finetune or gen_params.finetune_freeze_mlp:
-        q = copy.deepcopy(p)
-        for layer in q.layers:
-            layer.self_attn.causal = False
-    else:
-        q = InverseCotModel(p, unfreeze_mlp=gen_params.unfreeze_mlp)
+    q = copy.deepcopy(p)
+    for layer in q.layers:
+        layer.self_attn.causal = False
+
     q = q.to(device=device, dtype=dtype)
 
     # Load q checkpoint

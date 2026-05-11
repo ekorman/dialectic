@@ -1,3 +1,4 @@
+import copy
 import random
 
 import extty
@@ -19,7 +20,6 @@ from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import InverseCotParams, TrainParams
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.generate import generate_hard_tokens
-from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
@@ -93,20 +93,16 @@ def train_inverse_cot_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    if inverse_cot_params.full_finetune or inverse_cot_params.finetune_freeze_mlp:
-        import copy
-
-        q = copy.deepcopy(p)
-        q.requires_grad_(True)
-        q.embed_tokens.requires_grad_(False)
-        if inverse_cot_params.finetune_freeze_mlp:
-            for layer in q.layers:
-                layer.mlp.requires_grad_(False)
-                layer.post_attention_layernorm.requires_grad_(False)
+    q = copy.deepcopy(p)
+    q.requires_grad_(True)
+    q.embed_tokens.requires_grad_(False)
+    if inverse_cot_params.finetune_freeze_mlp:
         for layer in q.layers:
-            layer.self_attn.causal = False
-    else:
-        q = InverseCotModel(p, unfreeze_mlp=inverse_cot_params.unfreeze_mlp)
+            layer.mlp.requires_grad_(False)
+            layer.post_attention_layernorm.requires_grad_(False)
+    for layer in q.layers:
+        layer.self_attn.causal = False
+
     q.use_gradient_checkpointing = inverse_cot_params.gradient_checkpointing
     if inverse_cot_params.freeze_lm_head:
         q.lm_head.requires_grad_(False)

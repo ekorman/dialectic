@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.params import InverseCotEvalParams
-from dialectic.llm.inverse_cot import InverseCotModel, create_prefix_lm_mask
+from dialectic.llm.inverse_cot import create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -55,13 +55,10 @@ def eval_q_verifier_countdown(
     p.requires_grad_(False)
     p.eval()
 
-    # Build q
-    if eval_params.full_finetune or eval_params.finetune_freeze_mlp:
-        q = copy.deepcopy(p)
-        for layer in q.layers:
-            layer.self_attn.causal = False
-    else:
-        q = InverseCotModel(p, unfreeze_mlp=eval_params.unfreeze_mlp)
+    q = copy.deepcopy(p)
+    for layer in q.layers:
+        layer.self_attn.causal = False
+
     q = q.to(device=device, dtype=dtype)
 
     # Load q checkpoint

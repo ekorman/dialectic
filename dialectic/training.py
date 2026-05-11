@@ -10,7 +10,6 @@ from extty import Example
 
 from dialectic.distributed import barrier, is_main_process, unwrap_model
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.log import log
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
@@ -34,7 +33,7 @@ def train_loop(
     max_episodes: int,
     save_ckpt_freq: int,
     val_freq: int,
-    net: BaseTransformer | InverseCotModel,
+    net: BaseTransformer,
     opt: torch.optim.Optimizer,
     train_step: Callable[[int], StepFunctionReturn],
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],

@@ -5,7 +5,6 @@ from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.llm.generate import generate_hard_tokens
-from dialectic.llm.inverse_cot import InverseCotModel
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import PreTokenizedPrompt
@@ -154,7 +153,7 @@ def compute_baseline(
 def compute_fcr(
     *,
     p: BaseTransformer,
-    q: InverseCotModel,
+    q: BaseTransformer,
     prompts: list[PreTokenizedPrompt],
     tokenizer: Tokenizer,
     eos_token_id: int,
