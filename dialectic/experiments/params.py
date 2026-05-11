@@ -161,8 +161,6 @@ class SftParams:
     val_rollout_artifact: str | None = None
     val_pass_at_n: int = 1
     freeze_embeddings: bool = False
-    importance_weight: bool = False
-    importance_eps: float = 0.2
     q_ckpt_run: str | None = None
     q_ckpt_step: int | None = None
     lora_rank: int | None = None
