@@ -29,7 +29,7 @@ class TrainParams:
 @dataclass
 class GRPOParams:
     group_size: int
-    normalize_advantages: bool  # only used for grpo
+    normalize_advantages: bool
     normalize_by_sequence_length: bool
     beta: float
     mu: int = 1
