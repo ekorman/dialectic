@@ -96,10 +96,7 @@ def train_inverse_cot_countdown(
     q = copy.deepcopy(p)
     q.requires_grad_(True)
     q.embed_tokens.requires_grad_(False)
-    if inverse_cot_params.finetune_freeze_mlp:
-        for layer in q.layers:
-            layer.mlp.requires_grad_(False)
-            layer.post_attention_layernorm.requires_grad_(False)
+
     for layer in q.layers:
         layer.self_attn.causal = False
 
