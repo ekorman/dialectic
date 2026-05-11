@@ -60,17 +60,6 @@ class MathEnvParams:
 
 
 @dataclass
-class SingleStepSFTParams:
-    max_answer_tokens: int
-    normalize_by_sequence_length: bool
-
-
-@dataclass
-class MultiStepSFTParams:
-    normalize_by_sequence_length: bool
-
-
-@dataclass
 class InverseCotParams:
     normalize_by_sequence_length: bool
     freeze_lm_head: bool
