@@ -36,35 +36,33 @@ def _arg_type(tp):
     return tp
 
 
-def _add_dataclass_to_parser_(parser: argparse.ArgumentParser, dc: Type[T]) -> None:
+def _add_dataclass_to_parser_(
+    parser: argparse.ArgumentParser, name: str, dc: Type[T]
+) -> None:
     for f in fields(dc):
         arg_type = _arg_type(f.type)
+
+        arg_name = f"--{name}.{f.name.replace('_', '-')}"
 
         if arg_type is bool:
             default = f.default if f.default is not MISSING else False
             parser.add_argument(
-                f"--{f.name.replace('_', '-')}",
-                action=argparse.BooleanOptionalAction,
-                default=default,
+                arg_name, action=argparse.BooleanOptionalAction, default=default
             )
         else:
-            parser.add_argument(
-                f"--{f.name.replace('_', '-')}",
-                type=arg_type,
-                required=f.default is MISSING,
-            )
+            parser.add_argument(arg_name, type=arg_type, required=f.default is MISSING)
 
 
 def create_subparser(
     name: str,
     subparsers: argparse._SubParsersAction,
-    dcs: Sequence[Type[T]],
+    dcs: Sequence[tuple[str, Type[T]]],
     include_prompt_collection_id: bool,
     include_dataset_glob: bool = False,
 ):
     parser: argparse.ArgumentParser = subparsers.add_parser(name)
-    for dc in dcs:
-        _add_dataclass_to_parser_(parser, dc)
+    for name, dc in dcs:
+        _add_dataclass_to_parser_(parser, name, dc)
 
     if include_prompt_collection_id:
         parser.add_argument("--prompt-collection-id", type=int, required=True)
@@ -72,9 +70,9 @@ def create_subparser(
         parser.add_argument("--dataset-glob", type=str, nargs="+", required=True)
 
 
-def load_dc_from_arg_parser_args(dc: Type[T], args: argparse.Namespace) -> T:
+def load_dc_from_arg_parser_args(name: str, dc: Type[T], args: argparse.Namespace) -> T:
     def _get_value(field: Field):
-        val = getattr(args, field.name)
+        val = getattr(args, f"{name}.{field.name}")
         if val is None:
             val = field.default
         if field.type is bool and val is MISSING:
@@ -117,8 +115,8 @@ def _build_parser(
         parameters[None] = [
             p for p in sig.parameters.values() if not _should_exclude(p, ex)
         ]
-        for dc in [p.annotation for p in parameters[None]]:
-            _add_dataclass_to_parser_(parser, dc)
+        for name, dc in [(p.name, p.annotation) for p in parameters[None]]:
+            _add_dataclass_to_parser_(parser, name, dc)
         if ex.include_prompt_collection_id:
             parser.add_argument("--prompt-collection-id", type=int, required=True)
         if ex.include_dataset_glob:
@@ -135,7 +133,7 @@ def _build_parser(
             create_subparser(
                 name=ex.env_name,
                 subparsers=subparsers,
-                dcs=[p.annotation for p in parameters[ex.env_name]],
+                dcs=[(p.name, p.annotation) for p in parameters[ex.env_name]],
                 include_prompt_collection_id=ex.include_prompt_collection_id,
                 include_dataset_glob=ex.include_dataset_glob,
             )
@@ -167,7 +165,7 @@ def run_experiments_parser(experiments: list[Experiment]):
         ex = experiments[0]
         kwargs = {}
         for p in parameters[None]:
-            kwargs[p.name] = load_dc_from_arg_parser_args(p.annotation, args)
+            kwargs[p.name] = load_dc_from_arg_parser_args(p.name, p.annotation, args)
         _resolve_extra_args(ex, kwargs, None)
         return ex.fn(**kwargs)
 
@@ -176,6 +174,6 @@ def run_experiments_parser(experiments: list[Experiment]):
             kwargs = {}
             for p in parameters[ex.env_name]:
                 param_class = p.annotation
-                kwargs[p.name] = load_dc_from_arg_parser_args(param_class, args)
+                kwargs[p.name] = load_dc_from_arg_parser_args(p.name, param_class, args)
             _resolve_extra_args(ex, kwargs, ex.env_name)
             return ex.fn(**kwargs)
