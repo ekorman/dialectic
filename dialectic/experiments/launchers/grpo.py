@@ -32,7 +32,7 @@ from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.train import grpo_advantage, rloo_advantage, train_grpo
+from dialectic.rl.train import grpo_advantage, train_grpo
 
 
 def _resolve_val_episodes(val_episodes: int | None, val_envs: list[Env]) -> int:
@@ -66,16 +66,7 @@ def _train_grpo(
         )
     local_batch_size = batch_size // world_size
 
-    if grpo_params.advantage_fn_type == "grpo":
-        advantage_fn = partial(
-            grpo_advantage, normalize=grpo_params.normalize_advantages
-        )
-    elif grpo_params.advantage_fn_type == "rloo":
-        advantage_fn = rloo_advantage
-    else:
-        raise ValueError(
-            f"Got unknown advantage function type {grpo_params.advantage_fn_type}"
-        )
+    advantage_fn = partial(grpo_advantage, normalize=grpo_params.normalize_advantages)
 
     model_info = MODEL_REGISTRY[train_params.model_name]
     if is_distributed() and not is_main_process():

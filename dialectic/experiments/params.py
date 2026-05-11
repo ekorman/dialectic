@@ -29,7 +29,6 @@ class TrainParams:
 @dataclass
 class GRPOParams:
     group_size: int
-    advantage_fn_type: Literal["grpo", "rloo"]
     normalize_advantages: bool  # only used for grpo
     normalize_by_sequence_length: bool
     beta: float

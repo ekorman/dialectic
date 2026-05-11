@@ -6,7 +6,6 @@ from dialectic.rl.train import (
     compute_log_probs,
     compute_logits_of_group,
     grpo_advantage,
-    rloo_advantage,
     stack_and_pad,
 )
 
@@ -189,21 +188,5 @@ def test_grpo_advantage():
                     advs[j, i].item()
                     - ((rewards[j, i] - r_mean_at_batch) / r_std_at_batch).item()
                 )
-                < 1e-6
-            )
-
-
-def test_rloo_advantage():
-    g, b = 3, 4
-    rewards = torch.rand((g, b))
-
-    advs = rloo_advantage(rewards)
-    assert advs.shape == torch.Size((g, b))
-
-    for i in range(b):
-        for j in range(g):
-            sum_others = sum([rewards[k, i] for k in range(g) if k != j]).item()
-            assert (
-                abs(advs[j, i].item() - (rewards[j, i].item() - sum_others / (g - 1)))
                 < 1e-6
             )

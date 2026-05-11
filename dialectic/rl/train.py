@@ -206,13 +206,6 @@ def grpo_advantage(
     return rewards - mean
 
 
-def rloo_advantage(rewards: Float[torch.Tensor, "G B"]) -> Float[torch.Tensor, "G B"]:
-    G = rewards.shape[0]
-    if G == 1:
-        raise RuntimeError("Group size must be > 1 to use RLOO")
-    return G / (G - 1) * rewards - 1 / (G - 1) * rewards.sum(0, keepdim=True)
-
-
 def compute_grpo_loss(
     *,
     log_probs: Float[torch.Tensor, "B G L_new"],
