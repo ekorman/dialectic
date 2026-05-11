@@ -434,7 +434,6 @@ def create_grpo_step_fn(
     batch_size: int,
     group_size: int,
     normalize_by_sequence_length: bool,
-    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
     llm: "LLM | None" = None,
     accumulation_steps: int,
     max_grad_norm: float,
@@ -528,11 +527,6 @@ def create_grpo_step_fn(
 
                 scaled_loss = loss / accumulation_steps
                 scaled_loss.backward()
-
-                if backward_loss_fn is not None:
-                    bwd_loss, bwd_metrics = backward_loss_fn(micro_batch)
-                    (bwd_loss / accumulation_steps).backward()
-                    all_bwd_metrics.append(bwd_metrics)
 
                 total_loss += loss.item() / accumulation_steps
                 total_main_loss += main_loss / accumulation_steps
@@ -695,7 +689,6 @@ def _grpo_train_loop(
     val_envs: list[Env],
     val_freq: int = 0,
     warmup_steps: int = 0,
-    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
     llm: "LLM | None" = None,
 ) -> None:
     device = next(net.parameters()).device
@@ -718,7 +711,6 @@ def _grpo_train_loop(
         device=device,
         advantage_fn=advantage_fn,
         warmup_steps=warmup_steps,
-        backward_loss_fn=backward_loss_fn,
         llm=llm,
     )
 
@@ -766,7 +758,6 @@ def train_grpo(
     val_batch_size: int,
     val_freq: int = 0,
     warmup_steps: int = 0,
-    backward_loss_fn: Callable[[dict], tuple[torch.Tensor, dict]] | None = None,
     llm: "LLM | None" = None,
 ) -> None:
     if use_bf16:
@@ -841,7 +832,6 @@ def train_grpo(
         val_envs=val_envs,
         val_fn=val_fn,
         warmup_steps=warmup_steps,
-        backward_loss_fn=backward_loss_fn,
         llm=llm,
     )
 
@@ -864,84 +854,3 @@ def _expand_attention_mask(
     full_mask[:, :l_prompt] = attention_mask
     full_mask = full_mask.unsqueeze(1).expand(-1, group_size, -1)
     return full_mask.reshape(batch_size * group_size, seq_len)
-
-
-def make_per_cycle_backward_callback(
-    *,
-    B: int,
-    G: int,
-    advs: Float[torch.Tensor, "B G 1"],
-    completion_mask: Bool[torch.Tensor, "B G C"],
-    old_log_probs: Float[torch.Tensor, "B G C"] | None,
-    ref_log_probs: Float[torch.Tensor, "B G C"] | None,
-    beta: float,
-    eps: float | None,
-    normalize_by_sequence_length: bool,
-    loss_scale: float,
-    clip_ratio_c: float = 3.0,
-) -> Callable[[Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]]:
-    """Build a cycle_callback that computes per-cycle GRPO loss and calls backward.
-
-    This frees each cycle's autograd graph immediately, reducing peak memory
-    from O(C) cycles to O(1).
-    """
-    advs_bg = advs.squeeze(-1)  # [B, G]
-    if normalize_by_sequence_length:
-        seq_lengths = completion_mask.sum(dim=-1).clamp(min=1).float()  # [B, G]
-    else:
-        seq_lengths = torch.ones(B, G, device=advs.device)
-
-    def callback(
-        lp: Float[torch.Tensor, "B G"], cycle_idx: int
-    ) -> Float[torch.Tensor, "B G"]:
-        lp_bg = lp.view(B, G)
-        mask_c = completion_mask[:, :, cycle_idx]
-
-        if eps is not None and old_log_probs is not None:
-            ratio = (lp_bg - old_log_probs[:, :, cycle_idx]).exp()
-            unclipped = ratio * advs_bg
-            clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs_bg
-            main_obj = torch.min(unclipped, clipped)
-            dual_clip_obj = clip_ratio_c * advs_bg
-            main_obj = torch.where(
-                advs_bg < 0, torch.max(main_obj, dual_clip_obj), main_obj
-            )
-        else:
-            main_obj = lp_bg * advs_bg
-
-        cycle_loss = -(main_obj * mask_c / seq_lengths).mean()
-
-        if beta != 0 and ref_log_probs is not None:
-            kl_diff = torch.clamp(
-                ref_log_probs[:, :, cycle_idx] - lp_bg, min=-20, max=20
-            )
-            kl = torch.clamp(torch.exp(kl_diff) - kl_diff - 1, min=-10, max=10)
-            cycle_loss = cycle_loss + beta * (kl * mask_c / seq_lengths).mean()
-
-        (cycle_loss * loss_scale).backward()
-        return lp.detach()
-
-    return callback
-
-
-def _encode_prompts(
-    env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
-):
-    prompts = [state_to_str(er.data) for er in env_responses]
-    encoded = tokenizer.encode_batch(prompts)
-    max_prompt_len = max(len(e.ids) for e in encoded)
-    prompt_token_ids = torch.full(
-        (batch_size, max_prompt_len),
-        pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
-    attention_mask = torch.zeros(
-        batch_size, max_prompt_len, dtype=torch.bool, device=device
-    )
-    for b, enc in enumerate(encoded):
-        ids = torch.tensor(enc.ids, device=device)
-        prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-        attention_mask[b, max_prompt_len - len(ids) :] = True
-
-    return prompt_token_ids, attention_mask

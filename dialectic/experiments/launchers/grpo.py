@@ -22,12 +22,7 @@ from dialectic.experiments.envs import (
     load_countdown_dataset_artifacts,
 )
 from dialectic.experiments.models import load_model_and_opt
-from dialectic.experiments.params import (
-    BackwardParams,
-    GRPOParams,
-    RewardParams,
-    TrainParams,
-)
+from dialectic.experiments.params import GRPOParams, RewardParams, TrainParams
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.experiments.reward_fns import get_countdown_reward_fn
 from dialectic.llm.registry import MODEL_REGISTRY
@@ -48,153 +43,6 @@ def _resolve_val_episodes(val_episodes: int | None, val_envs: list[Env]) -> int:
     return sys.maxsize
 
 
-def _build_backward_loss_fn(
-    *,
-    net,
-    llm,
-    tokenizer,
-    model_info,
-    backward_params: BackwardParams,
-    prompt_collection: PromptCollection,
-    group_size: int,
-    device,
-):
-    from vllm import SamplingParams, TokensPrompt
-
-    from dialectic.experiments.envs import Message
-    from dialectic.rl.inverse_cot_loss import compute_contrastive_loss
-    from dialectic.rl.reward import _evaluate_and_verify_countdown
-
-    backward_system_prompt = backward_params.backward_system_prompt
-
-    def _make_backward_prompt(data) -> str:
-        msgs = []
-        msgs.append(Message(role="system", content=backward_system_prompt))
-        msgs.append(Message(role="user", content=data.prompt))
-        return model_info.format_messages(msgs, True)
-
-    def _backward_loss_fn(micro_batch: dict) -> tuple[torch.Tensor, dict]:
-        env_responses = micro_batch["env_responses"]
-        output_strs = micro_batch["output_strs"]
-        batch_size = len(env_responses)
-
-        # Extract correct/incorrect answers from forward rollouts
-        backward_prompts_list: list[str] = []
-        backward_is_correct: list[bool] = []
-        backward_group_boundaries: list[int] = []
-
-        for b in range(batch_size):
-            numbers = env_responses[b].data.numbers
-            target = env_responses[b].data.target
-            correct_answers: set[str] = set()
-            incorrect_answers: set[str] = set()
-
-            for g in range(group_size):
-                comp_str = output_strs[g][b]
-                extracted = extract_from_answer_tags(comp_str)
-                if extracted is None:
-                    continue
-                is_correct = _evaluate_and_verify_countdown(extracted, numbers, target)
-                if is_correct:
-                    correct_answers.add(extracted)
-                else:
-                    incorrect_answers.add(extracted)
-
-            if not correct_answers and not incorrect_answers:
-                continue
-
-            base_prompt = _make_backward_prompt(env_responses[b].data)
-            group_count = 0
-            for ans in correct_answers:
-                backward_prompts_list.append(base_prompt + f" <answer> {ans} </answer>")
-                backward_is_correct.append(True)
-                group_count += 1
-            for ans in incorrect_answers:
-                backward_prompts_list.append(base_prompt + f" <answer> {ans} </answer>")
-                backward_is_correct.append(False)
-                group_count += 1
-
-            prev = backward_group_boundaries[-1] if backward_group_boundaries else 0
-            backward_group_boundaries.append(prev + group_count)
-
-        zero = torch.tensor(0.0, device=device, requires_grad=True)
-        if not backward_prompts_list:
-            return zero, {"train/backward_loss": 0.0, "train/backward_n_prompts": 0}
-
-        # Generate backward CoTs via vLLM
-        tokenizer.no_padding()
-        tokenizer.no_truncation()
-        encs = tokenizer.encode_batch(backward_prompts_list)
-        prompt_token_ids = [list(e.ids) for e in encs]
-
-        sampling_params = SamplingParams(
-            n=1,
-            temperature=backward_params.backward_temperature,
-            max_tokens=500,
-            stop_token_ids=[model_info.eos_token_id],
-        )
-        vllm_outputs = llm.generate(
-            [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids],
-            sampling_params,
-            use_tqdm=False,
-        )
-        cot_strs = [out.outputs[0].text for out in vllm_outputs]
-
-        # Build backward training sequences
-        all_ids: list[list[int]] = []
-        all_prefix_lens: list[int] = []
-        for i, cot_str in enumerate(cot_strs):
-            p_ids = prompt_token_ids[i]
-            c_ids = list(tokenizer.encode(cot_str).ids)
-            all_ids.append(p_ids + c_ids + [model_info.eos_token_id])
-            all_prefix_lens.append(len(p_ids))
-
-        # Pad and build tensors
-        max_len = max(len(s) for s in all_ids)
-        padded = [s + [model_info.pad_token_id] * (max_len - len(s)) for s in all_ids]
-        input_ids = torch.tensor(padded, dtype=torch.long, device=device)
-        prefix_lengths = torch.tensor(all_prefix_lens, dtype=torch.long, device=device)
-        actual_lengths = torch.tensor(
-            [len(s) for s in all_ids], dtype=torch.long, device=device
-        )
-        positions = torch.arange(max_len, device=device).unsqueeze(0)
-        loss_mask = (positions >= prefix_lengths.unsqueeze(1)) & (
-            positions < actual_lengths.unsqueeze(1)
-        )
-        is_correct_t = torch.tensor(
-            backward_is_correct, dtype=torch.bool, device=device
-        )
-
-        group_sizes = []
-        prev = 0
-        for boundary in backward_group_boundaries:
-            group_sizes.append(boundary - prev)
-            prev = boundary
-
-        loss, metrics = compute_contrastive_loss(
-            net,
-            input_ids,
-            prefix_lengths,
-            loss_mask,
-            is_correct_t,
-            group_sizes,
-            contrastive_weight=backward_params.contrastive_weight,
-            contrastive_margin=backward_params.contrastive_margin,
-        )
-
-        scaled_loss = backward_params.backward_weight * loss
-        bwd_metrics = {
-            "train/backward_loss": scaled_loss.item(),
-            "train/backward_nll": metrics["train/nll"],
-            "train/backward_contrastive": metrics["train/contrastive_loss"],
-            "train/backward_gap": metrics.get("train/contrastive_gap", 0.0),
-            "train/backward_n_prompts": len(backward_prompts_list),
-        }
-        return scaled_loss, bwd_metrics
-
-    return _backward_loss_fn
-
-
 def _train_grpo(
     *,
     train_params: TrainParams,
@@ -204,7 +52,6 @@ def _train_grpo(
     reward_fn: RewardFn,
     extractor: Callable[[str], str | None],
     val_envs: list[Env],
-    backward_params: BackwardParams | None = None,
 ):
     init_distributed()
     rank = get_rank()
@@ -272,21 +119,6 @@ def _train_grpo(
         seed=train_params.seed + rank,
     )
 
-    bwd_loss_fn = None
-    if backward_params is not None and backward_params.backward_weight > 0:
-        from dialectic.distributed import unwrap_model
-
-        bwd_loss_fn = _build_backward_loss_fn(
-            net=unwrap_model(net),
-            llm=llm,
-            tokenizer=tokenizer,
-            model_info=model_info,
-            backward_params=backward_params,
-            prompt_collection=prompt_collection,
-            group_size=grpo_params.group_size,
-            device=device,
-        )
-
     train_grpo(
         net=net,
         opt=opt,
@@ -318,7 +150,6 @@ def _train_grpo(
         val_freq=train_params.val_freq,
         val_envs=val_envs,
         warmup_steps=train_params.warmup_steps,
-        backward_loss_fn=bwd_loss_fn,
         llm=llm,
     )
     cleanup()
@@ -330,7 +161,6 @@ def train_grpo_countdown(
     train_params: TrainParams,
     grpo_params: GRPOParams,
     reward_params: RewardParams,
-    backward_params: BackwardParams,
     prompt_collection: PromptCollection,
     dataset_artifacts: list[str],
 ):
@@ -372,7 +202,6 @@ def train_grpo_countdown(
         prompt_collection=prompt_collection,
         reward_fn=reward_fn,
         extractor=extract_from_answer_tags,
-        backward_params=backward_params,
         val_envs=val_envs,
     )
 
