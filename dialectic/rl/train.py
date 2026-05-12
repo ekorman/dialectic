@@ -590,14 +590,6 @@ def create_grpo_step_fn(
             "train/logprobs_time": t_logprobs_total,
             "train/optimization_time": t_opt,
             "train/lr": current_lr,
-            **(
-                {
-                    "train/hard_completion_ratio": sum(
-                        mb["hard_completion_ratio"] for mb in micro_batches
-                    )
-                    / len(micro_batches)
-                }
-            ),
             **{f"train/reward/{name}": mean for name, mean in component_means.items()},
         }
         if total_kl_loss is not None:
