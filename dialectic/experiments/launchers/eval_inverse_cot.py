@@ -11,6 +11,13 @@ from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
 from dialectic.rl.inverse_cot_eval import compute_fcr, expressions_match
 
+try:
+    from vllm import SamplingParams, TokensPrompt
+except ModuleNotFoundError:
+    log.error(
+        "vllm is required to run `eval_inverse_cot.py`. please make sure dialectic is installed with the vllm extra."
+    )
+
 
 @extty.experiment(project="eval-inverse-cot")
 def eval_inverse_cot_countdown(
@@ -90,8 +97,6 @@ def eval_inverse_cot_countdown(
         )
         del p
         torch.cuda.empty_cache()
-
-        from vllm import SamplingParams, TokensPrompt
 
         baseline_prompts = [pr for pr in prompts if pr.equation is not None]
         sampling_params = SamplingParams(
