@@ -1,7 +1,7 @@
 import re
 from typing import Callable, Protocol, Sequence
 
-from dialectic.rl.env import Countdown
+from dialectic.rl.env import Countdown, MathState
 from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
 
 RewardComponentFn = Callable[..., float]
@@ -107,6 +107,22 @@ def countdown_hybrid_correct(
         )
     except Exception:
         return 0.0
+
+
+# --- GSM8K-specific ---
+
+
+def gsm8k_correct(
+    *, env_response: EnvResponse[MathState], extracted_model_output: str | None, **_
+) -> float:
+    if extracted_model_output is None:
+        return 0.0
+    try:
+        predicted = float(extracted_model_output.replace(",", "").strip())
+        target = float(env_response.data.answer)
+    except (ValueError, TypeError):
+        return 0.0
+    return 1.0 if abs(predicted - target) < 1e-6 else 0.0
 
 
 # --- Generic (environment-agnostic) ---

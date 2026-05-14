@@ -111,36 +111,69 @@ class ArithmeticEnv(Env[QA[float], None]):
         raise EpisodeIsDoneError
 
 
-class GSM8kEnv(Env[QA[float], None]):
+class GSM8kEnv(Env["MathState", None]):
+    """
+    GSM8K grade-school math word problem environment.
+
+    Serves problems from a GSM8K-format JSONL file (each line a JSON object
+    with ``question`` and ``answer``, where ``answer`` ends with a
+    ``#### <number>`` line). Single-step episodes.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the GSM8K JSONL file.
+    prompt_template : str
+        Template applied to each question; must contain a ``{question}``
+        placeholder.
+    eval_mode : bool
+        If True, problems are served sequentially; otherwise sampled at random.
+    seed : int or None
+        Random seed used when sampling problems (ignored in eval mode).
+    """
+
     def __init__(
         self,
         *,
         path: str | Path,
+        prompt_template: str,
         eval_mode: bool,
+        seed: int | None = None,
     ):
         self.eval_mode = eval_mode
         self.path = path
+        self.prompt_template = prompt_template
         with open(path) as f:
             self.data = [json.loads(line) for line in f]
+        self._seed = seed
         if eval_mode:
             self._idx = 0
         else:
-            self.rng = random.Random()
+            self.rng = random.Random(seed)
 
     def reseed(self) -> None:
         if self.eval_mode:
             self._idx = 0
+        else:
+            self.rng = random.Random(self._seed)
 
-    def _get_question_and_answer(self, index: int) -> QA[float]:
+    def __str__(self) -> str:
+        return f"gsm8k_n{len(self.data)}"
+
+    def _get_state(self, index: int) -> "MathState":
         q = self.data[index]["question"]
         a = self.data[index]["answer"]
         m = re.search(r"####\s*([^\n]+)", a)
         if m is None:
             raise RuntimeError(f"Error extracting answer from {a}")
-        a = float(m.group(1).strip())
-        return QA(question=q, answer=a)
+        answer = m.group(1).strip().replace(",", "")
+        return MathState(
+            prompt=self.prompt_template.format(question=q),
+            answer=answer,
+            problem_type="gsm8k",
+        )
 
-    def reset(self, seed: int | None = None) -> EnvResponse[QA[float]]:
+    def reset(self, seed: int | None = None) -> EnvResponse["MathState"]:
         if self.eval_mode and seed is not None:
             raise ValueError("Should not pass a seed when in eval mode")
 
@@ -148,11 +181,11 @@ class GSM8kEnv(Env[QA[float], None]):
             index = self._idx
             self._idx += 1
         else:
-            self.rng = random.Random(seed)
+            if seed is not None:
+                self.rng = random.Random(seed)
             index = self.rng.randint(0, len(self.data) - 1)
 
-        qa = self._get_question_and_answer(index)
-        return EnvResponse(is_done=True, data=qa)
+        return EnvResponse(is_done=True, data=self._get_state(index))
 
     def step(self, action: None):
         raise EpisodeIsDoneError

@@ -35,6 +35,19 @@ class PromptCollection:
     assistant_prefill: str | None
 
 
+GSM8K_ENV_PROMPT_WITH_REASONING_TAGS = (
+    "{question}\n\n"
+    f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
+    "Put your final numerical answer in <answer></answer> tags, "
+    "for example <answer>42</answer>."
+)
+GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS = (
+    "{question}\n\n"
+    "Show your reasoning step by step. Put your final numerical answer in "
+    "<answer></answer> tags, for example <answer>42</answer>."
+)
+
+
 COUNTDOWN_INTERNAL_REASONING_PROMPT = PromptCollection(
     system_prompt=None,
     env_prompt=(
@@ -71,6 +84,23 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
         PromptCollection(
             system_prompt="Solve the math problem. Respond with only the numerical answer.",
             env_prompt="",
+            assistant_prefill=None,
+        ),
+    ],
+    "gsm8k": [
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=GSM8K_ENV_PROMPT_WITH_REASONING_TAGS,
+            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+        ),
+        PromptCollection(
+            system_prompt=SIMPLE_SYSTEM_PROMPT,
+            env_prompt=GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill="Let me solve this step by step.",
+        ),
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill=None,
         ),
     ],

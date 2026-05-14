@@ -51,6 +51,12 @@ class CountdownParams:
 
 
 @dataclass
+class GSM8kParams:
+    train_path: str
+    val_path: str | None = None
+
+
+@dataclass
 class MathEnvParams:
     difficulty: Literal["trivial", "easy", "medium"]
     direct_arithmetic_prob: float = 0.2

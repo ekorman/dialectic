@@ -22,14 +22,22 @@ from dialectic.experiments.envs import (
     load_countdown_dataset_artifacts,
 )
 from dialectic.experiments.models import load_model_and_opt
-from dialectic.experiments.params import GRPOParams, RewardParams, TrainParams
+from dialectic.experiments.params import (
+    GRPOParams,
+    GSM8kParams,
+    RewardParams,
+    TrainParams,
+)
 from dialectic.experiments.prompts import PromptCollection
-from dialectic.experiments.reward_fns import get_countdown_reward_fn
+from dialectic.experiments.reward_fns import (
+    get_countdown_reward_fn,
+    get_gsm8k_reward_fn,
+)
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.vllm_weight_sync import build_vllm_for_training
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
-from dialectic.rl.env import Env
+from dialectic.rl.env import Env, GSM8kEnv
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
 from dialectic.rl.train import grpo_advantage, train_grpo
@@ -38,8 +46,12 @@ from dialectic.rl.train import grpo_advantage, train_grpo
 def _resolve_val_episodes(val_episodes: int | None, val_envs: list[Env]) -> int:
     if val_episodes is not None:
         return val_episodes
-    if val_envs and hasattr(val_envs[0], "problems"):
-        return len(val_envs[0].problems)
+    if val_envs:
+        env0 = val_envs[0]
+        if hasattr(env0, "problems"):
+            return len(env0.problems)
+        if hasattr(env0, "data"):
+            return len(env0.data)
     return sys.maxsize
 
 
@@ -197,6 +209,57 @@ def train_grpo_countdown(
     )
 
 
+@extty.experiment(project="grpo-gsm8k")
+def train_grpo_gsm8k(
+    *,
+    train_params: TrainParams,
+    grpo_params: GRPOParams,
+    reward_params: RewardParams,
+    prompt_collection: PromptCollection,
+    gsm8k_params: GSM8kParams,
+):
+    init_distributed()
+    rank = get_rank()
+
+    env = GSM8kEnv(
+        path=gsm8k_params.train_path,
+        prompt_template=prompt_collection.env_prompt,
+        eval_mode=False,
+        seed=train_params.seed + rank * 10_000,
+    )
+    val_gsm8k_envs = (
+        [
+            GSM8kEnv(
+                path=gsm8k_params.val_path,
+                prompt_template=prompt_collection.env_prompt,
+                eval_mode=True,
+            )
+        ]
+        if gsm8k_params.val_path
+        else []
+    )
+    val_envs: list[Env] = list(val_gsm8k_envs)
+    log.info(
+        f"Train: {len(env.data)} problems"
+        + (f", Val: {len(val_gsm8k_envs[0].data)}" if val_gsm8k_envs else "")
+    )
+
+    reward_fn = get_gsm8k_reward_fn(
+        answer_tags_weight=reward_params.answer_tags_weight,
+        think_tags_weight=reward_params.think_tags_weight,
+    )
+
+    return _train_grpo(
+        train_params=train_params,
+        grpo_params=grpo_params,
+        env=env,
+        prompt_collection=prompt_collection,
+        reward_fn=reward_fn,
+        extractor=extract_from_answer_tags,
+        val_envs=val_envs,
+    )
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
@@ -205,6 +268,11 @@ if __name__ == "__main__":
                 fn=train_grpo_countdown,
                 include_prompt_collection_id=True,
                 include_dataset_glob=True,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=train_grpo_gsm8k,
+                include_prompt_collection_id=True,
             ),
         ]
     )
