@@ -95,39 +95,46 @@ def eval_q_verifier_countdown(
 
     correct_scores: list[float] = []
     incorrect_scores: list[float] = []
+    correct_cot_lens: list[int] = []
+    incorrect_cot_lens: list[int] = []
+    correct_has_answer_tag = 0
+    incorrect_has_answer_tag = 0
+    correct_wellformed_scores: list[float] = []
+    incorrect_wellformed_scores: list[float] = []
+    n_skipped_too_long = 0
     n_prompts_evaluated = 0
     best_of_n_correct = 0
     best_of_n_total = 0
     random_correct = 0
     random_total = 0
+    examples: list[extty.Example] = []
 
     for pr_idx, pr in enumerate(prompts):
         if not pr.completions or pr.equation is None:
             continue
 
+        prompt_str = tokenizer.decode(pr.prompt_ids)
+
         # Score each completion
-        scored_completions: list[tuple[float, bool]] = []
+        scored_completions: list[tuple[float, bool, str]] = []
 
         for comp in pr.completions:
-            # Extract answer from this completion
-            extracted = extract_from_answer_tags(
-                comp.answer if hasattr(comp, "answer") else ""
-            )
-            if extracted is None:
-                # Try to get answer from the answer_ids
-                answer_str = tokenizer.decode(comp.answer_ids)
-                extracted = extract_from_answer_tags(answer_str)
-                if extracted is None:
-                    extracted = answer_str.strip()
+            # Check if completion has valid, non-empty answer tags
+            answer_str = tokenizer.decode(comp.answer_ids)
+            cot_str = tokenizer.decode(comp.cot_ids)
+            extracted_answer = extract_from_answer_tags(answer_str)
+            has_answer_tag = extracted_answer is not None and len(extracted_answer) > 0
 
             # Build q's input: prompt + answer + CoT
             prefix_ids = pr.prompt_ids + comp.answer_ids
             cot_ids = comp.cot_ids
+            cot_len = len(cot_ids)
 
             full_ids = prefix_ids + cot_ids + [model_info.eos_token_id]
             prefix_len = len(prefix_ids)
 
             if len(full_ids) > 2048:
+                n_skipped_too_long += 1
                 continue
 
             input_tensor = torch.tensor([full_ids], dtype=torch.long, device=device)
@@ -150,12 +157,21 @@ def eval_q_verifier_countdown(
                 avg_log_prob = log_probs.mean().item()
 
             is_correct = comp.is_correct
-            scored_completions.append((avg_log_prob, is_correct))
+            response_str = f"[q_score={avg_log_prob:.3f}] [correct={is_correct}] [answer={answer_str}]\n{cot_str}"
+            scored_completions.append((avg_log_prob, is_correct, response_str))
 
             if is_correct:
                 correct_scores.append(avg_log_prob)
+                correct_cot_lens.append(cot_len)
+                if has_answer_tag:
+                    correct_has_answer_tag += 1
+                    correct_wellformed_scores.append(avg_log_prob)
             else:
                 incorrect_scores.append(avg_log_prob)
+                incorrect_cot_lens.append(cot_len)
+                if has_answer_tag:
+                    incorrect_has_answer_tag += 1
+                    incorrect_wellformed_scores.append(avg_log_prob)
 
         if not scored_completions:
             continue
@@ -175,6 +191,19 @@ def eval_q_verifier_countdown(
         random_total += 1
         if random_comp[1]:
             random_correct += 1
+
+        # Log examples: top 2 and bottom 2 by q score
+        if len(examples) < 20:
+            sorted_comps = sorted(scored_completions, key=lambda x: x[0], reverse=True)
+            shown = sorted_comps[:2] + sorted_comps[-2:]
+            examples.append(
+                extty.Example(
+                    prompt=prompt_str,
+                    responses=[c[2] for c in shown],
+                    rewards=[{"q_score": c[0], "correct": float(c[1])} for c in shown],
+                    groundtruth=pr.equation,
+                )
+            )
 
         if pr_idx % 50 == 0 and pr_idx > 0:
             log.info(
@@ -209,21 +238,67 @@ def eval_q_verifier_countdown(
         f"  Lift over random:                           {best_of_n_acc - random_acc:+.4f}"
     )
 
-    if extty.has_active_run():
-        extty.log(
-            {
-                "correct_score_mean": correct_mean,
-                "incorrect_score_mean": incorrect_mean,
-                "score_gap": gap,
-                "best_of_n_accuracy": best_of_n_acc,
-                "random_accuracy": random_acc,
-                "lift": best_of_n_acc - random_acc,
-                "n_correct_scores": len(correct_scores),
-                "n_incorrect_scores": len(incorrect_scores),
-                "n_prompts": n_prompts_evaluated,
-            },
-            step=0,
+    # Diagnostics
+    log.info("\nDiagnostics:")
+    log.info(f"  Skipped (too long): {n_skipped_too_long}")
+    log.info(
+        f"  Correct: {correct_has_answer_tag}/{len(correct_scores)} have answer tags "
+        f"({correct_has_answer_tag / max(len(correct_scores), 1):.0%})"
+    )
+    log.info(
+        f"  Incorrect: {incorrect_has_answer_tag}/{len(incorrect_scores)} have answer tags "
+        f"({incorrect_has_answer_tag / max(len(incorrect_scores), 1):.0%})"
+    )
+    avg_correct_cot = sum(correct_cot_lens) / max(len(correct_cot_lens), 1)
+    avg_incorrect_cot = sum(incorrect_cot_lens) / max(len(incorrect_cot_lens), 1)
+    log.info(
+        f"  Avg CoT length — correct: {avg_correct_cot:.0f}, incorrect: {avg_incorrect_cot:.0f}"
+    )
+
+    if correct_wellformed_scores and incorrect_wellformed_scores:
+        wf_correct_mean = sum(correct_wellformed_scores) / len(
+            correct_wellformed_scores
         )
+        wf_incorrect_mean = sum(incorrect_wellformed_scores) / len(
+            incorrect_wellformed_scores
+        )
+        wf_gap = wf_correct_mean - wf_incorrect_mean
+        log.info(
+            f"  Well-formed only — correct: {wf_correct_mean:.4f} (n={len(correct_wellformed_scores)}), "
+            f"incorrect: {wf_incorrect_mean:.4f} (n={len(incorrect_wellformed_scores)}), "
+            f"gap: {wf_gap:.4f}"
+        )
+
+    if extty.has_active_run():
+        metrics = {
+            "correct_score_mean": correct_mean,
+            "incorrect_score_mean": incorrect_mean,
+            "score_gap": gap,
+            "best_of_n_accuracy": best_of_n_acc,
+            "random_accuracy": random_acc,
+            "lift": best_of_n_acc - random_acc,
+            "n_correct_scores": len(correct_scores),
+            "n_incorrect_scores": len(incorrect_scores),
+            "n_prompts": n_prompts_evaluated,
+            "correct_answer_tag_pct": correct_has_answer_tag
+            / max(len(correct_scores), 1),
+            "incorrect_answer_tag_pct": incorrect_has_answer_tag
+            / max(len(incorrect_scores), 1),
+            "avg_correct_cot_len": avg_correct_cot,
+            "avg_incorrect_cot_len": avg_incorrect_cot,
+        }
+        if correct_wellformed_scores and incorrect_wellformed_scores:
+            metrics["wellformed_score_gap"] = wf_gap
+            metrics["wellformed_correct_mean"] = wf_correct_mean
+            metrics["wellformed_incorrect_mean"] = wf_incorrect_mean
+        if examples:
+            metrics["examples"] = extty.BatchExample(
+                prompts=[e.prompt for e in examples],
+                responses=[e.responses for e in examples],
+                rewards=[e.rewards for e in examples],
+                groundtruth=[e.groundtruth for e in examples],
+            )
+        extty.log(metrics, step=0)
 
 
 if __name__ == "__main__":
