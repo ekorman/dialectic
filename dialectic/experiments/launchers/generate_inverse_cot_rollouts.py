@@ -1,22 +1,29 @@
-"""vLLM-backed variant of ``generate_inverse_cot_rollouts``.
+"""vLLM-backed launcher for generating inverse-CoT rollout artifacts.
 
-Shares dataset loading, sharding, filtering and artifact upload with the
-pure-PyTorch launcher next door. The only differences are the generation
-backend (``vllm.LLM`` instead of ``generate_hard_tokens``) and the one-time
-checkpoint export that produces a HuggingFace-format directory for vLLM to
-read.
+The file is split into four layers so adding a new env costs only a small
+loader + an entry in ``__main__``:
 
-For a small model like Qwen3-0.6B this is typically 10–25× faster than the
-PyTorch path thanks to vLLM's continuous batching, PagedAttention, and
-automatic prefix-cache reuse across the ``group_size`` samples per prompt.
+1. Env-specific problem loaders (``_load_countdown_problems`` /
+   ``_load_gsm8k_problems``).
+2. Shared model + vLLM init (``_init_vllm_and_state_to_str``).
+3. Shared shard / generate / upload loop
+   (``_run_rollout_generation_loop``), which is env-agnostic and dispatches
+   grading via the caller-supplied ``filter_fn``.
+4. Thin ``@extty.experiment`` wrappers per env.
+
+For a small model like Qwen3-0.6B the vLLM backend is typically 10–25×
+faster than the PyTorch equivalent thanks to vLLM's continuous batching,
+PagedAttention, and automatic prefix-cache reuse across the ``group_size``
+samples per prompt.
 """
 
 import dataclasses
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import extty
 import torch
@@ -32,20 +39,26 @@ from dialectic.distributed import (
 )
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import get_state_to_str
-from dialectic.experiments.launchers._rollout_filter import filter_countdown_rollouts
-from dialectic.experiments.params import RolloutGenParams
+from dialectic.experiments.launchers._rollout_filter import (
+    filter_countdown_rollouts,
+    filter_gsm8k_rollouts,
+)
+from dialectic.experiments.params import GSM8kParams, RolloutGenParams
 from dialectic.experiments.prompts import PromptCollection
-from dialectic.llm.registry import MODEL_REGISTRY
+from dialectic.llm.registry import MODEL_REGISTRY, ModelInfo
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
-from dialectic.rl.env import Countdown
+from dialectic.rl.env import Countdown, MathState
 from dialectic.rl.types import EnvResponse
 
 if TYPE_CHECKING:
     from vllm import LLM
 
 
-def _load_dataset_problems(
+# --- Env-specific problem loaders -------------------------------------------
+
+
+def _load_countdown_problems(
     artifact_name: str,
     prompt_template: str,
 ) -> list[tuple[EnvResponse[Countdown], dict]]:
@@ -81,6 +94,49 @@ def _load_dataset_problems(
     return problems
 
 
+def _load_gsm8k_problems(
+    path: str,
+    prompt_template: str,
+    split: str,
+) -> list[tuple[EnvResponse[MathState], dict]]:
+    """Load GSM8K problems from a local JSONL, tag with split.
+
+    The parsed gold answer is stashed both in the ``MathState`` payload
+    (for grading by ``filter_gsm8k_rollouts``) and in the passthrough
+    ``equation`` field (so it lands in the emitted artifact's entry and
+    flows into ``PreTokenizedPrompt.equation`` downstream).
+    """
+    problems: list[tuple[EnvResponse[MathState], dict]] = []
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            question = entry["question"]
+            m = re.search(r"####\s*([^\n]+)", entry["answer"])
+            if m is None:
+                raise RuntimeError(f"Error extracting answer from {entry['answer']!r}")
+            answer_str = m.group(1).strip().replace(",", "")
+            problems.append(
+                (
+                    EnvResponse(
+                        is_done=True,
+                        data=MathState(
+                            prompt=prompt_template.format(question=question),
+                            answer=answer_str,
+                            problem_type="gsm8k",
+                        ),
+                    ),
+                    {"split": split, "equation": answer_str},
+                )
+            )
+    log.info(f"Loaded {len(problems)} problems from '{path}' (split={split})")
+    return problems
+
+
+# --- Shared init + generation loop ------------------------------------------
+
+
 def _vllm_generate_group(
     llm: "LLM",
     prompts: list[str],
@@ -110,16 +166,13 @@ def _vllm_generate_group(
     return completions_by_problem
 
 
-@extty.experiment(project="generate-inverse-cot-rollouts")
-def generate_inverse_cot_rollouts_vllm(
-    *,
+def _init_vllm_and_state_to_str(
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
-    dataset_artifacts: list[str],
-):
+) -> tuple["LLM", ModelInfo, Callable]:
+    """Build the per-rank vLLM engine + chat-formatted ``state_to_str``."""
     init_distributed()
     rank = get_rank()
-    world_size = get_world_size()
     torch.manual_seed(rollout_gen_params.seed + rank)
 
     model_info = MODEL_REGISTRY[rollout_gen_params.model_name]
@@ -138,7 +191,8 @@ def generate_inverse_cot_rollouts_vllm(
                 run_name=run_name,
                 step=rollout_gen_params.start_ckpt_step,
                 load_optimizer=False,
-            )["model_state_dict"]
+            )["model_state_dict"],
+            strict=False,
         )
     net.eval()
     net.requires_grad_(False)
@@ -149,19 +203,7 @@ def generate_inverse_cot_rollouts_vllm(
         assistant_prefill=prompt_collection.assistant_prefill,
     )
 
-    all_problems: list[tuple[EnvResponse[Countdown], dict]] = []
-    for artifact_name in dataset_artifacts:
-        all_problems.extend(
-            _load_dataset_problems(
-                artifact_name, prompt_template=prompt_collection.env_prompt
-            )
-        )
-    log.info(
-        f"Total: {len(all_problems)} problems from {len(dataset_artifacts)} artifact(s)"
-    )
-
     max_model_len = rollout_gen_params.max_tokens_generated + 1024
-
     llm = load_dialectic_qwen_as_vllm(
         net,
         tokenizer=tokenizer,
@@ -174,6 +216,28 @@ def generate_inverse_cot_rollouts_vllm(
     )
     del net
     torch.cuda.empty_cache()
+    return llm, model_info, state_to_str
+
+
+def _run_rollout_generation_loop(
+    *,
+    llm: "LLM",
+    model_info: ModelInfo,
+    state_to_str: Callable,
+    rollout_gen_params: RolloutGenParams,
+    prompt_collection: PromptCollection,
+    all_problems: list[tuple[EnvResponse, dict]],
+    filter_fn: Callable[..., list[dict]],
+) -> None:
+    """Env-agnostic shard / generate / filter / upload loop.
+
+    ``filter_fn`` must accept the same kwargs as ``filter_countdown_rollouts``
+    and ``filter_gsm8k_rollouts``; ``_rollout_filter`` exposes both with that
+    contract.
+    """
+    rank = get_rank()
+    world_size = get_world_size()
+    log.info(f"Total: {len(all_problems)} problems across {world_size} rank(s)")
 
     n_total = len(all_problems)
     n_shards = rollout_gen_params.n_shards
@@ -234,7 +298,7 @@ def generate_inverse_cot_rollouts_vllm(
                     seed=rollout_gen_params.seed + rank + shard_start + problem_idx,
                 )
 
-                kept = filter_countdown_rollouts(
+                kept = filter_fn(
                     prompts=batch_prompts,
                     env_responses=batch_responses,
                     extra_fields=batch_extra,
@@ -300,14 +364,83 @@ def generate_inverse_cot_rollouts_vllm(
     cleanup()
 
 
+# --- Experiment wrappers ----------------------------------------------------
+
+
+@extty.experiment(project="generate-inverse-cot-rollouts")
+def generate_inverse_cot_rollouts_vllm_countdown(
+    *,
+    rollout_gen_params: RolloutGenParams,
+    prompt_collection: PromptCollection,
+    dataset_artifacts: list[str],
+):
+    llm, model_info, state_to_str = _init_vllm_and_state_to_str(
+        rollout_gen_params, prompt_collection
+    )
+
+    all_problems: list[tuple[EnvResponse, dict]] = []
+    for artifact_name in dataset_artifacts:
+        all_problems.extend(
+            _load_countdown_problems(
+                artifact_name, prompt_template=prompt_collection.env_prompt
+            )
+        )
+
+    _run_rollout_generation_loop(
+        llm=llm,
+        model_info=model_info,
+        state_to_str=state_to_str,
+        rollout_gen_params=rollout_gen_params,
+        prompt_collection=prompt_collection,
+        all_problems=all_problems,
+        filter_fn=filter_countdown_rollouts,
+    )
+
+
+@extty.experiment(project="generate-inverse-cot-rollouts")
+def generate_inverse_cot_rollouts_vllm_gsm8k(
+    *,
+    rollout_gen_params: RolloutGenParams,
+    prompt_collection: PromptCollection,
+    gsm8k_params: GSM8kParams,
+):
+    llm, model_info, state_to_str = _init_vllm_and_state_to_str(
+        rollout_gen_params, prompt_collection
+    )
+
+    all_problems: list[tuple[EnvResponse, dict]] = _load_gsm8k_problems(
+        gsm8k_params.train_path, prompt_collection.env_prompt, "train"
+    )
+    if gsm8k_params.val_path:
+        all_problems += _load_gsm8k_problems(
+            gsm8k_params.val_path, prompt_collection.env_prompt, "val"
+        )
+
+    _run_rollout_generation_loop(
+        llm=llm,
+        model_info=model_info,
+        state_to_str=state_to_str,
+        rollout_gen_params=rollout_gen_params,
+        prompt_collection=prompt_collection,
+        all_problems=all_problems,
+        filter_fn=filter_gsm8k_rollouts,
+    )
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
             Experiment(
                 env_name="countdown",
-                fn=generate_inverse_cot_rollouts_vllm,
+                fn=generate_inverse_cot_rollouts_vllm_countdown,
                 include_prompt_collection_id=True,
                 include_dataset_glob=True,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=generate_inverse_cot_rollouts_vllm_gsm8k,
+                include_prompt_collection_id=True,
+                include_dataset_glob=False,
             ),
         ]
     )

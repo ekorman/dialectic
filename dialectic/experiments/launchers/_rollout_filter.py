@@ -1,15 +1,24 @@
 """Shared parsing / grading / group-filter logic for rollout launchers.
 
-Both the pure-PyTorch and vLLM-backed variants of the inverse-CoT rollout
-launcher call into this helper after their respective generation step. Keeping
-it here means both launchers agree on what counts as "kept" and what the
-per-batch log line looks like.
+The vLLM rollout launcher calls into this helper after its generation step.
+Each env (countdown, GSM8K, …) plugs in two callables:
+
+- ``grade_fn(env_response, extracted) -> bool`` — decides ``is_correct``
+  given the gold problem data and the string extracted from
+  ``<answer>…</answer>``.
+- ``entry_extra_fn(env_response) -> dict`` — emits env-specific fields
+  baked into the kept JSONL entry (e.g. countdown's ``numbers`` / ``target``).
+
+Everything else — parsing the completion into ``(cot, answer)``, counting
+per-batch stats, enforcing ``n_pos_min`` / ``n_neg_min``, building the
+output entry — is shared in ``_filter_rollouts``.
 """
 
 from dataclasses import dataclass
+from typing import Callable
 
 from dialectic.log import log
-from dialectic.rl.env import Countdown
+from dialectic.rl.env import Countdown, MathState
 from dialectic.rl.extractors import extract_from_answer_tags, parse_cot_and_answer
 from dialectic.rl.reward import _evaluate_and_verify_countdown
 from dialectic.rl.types import EnvResponse
@@ -22,23 +31,26 @@ class _BatchCounts:
     unparsed: int = 0
 
 
-def filter_countdown_rollouts(
+def _filter_rollouts(
     *,
     prompts: list[str],
-    env_responses: list[EnvResponse[Countdown]],
+    env_responses: list[EnvResponse],
     extra_fields: list[dict],
     completions_by_problem: list[list[str]],
     n_pos_min: int,
     n_neg_min: int,
+    grade_fn: Callable[[EnvResponse, str | None], bool],
+    entry_extra_fn: Callable[[EnvResponse], dict],
 ) -> list[dict]:
-    """Parse countdown rollouts and keep prompts with enough pos/neg samples.
+    """Parse a batch of rollouts and keep prompts with enough pos/neg samples.
 
     Parameters
     ----------
     prompts
         Chat-templated prompt strings, one per problem.
     env_responses
-        Per-problem ``Countdown`` env data (numbers + target).
+        Per-problem env data; passed through to ``grade_fn`` and
+        ``entry_extra_fn`` (the only two env-aware callbacks).
     extra_fields
         Passthrough dicts (e.g. ``split``, ``equation``) merged into the
         returned entries.
@@ -48,11 +60,11 @@ def filter_countdown_rollouts(
     n_pos_min, n_neg_min
         Minimum counts of correct / incorrect samples required for a prompt
         to be emitted.
-
-    Returns
-    -------
-    list[dict]
-        JSONL-ready entries for the kept prompts.
+    grade_fn
+        Returns whether the model's extracted ``<answer>…</answer>`` content
+        is correct for the given problem.
+    entry_extra_fn
+        Returns env-specific fields to embed in the emitted JSONL entry.
     """
     counts = _BatchCounts()
     kept: list[dict] = []
@@ -70,11 +82,7 @@ def filter_countdown_rollouts(
                 continue
 
             extracted = extract_from_answer_tags(comp_str)
-            is_correct = extracted is not None and _evaluate_and_verify_countdown(
-                extracted,
-                env_responses[b].data.numbers,
-                env_responses[b].data.target,
-            )
+            is_correct = grade_fn(env_responses[b], extracted)
             if is_correct:
                 counts.correct += 1
             else:
@@ -89,9 +97,8 @@ def filter_countdown_rollouts(
             kept.append(
                 {
                     "prompt_str": prompts[b],
-                    "numbers": env_responses[b].data.numbers,
-                    "target": env_responses[b].data.target,
                     "completions": group_completions,
+                    **entry_extra_fn(env_responses[b]),
                     **extra_fields[b],
                 }
             )
@@ -104,3 +111,68 @@ def filter_countdown_rollouts(
         f"{len(kept)}/{len(prompts)} prompts kept"
     )
     return kept
+
+
+def filter_countdown_rollouts(
+    *,
+    prompts: list[str],
+    env_responses: list[EnvResponse[Countdown]],
+    extra_fields: list[dict],
+    completions_by_problem: list[list[str]],
+    n_pos_min: int,
+    n_neg_min: int,
+) -> list[dict]:
+    """Countdown-flavored wrapper: grade by arithmetic-expression check."""
+    return _filter_rollouts(
+        prompts=prompts,
+        env_responses=env_responses,
+        extra_fields=extra_fields,
+        completions_by_problem=completions_by_problem,
+        n_pos_min=n_pos_min,
+        n_neg_min=n_neg_min,
+        grade_fn=lambda er, extracted: extracted is not None
+        and _evaluate_and_verify_countdown(extracted, er.data.numbers, er.data.target),
+        entry_extra_fn=lambda er: {
+            "numbers": er.data.numbers,
+            "target": er.data.target,
+        },
+    )
+
+
+def _gsm8k_correct(extracted: str | None, gold: str) -> bool:
+    if extracted is None:
+        return False
+    try:
+        predicted = float(extracted.replace(",", "").strip())
+        target = float(gold)
+    except (ValueError, TypeError):
+        return False
+    return abs(predicted - target) < 1e-6
+
+
+def filter_gsm8k_rollouts(
+    *,
+    prompts: list[str],
+    env_responses: list[EnvResponse[MathState]],
+    extra_fields: list[dict],
+    completions_by_problem: list[list[str]],
+    n_pos_min: int,
+    n_neg_min: int,
+) -> list[dict]:
+    """GSM8K-flavored wrapper: grade by numeric equality.
+
+    The gold answer string is also surfaced into the emitted entry via the
+    caller's ``extra_fields[b]["equation"]`` (see ``_load_gsm8k_problems`` in
+    ``generate_inverse_cot_rollouts_vllm``), so ``entry_extra_fn`` itself is
+    a no-op here.
+    """
+    return _filter_rollouts(
+        prompts=prompts,
+        env_responses=env_responses,
+        extra_fields=extra_fields,
+        completions_by_problem=completions_by_problem,
+        n_pos_min=n_pos_min,
+        n_neg_min=n_neg_min,
+        grade_fn=lambda er, extracted: _gsm8k_correct(extracted, er.data.answer),
+        entry_extra_fn=lambda _er: {},
+    )
