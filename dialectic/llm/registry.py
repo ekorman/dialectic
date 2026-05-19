@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from tokenizers import Tokenizer
+from torch import nn
 
 from dialectic.artifacts import Artifact, get_artifact
 from dialectic.llm.llama import (
@@ -25,7 +26,7 @@ class ModelInfo:
     pad_token_id: int
     format_messages: Callable[[list[Message], bool], str]
 
-    def load_net(self, **kwargs):
+    def load_net(self, **kwargs) -> nn.Module:
         return self.net_factory(**kwargs)
 
     def load_tokenizer(self) -> Tokenizer:
