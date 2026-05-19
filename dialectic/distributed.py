@@ -23,9 +23,21 @@ def init_distributed() -> bool:
     if "RANK" not in os.environ:
         return False
 
-    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+    # NCCL needs the per-rank CUDA device pinned BEFORE the first collective,
+    # otherwise the communicator is bound to the current device (cuda:0 on
+    # both ranks if `set_device` hasn't fired yet) and later collectives
+    # deadlock — that's the "Guessing device ID" warning PyTorch emits and
+    # what causes the barrier-before-DDP hang in launchers that fire a
+    # collective before `wrap_ddp` (which is the only call site that passes
+    # an explicit `device_ids`). Setting the device first AND passing
+    # `device_id` to `init_process_group` covers both PyTorch <2.4 and ≥2.4.
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        "nccl",
+        timeout=timedelta(minutes=30),
+        device_id=torch.device("cuda", local_rank),
+    )
     _distributed_active = True
     return True
 
