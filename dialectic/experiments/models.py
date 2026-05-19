@@ -17,6 +17,7 @@ def load_model_and_opt(
     compile_model: bool,
     load_opt: bool = True,
     lr: float | None = None,
+    weight_decay: float = 0.01,
     **kwargs,
 ) -> tuple[BaseTransformer, torch.optim.Optimizer | None]:
     model_info = MODEL_REGISTRY[model_name]
@@ -35,7 +36,7 @@ def load_model_and_opt(
             step=start_ckpt_step,
             load_optimizer=load_opt,
         )
-        net.load_state_dict(ckpt["model_state_dict"])
+        net.load_state_dict(ckpt["model_state_dict"], strict=False)
 
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -49,7 +50,7 @@ def load_model_and_opt(
     if load_opt:
         if lr is None:
             raise ValueError("lr must be set if `load_opt` is True")
-        opt = torch.optim.AdamW(net.parameters(), lr=lr)
+        opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
 
         if ckpt is not None and "optimizer_state_dict" in ckpt:
             opt.load_state_dict(ckpt["optimizer_state_dict"])

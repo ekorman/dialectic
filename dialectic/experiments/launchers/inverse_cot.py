@@ -20,6 +20,7 @@ from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import InverseCotParams, TrainParams
 from dialectic.experiments.prompts import PromptCollection
 from dialectic.llm.generate import generate_hard_tokens
+from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, freeze_base_params
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
@@ -36,14 +37,23 @@ from dialectic.rl.inverse_cot_loss import compute_contrastive_loss, compute_nll_
 from dialectic.training import StepFunctionReturn, train_loop
 
 
-@extty.experiment(project="inverse-cot-countdown")
-def train_inverse_cot_countdown(
+def _train_inverse_cot(
     *,
     train_params: TrainParams,
     inverse_cot_params: InverseCotParams,
     prompt_collection: PromptCollection,
     dataset_artifacts: list[str],
 ):
+    """Env-agnostic inverse-CoT training body.
+
+    Consumes pre-tokenized rollout artifacts via ``load_rollout_artifacts``;
+    no env-specific code paths in the training loop or ``_val_fn``. The
+    loader already enforces ``has_correct AND has_incorrect`` per train-split
+    prompt (see ``dialectic/rl/inverse_cot_data.py:131-140``), so rollout
+    artifacts generated with ``n_pos_min=0, n_neg_min=0`` (e.g. for eval
+    coverage) get correctly pruned to mixed prompts on the training side
+    while val keeps the all-correct / all-incorrect buckets needed by FCR.
+    """
     init_distributed()
     rank = get_rank()
     world_size = get_world_size()
@@ -53,6 +63,7 @@ def train_inverse_cot_countdown(
     torch.manual_seed(train_params.seed + rank)
     random.seed(train_params.seed + rank)
     device = get_device()
+    log.info(f"[rank {rank}/{world_size}] distributed init complete, device={device}")
 
     batch_size = train_params.batch_size
     if batch_size % world_size != 0:
@@ -77,7 +88,11 @@ def train_inverse_cot_countdown(
     # (via the extty cache), all ranks can load it independently without
     # racing on the download.
     if is_distributed() and not rank == 0:
+        log.info(f"[rank {rank}] waiting at pre-checkpoint barrier for rank 0 download")
         barrier()
+        log.info(f"[rank {rank}] released, loading forward model p from cache")
+    else:
+        log.info(f"[rank {rank}] loading forward model p (will populate cache)")
 
     p, _ = load_model_and_opt(
         model_name=train_params.model_name,
@@ -89,9 +104,11 @@ def train_inverse_cot_countdown(
         load_opt=False,
     )
     if is_distributed() and rank == 0:
+        log.info(f"[rank {rank}] download done, releasing post-checkpoint barrier")
         barrier()
     p.requires_grad_(False)
     p.eval()
+    log.info(f"[rank {rank}] forward model p loaded and frozen")
 
     q = copy.deepcopy(p)
     q.requires_grad_(True)
@@ -106,8 +123,44 @@ def train_inverse_cot_countdown(
     dtype = next(p.parameters()).dtype
     q = q.to(device=device, dtype=dtype)
 
+    # Apply LoRA AFTER `q.to(device, dtype)` so adapter layers inherit the
+    # right dtype/device from the base, and BEFORE the optimizer is built
+    # so `trainable_params` only collects adapter params. `freeze_base_params`
+    # overrides the earlier `requires_grad_` calls — when LoRA is on, only
+    # the LoRA A/B matrices train, regardless of `freeze_lm_head` (lm_head
+    # isn't a LoRA target so it gets frozen automatically).
+    if inverse_cot_params.lora_rank is not None:
+        if inverse_cot_params.lora_target_modules == "all":
+            lora_targets = DEFAULT_TARGET_MODULES
+        elif inverse_cot_params.lora_target_modules == "attn":
+            lora_targets = ("q_proj", "k_proj", "v_proj", "o_proj")
+        elif inverse_cot_params.lora_target_modules == "mlp":
+            lora_targets = ("gate_proj", "up_proj", "down_proj")
+        else:
+            raise ValueError(
+                f"Unknown lora_target_modules: {inverse_cot_params.lora_target_modules!r} "
+                "(expected 'all', 'attn', or 'mlp')"
+            )
+        apply_lora(
+            q,
+            rank=inverse_cot_params.lora_rank,
+            alpha=inverse_cot_params.lora_alpha,
+            dropout=inverse_cot_params.lora_dropout,
+            target_modules=lora_targets,
+        )
+        freeze_base_params(q)
+        log.info(
+            f"[rank {rank}] applied LoRA "
+            f"(rank={inverse_cot_params.lora_rank}, "
+            f"alpha={inverse_cot_params.lora_alpha}, "
+            f"dropout={inverse_cot_params.lora_dropout}, "
+            f"target={inverse_cot_params.lora_target_modules})"
+        )
+
     trainable_params = [param for param in q.parameters() if param.requires_grad]
-    opt = torch.optim.AdamW(trainable_params, lr=train_params.lr)
+    opt = torch.optim.AdamW(
+        trainable_params, lr=train_params.lr, weight_decay=train_params.weight_decay
+    )
 
     start_step = 0
     if train_params.start_ckpt_run is not None:
@@ -146,7 +199,9 @@ def train_inverse_cot_countdown(
     # all-reduce fires correctly on `.backward()`.
     q_raw = q
     if is_distributed():
+        log.info(f"[rank {rank}] entering DDP wrap (broadcasts initial q params)")
         q = wrap_ddp(q, get_local_rank())
+        log.info(f"[rank {rank}] DDP wrap complete")
 
     total_params = sum(param.numel() for param in q_raw.parameters())
     trainable_count = sum(param.numel() for param in trainable_params)
@@ -155,6 +210,7 @@ def train_inverse_cot_countdown(
         f"(rank {rank}/{world_size}, local_batch_size={local_batch_size})"
     )
 
+    log.info(f"[rank {rank}] loading {len(dataset_artifacts)} rollout artifact(s)")
     by_split = load_rollout_artifacts(
         dataset_artifacts,
         tokenizer,
@@ -167,6 +223,10 @@ def train_inverse_cot_countdown(
     )
     rollout_data = by_split.get("train", [])
     val_rollout_data = by_split.get("val", [])
+    log.info(
+        f"[rank {rank}] rollout data ready: "
+        f"train={len(rollout_data)} prompts, val={len(val_rollout_data)} prompts"
+    )
     if not rollout_data:
         raise ValueError("No training data found (split='train')")
 
@@ -183,7 +243,6 @@ def train_inverse_cot_countdown(
         total_metrics: dict[str, float] = {}
         local_episodes = 0
         max_seq_len = 0
-        max_batch_cost = 0
 
         # Sample all prompts for this step up front and subsample their
         # completions once, so we can length-sort across the full set
@@ -242,7 +301,6 @@ def train_inverse_cot_countdown(
 
             n, l = input_ids.shape
             max_seq_len = max(max_seq_len, l)
-            max_batch_cost = max(max_batch_cost, n * l * l)
             for k, v in step_metrics.items():
                 total_metrics[k] = total_metrics.get(k, 0.0) + v
             local_episodes += local_batch_size
@@ -266,7 +324,6 @@ def train_inverse_cot_countdown(
         metrics["train/episodes"] = global_episodes
         metrics["train/grad_norm"] = grad_norm
         metrics["train/max_seq_len"] = max_seq_len
-        metrics["train/max_batch_cost"] = max_batch_cost
         return StepFunctionReturn(n_episodes_processed=global_episodes, metrics=metrics)
 
     max_val = (
@@ -375,12 +432,16 @@ def train_inverse_cot_countdown(
 
             # qualitative examples (cap at 20). `build_contrastive_batch`
             # emits exactly `len(prompt.completions)` rows per prompt, so we
-            # can stride by the uniform group size to pick one example per
-            # prompt.
+            # walk the batch using its returned per-prompt `group_sizes`.
+            # The uniform-stride shortcut here used to assume every prompt
+            # had `train_group_size` completions, but on val splits where
+            # rollouts were generated with `n_pos_min=0`/`n_neg_min=0`
+            # (e.g. GSM8K), all-correct / all-incorrect prompts pass
+            # through `subsample_completions` unchanged and break that
+            # assumption — hence the per-prompt stride below.
             if len(examples) < 20:
                 ex_offset = 0
-                gs = len(batch_prompts[0].completions) if batch_prompts else 0
-                for prompt_data in batch_prompts:
+                for prompt_data, prompt_group_size in zip(batch_prompts, group_sizes):
                     if len(examples) >= 20:
                         break
                     prefix_len = prefix_lengths[ex_offset].item()
@@ -416,7 +477,7 @@ def train_inverse_cot_countdown(
                             ],
                         )
                     )
-                    ex_offset += gs
+                    ex_offset += prompt_group_size
 
             n_episodes += current_batch
 
@@ -465,6 +526,11 @@ def train_inverse_cot_countdown(
             },
         ), examples
 
+    log.info(
+        f"[rank {rank}] entering train_loop "
+        f"(start_step={start_step}, max_episodes={train_params.max_episodes}, "
+        f"val_freq={train_params.val_freq})"
+    )
     train_loop(
         max_episodes=train_params.max_episodes,
         save_ckpt_freq=train_params.save_ckpt_freq,
@@ -479,12 +545,50 @@ def train_inverse_cot_countdown(
     cleanup()
 
 
+@extty.experiment(project="inverse-cot-countdown")
+def train_inverse_cot_countdown(
+    *,
+    train_params: TrainParams,
+    inverse_cot_params: InverseCotParams,
+    prompt_collection: PromptCollection,
+    dataset_artifacts: list[str],
+):
+    return _train_inverse_cot(
+        train_params=train_params,
+        inverse_cot_params=inverse_cot_params,
+        prompt_collection=prompt_collection,
+        dataset_artifacts=dataset_artifacts,
+    )
+
+
+@extty.experiment(project="inverse-cot-gsm8k")
+def train_inverse_cot_gsm8k(
+    *,
+    train_params: TrainParams,
+    inverse_cot_params: InverseCotParams,
+    prompt_collection: PromptCollection,
+    dataset_artifacts: list[str],
+):
+    return _train_inverse_cot(
+        train_params=train_params,
+        inverse_cot_params=inverse_cot_params,
+        prompt_collection=prompt_collection,
+        dataset_artifacts=dataset_artifacts,
+    )
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
             Experiment(
                 env_name="countdown",
                 fn=train_inverse_cot_countdown,
+                include_prompt_collection_id=True,
+                include_dataset_glob=True,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=train_inverse_cot_gsm8k,
                 include_prompt_collection_id=True,
                 include_dataset_glob=True,
             ),

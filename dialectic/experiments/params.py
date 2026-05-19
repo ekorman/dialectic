@@ -24,6 +24,7 @@ class TrainParams:
     save_ckpt_freq: int = sys.maxsize
     logprob_chunk_size: int = 64
     warmup_steps: int = 0
+    weight_decay: float = 0.01
 
 
 @dataclass
@@ -76,6 +77,10 @@ class InverseCotParams:
     max_cot_tokens: int | None = None
     forward_ckpt_run: str | None = None
     forward_ckpt_step: int | None = None
+    lora_rank: int | None = None
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_modules: str = "all"
 
 
 @dataclass
