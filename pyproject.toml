@@ -22,6 +22,7 @@ dev = [
 ]
 modal = ["modal>=1.3.0.post1"]
 vllm = ["vllm>=0.9.0"]
+eval-q = ["scikit-learn>=1.5.0"]
 
 [build-system]
 requires = ["hatchling"]
