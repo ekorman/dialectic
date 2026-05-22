@@ -518,11 +518,11 @@ def _train_inverse_cot(
                 "nll_incorrect": nll_incorrect_mean,
                 "nll_shuffled": nll_shuffled_mean,
                 "fcr": fcr_result.fcr,
-                "fcr_all_incorrect": fcr_result.fcr_all_incorrect,
-                "fcr_n_all_incorrect": fcr_result.fcr_all_incorrect_total,
+                "fcr_on_all_incorrect": fcr_result.fcr_on_all_incorrect,
+                "n_on_all_incorrect": fcr_result.n_on_all_incorrect,
                 "p_baseline": fcr_result.p_baseline,
-                "fcr_hard": fcr_result.fcr_hard,
-                "fcr_hard_total": fcr_result.fcr_hard_total,
+                "fcr_on_hard": fcr_result.fcr_on_hard,
+                "n_on_hard": fcr_result.n_on_hard,
             },
         ), examples
 

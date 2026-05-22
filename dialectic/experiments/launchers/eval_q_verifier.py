@@ -5,16 +5,25 @@ For each prompt in the rollout data:
    - Compute q(CoT | extracted_answer, P) — log prob of the CoT under q conditioned on p's own answer
 2. Compare scores for correct vs incorrect completions
 3. Report: AUC, mean score gap, and accuracy of "pick highest q-score" as a selection strategy
+
+Correctness is read from the rollout artifact's ``is_correct`` flag, so this
+launcher is env-agnostic — same body for countdown and gsm8k.
 """
 
 import copy
+import random
 
 import extty
 import torch
 import torch.nn.functional as F
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
-from dialectic.experiments.params import InverseCotEvalParams
+from dialectic.experiments.launchers._eval_helpers import (
+    load_with_optional_lora,
+    resolve_eval_common_params,
+    strip_rng_state,
+)
+from dialectic.experiments.params import EvalCommonParams
 from dialectic.llm.inverse_cot import create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
@@ -22,35 +31,39 @@ from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
 
 
-@extty.experiment(project="eval-q-verifier")
-def eval_q_verifier_countdown(
+def _eval_q_verifier(
     *,
-    eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str],
-):
-    torch.manual_seed(eval_params.seed)
-    model_info = MODEL_REGISTRY[eval_params.model_name]
+    eval_params: EvalCommonParams,
+    dataset_artifacts: list[str] | None,
+) -> None:
+    cfg = resolve_eval_common_params(eval_params, dataset_artifacts)
+
+    torch.manual_seed(cfg.seed)
+    model_info = MODEL_REGISTRY[cfg.model_name]
     tokenizer = model_info.load_tokenizer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if eval_params.use_bf16 else torch.float32
+    dtype = torch.bfloat16 if cfg.use_bf16 else torch.float32
 
-    # Load p (for architecture reference)
-    log.info(
-        f"Loading p from {eval_params.forward_ckpt_run} step {eval_params.forward_ckpt_step}"
-    )
+    # Load p as the architecture base for q. Apply + merge any p-LoRA so the
+    # deepcopy below starts from the same weights p would serve.
+    log.info(f"Loading p from {cfg.forward_ckpt_run} step {cfg.forward_ckpt_step}")
     p = model_info.load_net(pretrained_weights=False)
-    project, run_name = eval_params.forward_ckpt_run.split("/")
+    p_project, p_run_name = cfg.forward_ckpt_run.split("/")
     p_ckpt = extty.load_checkpoint_from(
-        project=project,
-        run_name=run_name,
-        step=eval_params.forward_ckpt_step,
+        project=p_project,
+        run_name=p_run_name,
+        step=cfg.forward_ckpt_step,
         load_optimizer=False,
     )
     p_state = p_ckpt["model_state_dict"]
-    p_state.pop("_rng_torch", None)
-    p_state.pop("_rng_python", None)
-    p_state.pop("_rng_cuda", None)
-    p.load_state_dict(p_state)
+    strip_rng_state(p_state)
+    load_with_optional_lora(
+        p,
+        p_state,
+        lora_rank=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_target_modules=cfg.lora_target_modules,
+    )
     p = p.to(device=device, dtype=dtype)
     p.requires_grad_(False)
     p.eval()
@@ -58,37 +71,41 @@ def eval_q_verifier_countdown(
     q = copy.deepcopy(p)
     for layer in q.layers:
         layer.self_attn.causal = False
-
     q = q.to(device=device, dtype=dtype)
 
-    # Load q checkpoint
-    q_project, q_run_name = eval_params.q_ckpt_run.split("/")
+    log.info(f"Loading q from {cfg.q_ckpt_run} step {cfg.q_ckpt_step}")
+    q_project, q_run_name = cfg.q_ckpt_run.split("/")
     q_ckpt = extty.load_checkpoint_from(
         project=q_project,
         run_name=q_run_name,
-        step=eval_params.q_ckpt_step,
+        step=cfg.q_ckpt_step,
         load_optimizer=False,
     )
     q_state = q_ckpt["model_state_dict"]
-    q_state.pop("_rng_torch", None)
-    q_state.pop("_rng_python", None)
-    q_state.pop("_rng_cuda", None)
-    q.load_state_dict(q_state)
+    strip_rng_state(q_state)
+    load_with_optional_lora(
+        q,
+        q_state,
+        lora_rank=cfg.q_lora_rank,
+        lora_alpha=cfg.q_lora_alpha,
+        lora_target_modules=cfg.q_lora_target_modules,
+    )
     q.eval()
 
-    # Load data
-    by_split = load_rollout_artifacts(
-        dataset_artifacts, tokenizer, filter_train_split=False
-    )
-    prompts = by_split.get(eval_params.split, [])
-    if not prompts:
-        raise ValueError(f"No data found for split={eval_params.split}")
-    if eval_params.max_prompts is not None and len(prompts) > eval_params.max_prompts:
-        import random
+    # p is unused after deepcopy; free the GPU footprint
+    del p
+    torch.cuda.empty_cache()
 
-        rng = random.Random(eval_params.seed)
-        prompts = rng.sample(prompts, eval_params.max_prompts)
-    log.info(f"Evaluating on {len(prompts)} prompts (split={eval_params.split})")
+    by_split = load_rollout_artifacts(
+        cfg.dataset_artifacts, tokenizer, filter_train_split=False
+    )
+    prompts = by_split.get(cfg.split, [])
+    if not prompts:
+        raise ValueError(f"No data found for split={cfg.split}")
+    if cfg.max_prompts is not None and len(prompts) > cfg.max_prompts:
+        rng = random.Random(cfg.seed)
+        prompts = rng.sample(prompts, cfg.max_prompts)
+    log.info(f"Evaluating on {len(prompts)} prompts (split={cfg.split})")
 
     tokenizer.no_padding()
     tokenizer.no_truncation()
@@ -107,6 +124,7 @@ def eval_q_verifier_countdown(
     best_of_n_total = 0
     random_correct = 0
     random_total = 0
+    selection_rng = random.Random(cfg.seed + 1)
     examples: list[extty.Example] = []
 
     for pr_idx, pr in enumerate(prompts):
@@ -119,13 +137,11 @@ def eval_q_verifier_countdown(
         scored_completions: list[tuple[float, bool, str]] = []
 
         for comp in pr.completions:
-            # Check if completion has valid, non-empty answer tags
             answer_str = tokenizer.decode(comp.answer_ids)
             cot_str = tokenizer.decode(comp.cot_ids)
             extracted_answer = extract_from_answer_tags(answer_str)
             has_answer_tag = extracted_answer is not None and len(extracted_answer) > 0
 
-            # Build q's input: prompt + answer + CoT
             prefix_ids = pr.prompt_ids + comp.answer_ids
             cot_ids = comp.cot_ids
             cot_len = len(cot_ids)
@@ -184,15 +200,12 @@ def eval_q_verifier_countdown(
         if best_score_comp[1]:
             best_of_n_correct += 1
 
-        # Random baseline: pick a random completion
-        import random
-
-        random_comp = random.choice(scored_completions)
+        # Random baseline: pick a random completion (seeded for reproducibility)
+        random_comp = selection_rng.choice(scored_completions)
         random_total += 1
         if random_comp[1]:
             random_correct += 1
 
-        # Log examples: top 2 and bottom 2 by q score
         if len(examples) < 20:
             sorted_comps = sorted(scored_completions, key=lambda x: x[0], reverse=True)
             shown = sorted_comps[:2] + sorted_comps[-2:]
@@ -213,7 +226,6 @@ def eval_q_verifier_countdown(
                 f"best_of_n={best_of_n_correct}/{best_of_n_total}"
             )
 
-    # Results
     correct_mean = sum(correct_scores) / max(len(correct_scores), 1)
     incorrect_mean = sum(incorrect_scores) / max(len(incorrect_scores), 1)
     gap = correct_mean - incorrect_mean
@@ -238,7 +250,6 @@ def eval_q_verifier_countdown(
         f"  Lift over random:                           {best_of_n_acc - random_acc:+.4f}"
     )
 
-    # Diagnostics
     log.info("\nDiagnostics:")
     log.info(f"  Skipped (too long): {n_skipped_too_long}")
     log.info(
@@ -255,6 +266,9 @@ def eval_q_verifier_countdown(
         f"  Avg CoT length — correct: {avg_correct_cot:.0f}, incorrect: {avg_incorrect_cot:.0f}"
     )
 
+    wf_correct_mean = 0.0
+    wf_incorrect_mean = 0.0
+    wf_gap = 0.0
     if correct_wellformed_scores and incorrect_wellformed_scores:
         wf_correct_mean = sum(correct_wellformed_scores) / len(
             correct_wellformed_scores
@@ -270,7 +284,7 @@ def eval_q_verifier_countdown(
         )
 
     if extty.has_active_run():
-        metrics = {
+        metrics: dict = {
             "correct_score_mean": correct_mean,
             "incorrect_score_mean": incorrect_mean,
             "score_gap": gap,
@@ -301,6 +315,24 @@ def eval_q_verifier_countdown(
         extty.log(metrics, step=0)
 
 
+@extty.experiment(project="eval-q-verifier-countdown")
+def eval_q_verifier_countdown(
+    *,
+    eval_params: EvalCommonParams,
+    dataset_artifacts: list[str] | None = None,
+) -> None:
+    _eval_q_verifier(eval_params=eval_params, dataset_artifacts=dataset_artifacts)
+
+
+@extty.experiment(project="eval-q-verifier-gsm8k")
+def eval_q_verifier_gsm8k(
+    *,
+    eval_params: EvalCommonParams,
+    dataset_artifacts: list[str] | None = None,
+) -> None:
+    _eval_q_verifier(eval_params=eval_params, dataset_artifacts=dataset_artifacts)
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
@@ -309,6 +341,14 @@ if __name__ == "__main__":
                 fn=eval_q_verifier_countdown,
                 include_dataset_glob=True,
                 include_prompt_collection_id=False,
+                dataset_glob_required=False,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=eval_q_verifier_gsm8k,
+                include_dataset_glob=True,
+                include_prompt_collection_id=False,
+                dataset_glob_required=False,
             ),
         ]
     )

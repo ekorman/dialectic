@@ -84,8 +84,8 @@ class InverseCotParams:
 
 
 @dataclass
-class InverseCotEvalParams:
-    """FCR evaluator inputs.
+class EvalCommonParams:
+    """Shared CLI inputs for q-eval launchers.
 
     Only ``q_ckpt_run`` and ``q_ckpt_step`` are required from the CLI; every
     other field defaults to ``None`` and is auto-derived at launch time from
@@ -94,6 +94,9 @@ class InverseCotEvalParams:
     the p checkpoint). p's own LoRA settings are recursively pulled from the
     forward run's config when available. Any field passed on the CLI takes
     precedence over the derived value.
+
+    Launchers that need additional knobs (sampling temperature, vLLM
+    settings, etc.) subclass this and add them.
     """
 
     q_ckpt_run: str
@@ -110,11 +113,18 @@ class InverseCotEvalParams:
     q_lora_target_modules: str | None = None
     seed: int = 42
     split: str = "val"
+    max_prompts: int | None = None
+
+
+@dataclass
+class InverseCotEvalParams(EvalCommonParams):
+    """FCR evaluator inputs — adds the vLLM-sampling-specific knobs that the
+    q-verifier launcher doesn't need."""
+
     batch_size: int = 16
     max_tokens_generated: int = 500
     temperature: float = 0.7
     n_samples: int = 1
-    max_prompts: int | None = None
     gpu_memory_utilization: float = 0.45
 
 

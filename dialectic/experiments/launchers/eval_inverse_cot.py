@@ -1,14 +1,17 @@
 import copy
 import gc
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 
 import extty
 import torch
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
+from dialectic.experiments.launchers._eval_helpers import (
+    load_with_optional_lora,
+    resolve_inverse_cot_eval_params,
+    strip_rng_state,
+)
 from dialectic.experiments.params import InverseCotEvalParams
-from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
@@ -21,204 +24,6 @@ from dialectic.rl.inverse_cot_eval import (
     gsm8k_match,
 )
 
-
-@dataclass
-class _ResolvedEvalParams:
-    """Holds the post-resolution view of ``InverseCotEvalParams``: every
-    field is concrete (no ``None`` for derived values)."""
-
-    q_ckpt_run: str
-    q_ckpt_step: int
-    model_name: str
-    forward_ckpt_run: str
-    forward_ckpt_step: int
-    use_bf16: bool
-    lora_rank: int | None
-    lora_alpha: float
-    lora_target_modules: str
-    q_lora_rank: int | None
-    q_lora_alpha: float
-    q_lora_target_modules: str
-    dataset_artifacts: list[str]
-    seed: int
-    split: str
-    batch_size: int
-    max_tokens_generated: int
-    temperature: float
-    n_samples: int
-    max_prompts: int | None
-    gpu_memory_utilization: float
-
-
-def _load_run_config(ckpt_run: str) -> dict[str, Any] | None:
-    """Fetch a run's extty config; return ``None`` if the run isn't local."""
-    try:
-        project, name = ckpt_run.split("/", 1)
-    except ValueError:
-        log.warning(
-            f"Cannot parse run ref {ckpt_run!r} as 'project/name'; "
-            "skipping auto-derivation"
-        )
-        return None
-    try:
-        run_data = extty.get_run(project, name)
-    except FileNotFoundError:
-        log.warning(
-            f"Run {ckpt_run!r} not found locally; cannot auto-derive its config"
-        )
-        return None
-    return run_data.config
-
-
-def _pick_lora_section(config: dict[str, Any]) -> dict[str, Any]:
-    """Find the param section in a run config that carries lora settings.
-
-    GRPO's ``TrainParams`` has no LoRA fields, but SFT's ``SftParams`` and
-    inverse-cot's ``InverseCotParams`` do. Scan candidate sections in order
-    and return the first one with a ``lora_rank`` key; otherwise an empty
-    dict (no LoRA was used).
-    """
-    for section_name in ("inverse_cot_params", "sft_params", "train_params"):
-        section = config.get(section_name)
-        if isinstance(section, dict) and "lora_rank" in section:
-            return section
-    return {}
-
-
-def _resolve_eval_params(
-    eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str] | None,
-) -> _ResolvedEvalParams:
-    """Fill in every ``None`` field from the q run's extty config.
-
-    Strategy:
-    1. Load q's config from ``q_ckpt_run``. From it, take ``model_name``,
-       ``use_bf16``, the q-LoRA settings (``inverse_cot_params.lora_*``),
-       the forward-checkpoint reference, and the ``dataset_artifacts`` list
-       (the same rollout artifact q was trained on).
-    2. Load the forward run's config (the GRPO/SFT run that produced p).
-       Take p's LoRA settings from whichever param section has ``lora_rank``.
-    3. Any explicit value the user set on the CLI overrides the derived one.
-    """
-    q_config = _load_run_config(eval_params.q_ckpt_run)
-    if q_config is None:
-        raise ValueError(
-            f"Cannot auto-derive eval params: q run {eval_params.q_ckpt_run!r} "
-            "is not available locally. Either pull the run or specify all "
-            "required fields explicitly on the CLI."
-        )
-
-    q_train = q_config.get("train_params", {}) if isinstance(q_config, dict) else {}
-    q_icp = q_config.get("inverse_cot_params", {}) if isinstance(q_config, dict) else {}
-
-    model_name = eval_params.model_name or q_train.get("model_name")
-    if model_name is None:
-        raise ValueError(
-            "`model_name` is not set and was not found in the q run's "
-            "train_params.model_name"
-        )
-
-    forward_ckpt_run = eval_params.forward_ckpt_run or q_icp.get("forward_ckpt_run")
-    forward_ckpt_step = (
-        eval_params.forward_ckpt_step
-        if eval_params.forward_ckpt_step is not None
-        else q_icp.get("forward_ckpt_step")
-    )
-    if forward_ckpt_run is None or forward_ckpt_step is None:
-        raise ValueError(
-            "`forward_ckpt_run`/`forward_ckpt_step` not set and not found in "
-            "the q run's inverse_cot_params"
-        )
-
-    use_bf16 = (
-        eval_params.use_bf16
-        if eval_params.use_bf16 is not None
-        else bool(q_train.get("use_bf16", True))
-    )
-
-    q_lora_rank = (
-        eval_params.q_lora_rank
-        if eval_params.q_lora_rank is not None
-        else q_icp.get("lora_rank")
-    )
-    q_lora_alpha = (
-        eval_params.q_lora_alpha
-        if eval_params.q_lora_alpha is not None
-        else float(q_icp.get("lora_alpha", 16.0))
-    )
-    q_lora_target_modules = eval_params.q_lora_target_modules or q_icp.get(
-        "lora_target_modules", "all"
-    )
-
-    # p-LoRA: resolve from the forward run's config (recursive lookup). If
-    # the forward run isn't reachable, fall back to "no LoRA" — this is the
-    # right default for GRPO-trained p.
-    p_lora_rank = eval_params.lora_rank
-    p_lora_alpha = eval_params.lora_alpha
-    p_lora_target_modules = eval_params.lora_target_modules
-    if p_lora_rank is None and p_lora_alpha is None and p_lora_target_modules is None:
-        fwd_config = _load_run_config(forward_ckpt_run)
-        if fwd_config is not None:
-            fwd_lora = _pick_lora_section(fwd_config)
-            p_lora_rank = fwd_lora.get("lora_rank")
-            p_lora_alpha = float(fwd_lora.get("lora_alpha", 16.0))
-            p_lora_target_modules = fwd_lora.get("lora_target_modules", "all")
-    p_lora_alpha = p_lora_alpha if p_lora_alpha is not None else 16.0
-    p_lora_target_modules = p_lora_target_modules or "all"
-
-    if dataset_artifacts is None:
-        cfg_artifacts = (
-            q_config.get("dataset_artifacts") if isinstance(q_config, dict) else None
-        )
-        if not cfg_artifacts:
-            raise ValueError(
-                "No `dataset_artifacts` set via --dataset-glob and the q run's "
-                "config has no `dataset_artifacts` field to fall back to."
-            )
-        dataset_artifacts = list(cfg_artifacts)
-
-    resolved = _ResolvedEvalParams(
-        q_ckpt_run=eval_params.q_ckpt_run,
-        q_ckpt_step=eval_params.q_ckpt_step,
-        model_name=model_name,
-        forward_ckpt_run=forward_ckpt_run,
-        forward_ckpt_step=forward_ckpt_step,
-        use_bf16=use_bf16,
-        lora_rank=p_lora_rank,
-        lora_alpha=p_lora_alpha,
-        lora_target_modules=p_lora_target_modules,
-        q_lora_rank=q_lora_rank,
-        q_lora_alpha=q_lora_alpha,
-        q_lora_target_modules=q_lora_target_modules,
-        dataset_artifacts=dataset_artifacts,
-        seed=eval_params.seed,
-        split=eval_params.split,
-        batch_size=eval_params.batch_size,
-        max_tokens_generated=eval_params.max_tokens_generated,
-        temperature=eval_params.temperature,
-        n_samples=eval_params.n_samples,
-        max_prompts=eval_params.max_prompts,
-        gpu_memory_utilization=eval_params.gpu_memory_utilization,
-    )
-    log.info("Resolved eval params:")
-    log.info(f"  model_name:           {resolved.model_name}")
-    log.info(
-        f"  forward_ckpt:         {resolved.forward_ckpt_run} step {resolved.forward_ckpt_step}"
-    )
-    log.info(
-        f"  q_ckpt:               {resolved.q_ckpt_run} step {resolved.q_ckpt_step}"
-    )
-    log.info(f"  use_bf16:             {resolved.use_bf16}")
-    log.info(
-        f"  p LoRA:               rank={resolved.lora_rank} alpha={resolved.lora_alpha} target={resolved.lora_target_modules}"
-    )
-    log.info(
-        f"  q LoRA:               rank={resolved.q_lora_rank} alpha={resolved.q_lora_alpha} target={resolved.q_lora_target_modules}"
-    )
-    log.info(f"  dataset_artifacts:    {resolved.dataset_artifacts}")
-    return resolved
-
-
 try:
     from vllm import SamplingParams, TokensPrompt
 except ModuleNotFoundError:
@@ -228,48 +33,6 @@ except ModuleNotFoundError:
 
 
 GradeFn = Callable[[str | None, str], bool]
-
-
-def _resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
-    if target_modules == "all":
-        return DEFAULT_TARGET_MODULES
-    if target_modules == "attn":
-        return ("q_proj", "k_proj", "v_proj", "o_proj")
-    if target_modules == "mlp":
-        return ("gate_proj", "up_proj", "down_proj")
-    raise ValueError(
-        f"Unknown lora_target_modules: {target_modules!r} (expected 'all', 'attn', or 'mlp')"
-    )
-
-
-def _strip_rng_state(state: dict) -> None:
-    for key in ("_rng_torch", "_rng_python", "_rng_cuda"):
-        state.pop(key, None)
-
-
-def _load_with_optional_lora(
-    net,
-    state_dict: dict,
-    *,
-    lora_rank: int | None,
-    lora_alpha: float,
-    lora_target_modules: str,
-) -> None:
-    """Load ``state_dict`` into ``net`` with an optional LoRA merge step.
-
-    LoRA-trained checkpoints carry adapter weights that only line up if the
-    adapter layers are added to ``net`` *before* the state dict is loaded.
-    After load the adapters get merged back into the base weights so vLLM
-    sees a standard transformer.
-    """
-    if lora_rank is None:
-        net.load_state_dict(state_dict)
-        return
-    targets = _resolve_lora_targets(lora_target_modules)
-    apply_lora(net, rank=lora_rank, alpha=lora_alpha, target_modules=targets)
-    net.load_state_dict(state_dict)
-    merge_lora(net)
-    log.info(f"Loaded and merged LoRA weights (rank={lora_rank})")
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -352,14 +115,14 @@ def _aggregate_fcr(
         fcr_at_1=fcr_at_1,
         fcr_pass_rate_at_n=fcr_pr,
         fcr_pass_at_n=fcr_any,
-        fcr_all_incorrect_at_1=ai_at_1,
-        fcr_all_incorrect_pass_rate_at_n=ai_pr,
-        fcr_all_incorrect_pass_at_n=ai_any,
-        fcr_all_incorrect_total=ai_total,
-        fcr_hard_at_1=hard_at_1,
-        fcr_hard_pass_rate_at_n=hard_pr,
-        fcr_hard_pass_at_n=hard_any,
-        fcr_hard_total=hard_total,
+        fcr_at_1_on_all_incorrect=ai_at_1,
+        fcr_pass_rate_at_n_on_all_incorrect=ai_pr,
+        fcr_pass_at_n_on_all_incorrect=ai_any,
+        n_on_all_incorrect=ai_total,
+        fcr_at_1_on_hard=hard_at_1,
+        fcr_pass_rate_at_n_on_hard=hard_pr,
+        fcr_pass_at_n_on_hard=hard_any,
+        n_on_hard=hard_total,
         p_baseline_artifact=p_baseline_artifact,
         p_pass_rate_at_n=base_pr,
         p_pass_at_n=base_any,
@@ -382,7 +145,7 @@ def _eval_inverse_cot(
     dataset_artifacts: list[str] | None,
     grade_fn: GradeFn,
 ) -> None:
-    cfg = _resolve_eval_params(eval_params, dataset_artifacts)
+    cfg = resolve_inverse_cot_eval_params(eval_params, dataset_artifacts)
 
     torch.manual_seed(cfg.seed)
     model_info = MODEL_REGISTRY[cfg.model_name]
@@ -401,8 +164,8 @@ def _eval_inverse_cot(
         load_optimizer=False,
     )
     p_state = p_ckpt["model_state_dict"]
-    _strip_rng_state(p_state)
-    _load_with_optional_lora(
+    strip_rng_state(p_state)
+    load_with_optional_lora(
         p,
         p_state,
         lora_rank=cfg.lora_rank,
@@ -428,8 +191,8 @@ def _eval_inverse_cot(
         load_optimizer=False,
     )
     q_state = q_ckpt["model_state_dict"]
-    _strip_rng_state(q_state)
-    _load_with_optional_lora(
+    strip_rng_state(q_state)
+    load_with_optional_lora(
         q,
         q_state,
         lora_rank=cfg.q_lora_rank,
@@ -592,12 +355,12 @@ def _eval_inverse_cot(
     log.info(f"  p_pass_at_n (fresh):                 {result.p_pass_at_n:.4f}")
     log.info(f"  fcr_pass_rate_lift:                  {result.fcr_pass_rate_lift:+.4f}")
     log.info(f"  fcr_pass_at_n_lift:                  {result.fcr_pass_at_n_lift:+.4f}")
-    log.info(f"  all_incorrect bucket ({result.fcr_all_incorrect_total} prompts):")
+    log.info(f"  all_incorrect bucket ({result.n_on_all_incorrect} prompts):")
     log.info(
-        f"    fcr_pass_rate_at_n:              {result.fcr_all_incorrect_pass_rate_at_n:.4f}"
+        f"    fcr_pass_rate_at_n:              {result.fcr_pass_rate_at_n_on_all_incorrect:.4f}"
     )
     log.info(
-        f"    fcr_pass_at_n:                   {result.fcr_all_incorrect_pass_at_n:.4f}"
+        f"    fcr_pass_at_n:                   {result.fcr_pass_at_n_on_all_incorrect:.4f}"
     )
     log.info(
         f"    p_pass_rate_at_n:                {result.p_pass_rate_at_n_on_all_incorrect:.4f}"
@@ -611,11 +374,11 @@ def _eval_inverse_cot(
     log.info(
         f"    fcr_pass_at_n_lift:              {result.fcr_pass_at_n_lift_on_all_incorrect:+.4f}"
     )
-    log.info(f"  hard bucket ({result.fcr_hard_total} prompts):")
+    log.info(f"  hard bucket ({result.n_on_hard} prompts):")
     log.info(
-        f"    fcr_pass_rate_at_n:              {result.fcr_hard_pass_rate_at_n:.4f}"
+        f"    fcr_pass_rate_at_n:              {result.fcr_pass_rate_at_n_on_hard:.4f}"
     )
-    log.info(f"    fcr_pass_at_n:                   {result.fcr_hard_pass_at_n:.4f}")
+    log.info(f"    fcr_pass_at_n:                   {result.fcr_pass_at_n_on_hard:.4f}")
     log.info(
         f"    p_pass_rate_at_n:                {result.p_pass_rate_at_n_on_hard:.4f}"
     )
@@ -635,14 +398,14 @@ def _eval_inverse_cot(
                 "fcr_at_1": result.fcr_at_1,
                 "fcr_pass_rate_at_n": result.fcr_pass_rate_at_n,
                 "fcr_pass_at_n": result.fcr_pass_at_n,
-                "fcr_all_incorrect_at_1": result.fcr_all_incorrect_at_1,
-                "fcr_all_incorrect_pass_rate_at_n": result.fcr_all_incorrect_pass_rate_at_n,
-                "fcr_all_incorrect_pass_at_n": result.fcr_all_incorrect_pass_at_n,
-                "fcr_all_incorrect_total": result.fcr_all_incorrect_total,
-                "fcr_hard_at_1": result.fcr_hard_at_1,
-                "fcr_hard_pass_rate_at_n": result.fcr_hard_pass_rate_at_n,
-                "fcr_hard_pass_at_n": result.fcr_hard_pass_at_n,
-                "fcr_hard_total": result.fcr_hard_total,
+                "fcr_at_1_on_all_incorrect": result.fcr_at_1_on_all_incorrect,
+                "fcr_pass_rate_at_n_on_all_incorrect": result.fcr_pass_rate_at_n_on_all_incorrect,
+                "fcr_pass_at_n_on_all_incorrect": result.fcr_pass_at_n_on_all_incorrect,
+                "n_on_all_incorrect": result.n_on_all_incorrect,
+                "fcr_at_1_on_hard": result.fcr_at_1_on_hard,
+                "fcr_pass_rate_at_n_on_hard": result.fcr_pass_rate_at_n_on_hard,
+                "fcr_pass_at_n_on_hard": result.fcr_pass_at_n_on_hard,
+                "n_on_hard": result.n_on_hard,
                 "p_baseline_artifact": result.p_baseline_artifact,
                 "p_pass_rate_at_n": result.p_pass_rate_at_n,
                 "p_pass_at_n": result.p_pass_at_n,
