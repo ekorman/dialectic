@@ -20,6 +20,7 @@ from typing import Callable
 from dialectic.log import log
 from dialectic.rl.env import Countdown, MathState
 from dialectic.rl.extractors import extract_from_answer_tags, parse_cot_and_answer
+from dialectic.rl.inverse_cot_eval import gsm8k_match
 from dialectic.rl.reward import _evaluate_and_verify_countdown
 from dialectic.rl.types import EnvResponse
 
@@ -139,17 +140,6 @@ def filter_countdown_rollouts(
     )
 
 
-def _gsm8k_correct(extracted: str | None, gold: str) -> bool:
-    if extracted is None:
-        return False
-    try:
-        predicted = float(extracted.replace(",", "").strip())
-        target = float(gold)
-    except (ValueError, TypeError):
-        return False
-    return abs(predicted - target) < 1e-6
-
-
 def filter_gsm8k_rollouts(
     *,
     prompts: list[str],
@@ -173,6 +163,6 @@ def filter_gsm8k_rollouts(
         completions_by_problem=completions_by_problem,
         n_pos_min=n_pos_min,
         n_neg_min=n_neg_min,
-        grade_fn=lambda er, extracted: _gsm8k_correct(extracted, er.data.answer),
+        grade_fn=lambda er, extracted: gsm8k_match(extracted, er.data.answer),
         entry_extra_fn=lambda _er: {},
     )

@@ -367,7 +367,7 @@ def _run_rollout_generation_loop(
 # --- Experiment wrappers ----------------------------------------------------
 
 
-@extty.experiment(project="generate-inverse-cot-rollouts")
+@extty.experiment(project="generate-inverse-cot-rollouts-countdown")
 def generate_inverse_cot_rollouts_vllm_countdown(
     *,
     rollout_gen_params: RolloutGenParams,
@@ -397,7 +397,7 @@ def generate_inverse_cot_rollouts_vllm_countdown(
     )
 
 
-@extty.experiment(project="generate-inverse-cot-rollouts")
+@extty.experiment(project="generate-inverse-cot-rollouts-gsm8k")
 def generate_inverse_cot_rollouts_vllm_gsm8k(
     *,
     rollout_gen_params: RolloutGenParams,

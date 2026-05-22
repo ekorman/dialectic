@@ -20,6 +20,23 @@ def expressions_match(pred: str, gt: str) -> bool:
         return False
 
 
+def gsm8k_match(pred: str | None, gt: str) -> bool:
+    """Check if a GSM8K-extracted numeric string matches the gold answer.
+
+    Strips thousand-separator commas before float-casting so ``"1,000"`` and
+    ``"1000"`` compare equal. Returns ``False`` for unparseable strings or
+    ``None`` predictions rather than raising.
+    """
+    if pred is None:
+        return False
+    try:
+        predicted = float(pred.replace(",", "").strip())
+        target = float(gt)
+    except (ValueError, TypeError):
+        return False
+    return abs(predicted - target) < 1e-6
+
+
 HARD_PROMPT_THRESHOLD = 0.25
 
 
@@ -34,6 +51,54 @@ class FCRResult:
     p_baseline: float
     fcr_hard: float
     fcr_hard_total: int
+
+
+@dataclass
+class EvalFcrResult:
+    """Multi-sample FCR evaluation result (vLLM-driven, launcher-side).
+
+    All ``*_pass_rate_at_n`` fields are means of per-sample ``is_correct``
+    over the ``n_samples`` q-CoTs per prompt; all ``*_pass_at_n`` fields are
+    means over prompts of ``any(is_correct[p, :])``. The ``_on_*`` suffixes
+    filter the freshly-sampled p baseline to the same bucket the matching
+    ``fcr_*`` metric uses — these matter when eval-time ``n_samples`` is
+    larger than the artifact's group size, because the all-incorrect / hard
+    buckets are fixed by the artifact and a larger N may surface fresh
+    successes from p alone that didn't appear in the rollouts.
+    """
+
+    n_prompts: int
+    n_samples: int
+
+    fcr_at_1: float
+    fcr_pass_rate_at_n: float
+    fcr_pass_at_n: float
+
+    fcr_all_incorrect_at_1: float
+    fcr_all_incorrect_pass_rate_at_n: float
+    fcr_all_incorrect_pass_at_n: float
+    fcr_all_incorrect_total: int
+
+    fcr_hard_at_1: float
+    fcr_hard_pass_rate_at_n: float
+    fcr_hard_pass_at_n: float
+    fcr_hard_total: int
+
+    p_baseline_artifact: float
+    p_pass_rate_at_n: float
+    p_pass_at_n: float
+
+    p_pass_rate_at_n_on_all_incorrect: float
+    p_pass_at_n_on_all_incorrect: float
+    p_pass_rate_at_n_on_hard: float
+    p_pass_at_n_on_hard: float
+
+    fcr_pass_rate_lift: float
+    fcr_pass_at_n_lift: float
+    fcr_pass_rate_lift_on_all_incorrect: float
+    fcr_pass_at_n_lift_on_all_incorrect: float
+    fcr_pass_rate_lift_on_hard: float
+    fcr_pass_at_n_lift_on_hard: float
 
 
 @dataclass

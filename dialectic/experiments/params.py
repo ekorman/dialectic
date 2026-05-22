@@ -85,23 +85,55 @@ class InverseCotParams:
 
 @dataclass
 class InverseCotEvalParams:
-    model_name: str
-    forward_ckpt_run: str
-    forward_ckpt_step: int
-    use_bf16: bool
-    q_ckpt_run: str | None = None
-    q_ckpt_step: int | None = None
+    """FCR evaluator inputs.
+
+    Only ``q_ckpt_run`` and ``q_ckpt_step`` are required from the CLI; every
+    other field defaults to ``None`` and is auto-derived at launch time from
+    the q run's extty config (which carries ``model_name``, ``use_bf16``, the
+    q-LoRA settings, and the ``forward_ckpt_run`` / ``forward_ckpt_step`` of
+    the p checkpoint). p's own LoRA settings are recursively pulled from the
+    forward run's config when available. Any field passed on the CLI takes
+    precedence over the derived value.
+    """
+
+    q_ckpt_run: str
+    q_ckpt_step: int
+    model_name: str | None = None
+    forward_ckpt_run: str | None = None
+    forward_ckpt_step: int | None = None
+    use_bf16: bool | None = None
+    lora_rank: int | None = None
+    lora_alpha: float | None = None
+    lora_target_modules: str | None = None
+    q_lora_rank: int | None = None
+    q_lora_alpha: float | None = None
+    q_lora_target_modules: str | None = None
     seed: int = 42
     split: str = "val"
     batch_size: int = 16
     max_tokens_generated: int = 500
     temperature: float = 0.7
-    baseline_only: bool = False
     n_samples: int = 1
+    max_prompts: int | None = None
+    gpu_memory_utilization: float = 0.45
+
+
+@dataclass
+class GrpoEvalParams:
+    model_name: str
+    forward_ckpt_run: str
+    forward_ckpt_step: int
+    use_bf16: bool
+    seed: int = 42
+    split: str = "val"
+    max_tokens_generated: int = 500
+    temperature: float = 0.7
+    n_samples: int = 8
     lora_rank: int | None = None
     lora_alpha: float = 16.0
     lora_target_modules: str = "all"
     max_prompts: int | None = None
+    gpu_memory_utilization: float = 0.90
 
 
 @dataclass

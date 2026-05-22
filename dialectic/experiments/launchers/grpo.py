@@ -90,6 +90,7 @@ def _train_grpo(
         compile_model=train_params.compile_model,
         load_opt=True,
         lr=train_params.lr,
+        weight_decay=train_params.weight_decay,
     )
     if is_distributed():
         if is_main_process():

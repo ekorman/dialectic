@@ -59,6 +59,7 @@ def create_subparser(
     dcs: Sequence[tuple[str, Type[T]]],
     include_prompt_collection_id: bool,
     include_dataset_glob: bool = False,
+    dataset_glob_required: bool = True,
 ):
     parser: argparse.ArgumentParser = subparsers.add_parser(name)
     for name, dc in dcs:
@@ -67,7 +68,9 @@ def create_subparser(
     if include_prompt_collection_id:
         parser.add_argument("--prompt-collection-id", type=int, required=True)
     if include_dataset_glob:
-        parser.add_argument("--dataset-glob", type=str, nargs="+", required=True)
+        parser.add_argument(
+            "--dataset-glob", type=str, nargs="+", required=dataset_glob_required
+        )
 
 
 def load_dc_from_arg_parser_args(name: str, dc: Type[T], args: argparse.Namespace) -> T:
@@ -90,6 +93,7 @@ class Experiment:
     fn: Callable
     include_prompt_collection_id: bool
     include_dataset_glob: bool = False
+    dataset_glob_required: bool = True
 
 
 def _build_parser(
@@ -102,7 +106,7 @@ def _build_parser(
         if p.annotation == PromptCollection and ex.include_prompt_collection_id:
             return True
         if (
-            p.annotation == list[str]
+            p.annotation in (list[str], list[str] | None)
             and p.name == "dataset_artifacts"
             and ex.include_dataset_glob
         ):
@@ -120,7 +124,12 @@ def _build_parser(
         if ex.include_prompt_collection_id:
             parser.add_argument("--prompt-collection-id", type=int, required=True)
         if ex.include_dataset_glob:
-            parser.add_argument("--dataset-glob", type=str, nargs="+", required=True)
+            parser.add_argument(
+                "--dataset-glob",
+                type=str,
+                nargs="+",
+                required=ex.dataset_glob_required,
+            )
     else:
         subparsers = parser.add_subparsers(dest="env")
         for ex in experiments:
@@ -136,6 +145,7 @@ def _build_parser(
                 dcs=[(p.name, p.annotation) for p in parameters[ex.env_name]],
                 include_prompt_collection_id=ex.include_prompt_collection_id,
                 include_dataset_glob=ex.include_dataset_glob,
+                dataset_glob_required=ex.dataset_glob_required,
             )
 
     return parser, parameters
@@ -152,14 +162,17 @@ def run_experiments_parser(experiments: list[Experiment]):
                 args.prompt_collection_id
             ]
         if ex.include_dataset_glob:
+            patterns = args.dataset_glob or []
             all_matched: list[str] = []
-            for pattern in args.dataset_glob:
+            for pattern in patterns:
                 all_matched.extend(resolve_artifact_glob(pattern))
             # deduplicate while preserving order
             seen: set[str] = set()
-            kwargs["dataset_artifacts"] = [
-                n for n in all_matched if n not in seen and not seen.add(n)
-            ]
+            kwargs["dataset_artifacts"] = (
+                [n for n in all_matched if n not in seen and not seen.add(n)]
+                if patterns
+                else None
+            )
 
     if len(experiments) == 1 and experiments[0].env_name is None:
         ex = experiments[0]
