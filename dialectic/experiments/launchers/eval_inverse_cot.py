@@ -4,6 +4,7 @@ from typing import Callable
 
 import extty
 import torch
+from tqdm import tqdm
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.launchers._eval_helpers import (
@@ -12,6 +13,7 @@ from dialectic.experiments.launchers._eval_helpers import (
     strip_rng_state,
 )
 from dialectic.experiments.params import InverseCotEvalParams
+from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
@@ -219,45 +221,72 @@ def _eval_inverse_cot(
         f"(split={cfg.split}, n_samples={cfg.n_samples})"
     )
 
-    # ---------------- q -> vLLM, sample N CoTs per prompt ----------------
+    # ---------------- q via native PyTorch (prefix-LM attention) ----------------
+    # vLLM serves a Qwen3ForCausalLM as causal-only, but q was trained with
+    # prefix-LM (bidirectional over prompt + answer) — the ``causal=False`` flag
+    # on q.layers is a runtime in-memory state, not part of the HF export. Using
+    # vLLM for q therefore feeds it an attention pattern it wasn't trained on
+    # and the resulting CoTs are garbage at early checkpoints (and silently
+    # off-distribution at later ones). Match ``compute_fcr`` 's training-time
+    # regime: run q natively with ``attention_mask=prefix_mask``, KV-cached.
     log.info(
-        f"Exporting q to vLLM (gpu_memory_utilization={cfg.gpu_memory_utilization})"
+        f"Sampling {cfg.n_samples} q-CoTs per prompt via native PyTorch (prefix-LM)"
     )
-    q_vllm = load_dialectic_qwen_as_vllm(
-        q,
-        tokenizer=tokenizer,
-        eos_token_id=model_info.eos_token_id,
-        pad_token_id=model_info.pad_token_id,
-        max_model_len=cfg.max_tokens_generated + 1024,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-        dtype="bfloat16" if cfg.use_bf16 else "float16",
-        seed=cfg.seed,
-    )
-    del q
-    torch.cuda.empty_cache()
 
-    q_prefix_ids = [
+    prefix_ids_per_prompt: list[list[int]] = [
         pr.prompt_ids + tokenizer.encode(f" <answer> {pr.equation} </answer>").ids
         for pr in prompts
     ]
-    q_sampling = SamplingParams(
-        n=cfg.n_samples,
-        temperature=cfg.temperature,
-        max_tokens=cfg.max_tokens_generated,
-        stop_token_ids=[model_info.eos_token_id],
-        seed=cfg.seed,
-    )
-    log.info(f"Generating {cfg.n_samples} q-CoTs per prompt")
-    q_outputs = q_vllm.generate(
-        [TokensPrompt(prompt_token_ids=ids) for ids in q_prefix_ids],
-        q_sampling,
-        use_tqdm=True,
-    )
-    q_cot_strs: list[list[str]] = [
-        [sample.text for sample in out.outputs] for out in q_outputs
-    ]
 
-    del q_vllm
+    # Flat (prompt_idx, sample_idx, prefix_ids) job list — N samples per prompt.
+    jobs: list[tuple[int, int, list[int]]] = []
+    for p_idx in range(len(prompts)):
+        for s_idx in range(cfg.n_samples):
+            jobs.append((p_idx, s_idx, prefix_ids_per_prompt[p_idx]))
+
+    q_cot_strs: list[list[str]] = [["" for _ in range(cfg.n_samples)] for _ in prompts]
+
+    n_batches = (len(jobs) + cfg.batch_size - 1) // cfg.batch_size
+    for batch_start in tqdm(
+        range(0, len(jobs), cfg.batch_size),
+        total=n_batches,
+        desc="q sampling (native)",
+    ):
+        batch = jobs[batch_start : batch_start + cfg.batch_size]
+        B = len(batch)
+        max_prefix_len = max(len(j[2]) for j in batch)
+
+        q_prefix_ids_tensor = torch.full(
+            (B, max_prefix_len),
+            model_info.pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        q_prefix_mask = torch.zeros(B, max_prefix_len, dtype=torch.bool, device=device)
+        for i, (_, _, prefix_ids) in enumerate(batch):
+            offset = max_prefix_len - len(prefix_ids)
+            q_prefix_ids_tensor[i, offset:] = torch.tensor(prefix_ids, device=device)
+            q_prefix_mask[i, offset:] = True
+
+        with torch.no_grad():
+            q_completions = generate_hard_tokens(
+                net=q,
+                token_ids=q_prefix_ids_tensor,
+                sampling_strategy="sample",
+                temperature=cfg.temperature,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                max_tokens_generated=cfg.max_tokens_generated,
+                use_kv_cache=True,
+                use_bf16=cfg.use_bf16,
+                attention_mask=q_prefix_mask,
+            ).tokens
+
+        for i, (p_idx, s_idx, _) in enumerate(batch):
+            cot_tokens = q_completions[i, max_prefix_len:].tolist()
+            q_cot_strs[p_idx][s_idx] = tokenizer.decode(cot_tokens)
+
+    del q
     gc.collect()
     torch.cuda.empty_cache()
 
