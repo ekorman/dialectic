@@ -1,5 +1,6 @@
 import json
 import random
+import time
 
 import extty
 import torch
@@ -28,125 +29,155 @@ from dialectic.rl.inverse_cot_eval import compute_baseline
 from dialectic.training import StepFunctionReturn, train_loop
 
 
-def _load_sft_data(
-    artifact_names: list[str],
+def _read_artifact_jsonl(name: str) -> list[dict]:
+    t0 = time.perf_counter()
+    data = extty.load_artifact(name, cache=True)
+    if not isinstance(data, bytes):
+        raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
+    log.info(f"Downloaded artifact '{name}' in {time.perf_counter() - t0:.1f}s")
+
+    t1 = time.perf_counter()
+    entries = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
+    log.info(f"Parsed {len(entries)} entries in {time.perf_counter() - t1:.1f}s")
+    return entries
+
+
+def _log_split_summary(
+    by_split: dict[str, list[dict]],
     tokenizer,
-    eos_token_id: int,
-    fcr_filter: bool = False,
-    use_rollout_data: bool = False,
-) -> dict[str, list[dict]]:
-    """Load training data for SFT.
-
-    When ``use_rollout_data`` is False, loads q-generated CoT artifacts
-    (one CoT per prompt). When True, loads original rollout artifacts
-    and uses p's own correct CoTs (one example per correct completion).
-
-    Returns dict mapping split name to list of tokenized examples.
-    Each example has: prompt_ids, response_ids, full_ids.
-    """
-    import time as _time
-
-    by_split: dict[str, list[dict]] = {}
-
-    tokenizer.no_padding()
-    tokenizer.no_truncation()
-
-    for name in artifact_names:
-        t0 = _time.perf_counter()
-        data = extty.load_artifact(name, cache=True)
-        if not isinstance(data, bytes):
-            raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
-        log.info(f"Downloaded artifact '{name}' in {_time.perf_counter() - t0:.1f}s")
-
-        t1 = _time.perf_counter()
-        entries = [
-            json.loads(line) for line in data.decode().splitlines() if line.strip()
-        ]
-        log.info(f"Parsed {len(entries)} entries in {_time.perf_counter() - t1:.1f}s")
-
-        t2 = _time.perf_counter()
-        if use_rollout_data:
-            # Batch tokenize: collect all strings first, encode in one call
-            prompt_strs: list[str] = []
-            response_strs: list[str] = []
-            entry_indices: list[int] = []
-            splits: list[str] = []
-
-            cot_only_strs: list[str] = []
-            for i, entry in enumerate(entries):
-                split = entry.get("split", "train")
-                for comp in entry["completions"]:
-                    if not comp["is_correct"]:
-                        continue
-                    cot_str = f"<think>\n{comp['cot'].strip()}\n</think>\n\n"
-                    prompt_strs.append(entry["prompt_str"])
-                    response_strs.append(cot_str + comp["answer"])
-                    cot_only_strs.append(cot_str)
-                    entry_indices.append(i)
-                    splits.append(split)
-
-            log.info(
-                f"Collected {len(prompt_strs)} correct completions in {_time.perf_counter() - t2:.1f}s"
-            )
-            t3 = _time.perf_counter()
-
-            prompt_encs = tokenizer.encode_batch(prompt_strs)
-            response_encs = tokenizer.encode_batch(response_strs)
-            cot_encs = tokenizer.encode_batch(cot_only_strs)
-            log.info(
-                f"Batch tokenized {len(prompt_strs)} pairs in {_time.perf_counter() - t3:.1f}s"
-            )
-
-            for idx in range(len(prompt_strs)):
-                prompt_ids = list(prompt_encs[idx].ids)
-                response_ids = list(response_encs[idx].ids)
-                cot_len = len(cot_encs[idx].ids)
-                full_ids = prompt_ids + response_ids + [eos_token_id]
-                by_split.setdefault(splits[idx], []).append(
-                    {
-                        "prompt_ids": prompt_ids,
-                        "response_ids": response_ids,
-                        "full_ids": full_ids,
-                        "prefix_len": len(prompt_ids),
-                        "cot_len": cot_len,
-                    }
-                )
-        else:
-            for entry in entries:
-                if fcr_filter and not entry.get("fcr_correct", False):
-                    continue
-
-                prompt_ids = entry["prompt_ids"]
-                cot = entry["cot"]
-                answer = entry["answer"]
-                split = entry.get("split", "train")
-
-                cot_str = f"<think>\n{cot.strip()}\n</think>\n\n"
-                response_str = cot_str + f"<answer> {answer} </answer>"
-                response_ids = tokenizer.encode(response_str).ids
-                cot_len = len(tokenizer.encode(cot_str).ids)
-
-                full_ids = prompt_ids + response_ids + [eos_token_id]
-
-                by_split.setdefault(split, []).append(
-                    {
-                        "prompt_ids": prompt_ids,
-                        "response_ids": response_ids,
-                        "full_ids": full_ids,
-                        "prefix_len": len(prompt_ids),
-                        "cot_len": cot_len,
-                    }
-                )
-
+    *,
+    label: str,
+) -> None:
     for split, examples in sorted(by_split.items()):
-        log.info(f"  {split}: {len(examples)} examples")
+        log.info(f"  [{label}] {split}: {len(examples)} examples")
         if examples:
             ex = examples[0]
             decoded = tokenizer.decode(ex["full_ids"])
-            log.info(f"  Sample ({split}): {decoded[:500]!r}")
+            log.info(f"  [{label}] Sample ({split}): {decoded[:500]!r}")
             log.info(
-                f"  prompt_ids len={len(ex['prompt_ids'])} response_ids len={len(ex['response_ids'])} total={len(ex['full_ids'])}"
+                f"  [{label}] prompt_ids len={len(ex['prompt_ids'])} response_ids len={len(ex['response_ids'])} total={len(ex['full_ids'])}"
             )
+
+
+def _load_q_cot_artifact(
+    name: str,
+    tokenizer,
+    eos_token_id: int,
+) -> dict[str, list[dict]]:
+    """Load a q-CoT artifact emitted by ``generate_q_cot.py``.
+
+    Each entry has the schema ``{"prompt_ids", "cot", "answer", "split",
+    "fcr_correct"}``. Only entries with ``fcr_correct=True`` are kept —
+    we don't want to teach p to imitate CoTs that didn't actually prime
+    it to the right answer.
+    """
+
+    tokenizer.no_padding()
+    tokenizer.no_truncation()
+    by_split: dict[str, list[dict]] = {}
+
+    entries = _read_artifact_jsonl(name)
+    t0 = time.perf_counter()
+    n_dropped = 0
+    for entry in entries:
+        if not entry.get("fcr_correct", False):
+            n_dropped += 1
+            continue
+        prompt_ids = entry["prompt_ids"]
+        cot = entry["cot"]
+        answer = entry["answer"]
+        split = entry.get("split", "train")
+
+        cot_str = f"<think>\n{cot.strip()}\n</think>\n\n"
+        response_str = cot_str + f"<answer> {answer} </answer>"
+        response_ids = tokenizer.encode(response_str).ids
+        cot_len = len(tokenizer.encode(cot_str).ids)
+
+        full_ids = prompt_ids + response_ids + [eos_token_id]
+
+        by_split.setdefault(split, []).append(
+            {
+                "prompt_ids": prompt_ids,
+                "response_ids": response_ids,
+                "full_ids": full_ids,
+                "prefix_len": len(prompt_ids),
+                "cot_len": cot_len,
+            }
+        )
+
+    log.info(
+        f"q-CoT artifact '{name}': kept {sum(len(v) for v in by_split.values())} entries "
+        f"(dropped {n_dropped} with fcr_correct=False) in "
+        f"{time.perf_counter() - t0:.1f}s"
+    )
+    _log_split_summary(by_split, tokenizer, label="q_cot")
+    return by_split
+
+
+def _load_p_rollout_artifact(
+    name: str,
+    tokenizer,
+    eos_token_id: int,
+) -> dict[str, list[dict]]:
+    """Load a p-rollout artifact emitted by ``generate_inverse_cot_rollouts.py``.
+
+    Each entry has the schema ``{"prompt_str", "completions": [{"cot",
+    "answer", "is_correct"}, ...], "split"}``. Only completions with
+    ``is_correct=True`` are kept; each correct completion becomes its own
+    training example.
+    """
+
+    tokenizer.no_padding()
+    tokenizer.no_truncation()
+    by_split: dict[str, list[dict]] = {}
+
+    entries = _read_artifact_jsonl(name)
+    t0 = time.perf_counter()
+
+    prompt_strs: list[str] = []
+    response_strs: list[str] = []
+    cot_only_strs: list[str] = []
+    splits: list[str] = []
+
+    for entry in entries:
+        split = entry.get("split", "train")
+        for comp in entry["completions"]:
+            if not comp["is_correct"]:
+                continue
+            cot_str = f"<think>\n{comp['cot'].strip()}\n</think>\n\n"
+            prompt_strs.append(entry["prompt_str"])
+            response_strs.append(cot_str + comp["answer"])
+            cot_only_strs.append(cot_str)
+            splits.append(split)
+
+    log.info(
+        f"Collected {len(prompt_strs)} correct completions in "
+        f"{time.perf_counter() - t0:.1f}s"
+    )
+    t1 = time.perf_counter()
+    prompt_encs = tokenizer.encode_batch(prompt_strs)
+    response_encs = tokenizer.encode_batch(response_strs)
+    cot_encs = tokenizer.encode_batch(cot_only_strs)
+    log.info(
+        f"Batch tokenized {len(prompt_strs)} pairs in {time.perf_counter() - t1:.1f}s"
+    )
+
+    for idx in range(len(prompt_strs)):
+        prompt_ids = list(prompt_encs[idx].ids)
+        response_ids = list(response_encs[idx].ids)
+        cot_len = len(cot_encs[idx].ids)
+        full_ids = prompt_ids + response_ids + [eos_token_id]
+        by_split.setdefault(splits[idx], []).append(
+            {
+                "prompt_ids": prompt_ids,
+                "response_ids": response_ids,
+                "full_ids": full_ids,
+                "prefix_len": len(prompt_ids),
+                "cot_len": cot_len,
+            }
+        )
+
+    _log_split_summary(by_split, tokenizer, label="p_rollout")
     return by_split
 
 
@@ -180,12 +211,40 @@ def _build_sft_batch(
     return input_ids, loss_mask
 
 
+def _validate_sft_data_params(sft_params: SftParams) -> None:
+    """Enforce the slot/mix_ratio contract before any GPU work happens.
+
+    Rules:
+    - At least one of ``q_cot_artifact`` / ``p_rollout_artifact`` must be set.
+    - If only ``q_cot_artifact`` is set, ``mix_ratio`` must be 1.0 (no rollout
+      data to draw from).
+    - If only ``p_rollout_artifact`` is set, ``mix_ratio`` must be 0.0.
+    - ``mix_ratio`` must lie in ``[0, 1]``.
+    """
+    has_q = sft_params.q_cot_artifact is not None
+    has_p = sft_params.p_rollout_artifact is not None
+    if not has_q and not has_p:
+        raise ValueError(
+            "At least one of `q_cot_artifact` or `p_rollout_artifact` must be set"
+        )
+    if not (0.0 <= sft_params.mix_ratio <= 1.0):
+        raise ValueError(f"mix_ratio must be in [0, 1], got {sft_params.mix_ratio}")
+    if not has_q and sft_params.mix_ratio != 0.0:
+        raise ValueError(
+            "q_cot_artifact is None; mix_ratio must be 0.0 for pure-rollout training"
+        )
+    if not has_p and sft_params.mix_ratio != 1.0:
+        raise ValueError(
+            "p_rollout_artifact is None; mix_ratio must be 1.0 for pure-q-CoT training"
+        )
+
+
 @extty.experiment(project="sft-inverse-cot-countdown")
 def train_sft_inverse_cot_countdown(
     *,
     sft_params: SftParams,
-    dataset_artifacts: list[str],
 ):
+    _validate_sft_data_params(sft_params)
     init_distributed()
     rank = get_rank()
     world_size = get_world_size()
@@ -276,53 +335,65 @@ def train_sft_inverse_cot_countdown(
         f"(rank {rank}/{world_size}, local_batch_size={local_batch_size})"
     )
 
-    # Load SFT data (rank 0 downloads first, others wait for cache)
+    # Load SFT data (rank 0 downloads first, others wait for cache).
+    # q_cot_artifact and p_rollout_artifact are independent slots — fill
+    # whichever ones are set; combine at batch-construction time via mix_ratio.
     if is_distributed() and rank != 0:
         barrier()
-    by_split = _load_sft_data(
-        dataset_artifacts,
-        tokenizer,
-        eos_token_id=model_info.eos_token_id,
-        fcr_filter=sft_params.fcr_filter,
-        use_rollout_data=sft_params.use_rollout_data,
-    )
-    train_data = by_split.get("train", [])
-    val_data = by_split.get("val", [])
 
-    mix_train: list[dict] = []
-    if sft_params.mix_rollout_artifact is not None:
-        from dialectic.experiments.arg_parser import resolve_artifact_glob as _resolve
-
-        mix_names = _resolve(sft_params.mix_rollout_artifact)
-        mix_split = _load_sft_data(
-            mix_names,
+    q_cot_by_split: dict[str, list[dict]] = {}
+    if sft_params.q_cot_artifact is not None:
+        q_cot_by_split = _load_q_cot_artifact(
+            sft_params.q_cot_artifact,
             tokenizer,
             eos_token_id=model_info.eos_token_id,
-            use_rollout_data=True,
         )
-        mix_train = mix_split.get("train", [])
-        log.info(
-            f"Mixing {len(mix_train)} rollout examples with {len(train_data)} q-cot examples "
-            f"(mix_ratio={sft_params.mix_ratio}: {sft_params.mix_ratio:.0%} q-cot, "
-            f"{1 - sft_params.mix_ratio:.0%} rollout per batch)"
+    p_rollout_by_split: dict[str, list[dict]] = {}
+    if sft_params.p_rollout_artifact is not None:
+        p_rollout_by_split = _load_p_rollout_artifact(
+            sft_params.p_rollout_artifact,
+            tokenizer,
+            eos_token_id=model_info.eos_token_id,
         )
+
+    train_q_cot = q_cot_by_split.get("train", [])
+    train_p_rollout = p_rollout_by_split.get("train", [])
+
+    # Val-loss source: prefer q-CoT val split when present (it's what
+    # actually exercises the inverse-CoT supervision); fall back to rollout
+    # val when only rollouts are loaded.
+    if q_cot_by_split:
+        val_data = q_cot_by_split.get("val", [])
+    else:
+        val_data = p_rollout_by_split.get("val", [])
+
+    if sft_params.mix_ratio > 0 and not train_q_cot:
+        raise ValueError(
+            "mix_ratio > 0 but q_cot artifact yielded zero training examples"
+        )
+    if sft_params.mix_ratio < 1 and not train_p_rollout:
+        raise ValueError(
+            "mix_ratio < 1 but p_rollout artifact yielded zero training examples"
+        )
+
+    log.info(
+        f"Training mix: mix_ratio={sft_params.mix_ratio} "
+        f"({sft_params.mix_ratio:.0%} q-cot from {len(train_q_cot)} examples, "
+        f"{1 - sft_params.mix_ratio:.0%} rollout from {len(train_p_rollout)} examples)"
+    )
 
     if is_distributed() and rank == 0:
         barrier()
 
-    if not train_data:
-        raise ValueError("No training data found")
-
-    # Load q for importance weighting
-    q_model = None
-
-    # Load original rollout data for val accuracy evaluation
+    # Load a separate rollout artifact for val-accuracy evaluation. This is
+    # only used as a source of val *prompts* (the launcher re-generates with
+    # p via vLLM in compute_baseline); the rollout artifact's own
+    # completions feed the "hard prompt" classification.
     val_prompts = []
     if sft_params.val_rollout_artifact is not None:
-        from dialectic.experiments.arg_parser import resolve_artifact_glob
-
-        val_artifact_names = resolve_artifact_glob(sft_params.val_rollout_artifact)
-        rollout_splits = load_rollout_artifacts(val_artifact_names, tokenizer)
+        rollout_splits = load_rollout_artifacts(
+            [sft_params.val_rollout_artifact], tokenizer
+        )
         val_prompts = rollout_splits.get("val", [])
         log.info(f"Loaded {len(val_prompts)} val prompts for accuracy eval")
 
@@ -334,17 +405,19 @@ def train_sft_inverse_cot_countdown(
         local_episodes = 0
 
         for _ in range(sft_params.accumulation_steps):
-            if mix_train:
-                n_q = max(1, int(local_batch_size * sft_params.mix_ratio))
-                n_p = local_batch_size - n_q
-                q_indices = torch.randint(len(train_data), (n_q,)).tolist()
-                p_indices = torch.randint(len(mix_train), (n_p,)).tolist()
-                batch_examples = [train_data[i] for i in q_indices] + [
-                    mix_train[i] for i in p_indices
-                ]
-            else:
-                indices = torch.randint(len(train_data), (local_batch_size,)).tolist()
-                batch_examples = [train_data[i] for i in indices]
+            # Split the local batch into q-CoT and rollout halves per mix_ratio.
+            # Validation guarantees: if mix_ratio == 0 then train_q_cot is empty,
+            # if mix_ratio == 1 then train_p_rollout is empty; the active slot
+            # always has data.
+            n_q = round(local_batch_size * sft_params.mix_ratio)
+            n_p = local_batch_size - n_q
+            batch_examples: list[dict] = []
+            if n_q > 0:
+                q_indices = torch.randint(len(train_q_cot), (n_q,)).tolist()
+                batch_examples += [train_q_cot[i] for i in q_indices]
+            if n_p > 0:
+                p_indices = torch.randint(len(train_p_rollout), (n_p,)).tolist()
+                batch_examples += [train_p_rollout[i] for i in p_indices]
 
             input_ids, loss_mask = _build_sft_batch(
                 batch_examples, model_info.pad_token_id, device
@@ -356,38 +429,11 @@ def train_sft_inverse_cot_countdown(
             shift_mask = loss_mask[:, 1:]
 
             B, L, V = shift_logits.shape
-            p_log_probs = -F.cross_entropy(
+            per_token_loss = F.cross_entropy(
                 shift_logits.reshape(B * L, V),
                 shift_targets.reshape(B * L),
                 reduction="none",
             ).reshape(B, L)
-
-            if q_model is not None:
-                with torch.no_grad():
-                    q_logits = q_model(input_ids, return_all_logits=True)
-                q_shift_logits = q_logits[:, :-1]
-                q_log_probs = -F.cross_entropy(
-                    q_shift_logits.reshape(B * L, V),
-                    shift_targets.reshape(B * L),
-                    reduction="none",
-                ).reshape(B, L)
-
-                # Sequence-level importance weight: p(C|P) / q(C|A*,P)
-                seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
-                p_seq_logprob = (p_log_probs.detach() * shift_mask).sum(
-                    dim=1
-                ) / seq_lengths
-                q_seq_logprob = (q_log_probs * shift_mask).sum(dim=1) / seq_lengths
-                seq_ratio = torch.exp(p_seq_logprob - q_seq_logprob)
-                clipped_seq_ratio = torch.clamp(
-                    seq_ratio,
-                    1.0 - sft_params.importance_eps,
-                    1.0 + sft_params.importance_eps,
-                )
-                # Apply one weight per sequence to all tokens
-                per_token_loss = -clipped_seq_ratio.unsqueeze(1) * p_log_probs
-            else:
-                per_token_loss = -p_log_probs
 
             masked_loss = per_token_loss * shift_mask
             seq_lengths = shift_mask.sum(dim=1).clamp(min=1)
@@ -552,7 +598,6 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=train_sft_inverse_cot_countdown,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
             ),
         ]
