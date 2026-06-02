@@ -147,17 +147,13 @@ class GrpoEvalParams:
 
 
 @dataclass
-class GenerateQCotParams:
-    model_name: str
-    forward_ckpt_run: str
-    forward_ckpt_step: int
-    q_ckpt_run: str
-    q_ckpt_step: int
-    use_bf16: bool
+class GenerateQCotParams(EvalCommonParams):
+    """q-CoT generation inputs — adds the sampling knobs needed for offline
+    data synthesis on top of the shared auto-derivable surface."""
+
     batch_size: int = 16
     max_tokens_generated: int = 500
     temperature: float = 0.3
-    seed: int = 42
 
 
 @dataclass

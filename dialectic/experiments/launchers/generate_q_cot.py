@@ -1,3 +1,22 @@
+"""Generate q-CoTs at scale for offline data synthesis.
+
+For each prompt in a rollout artifact:
+1. q (prefix-LM, conditioned on prompt + gold answer) samples one CoT.
+2. p (causal) greedy-decodes given prompt + ``<think>q_cot</think>`` — used to
+   record whether q's CoT successfully primes p to the right answer
+   (``fcr_correct``).
+
+The emitted artifact is the SFT material for bootstrapping p past its
+sampling ceiling: every entry pairs (prompt, q's CoT, gold answer) with a
+correctness flag from p's downstream greedy decode.
+
+Like the eval launchers, every field except ``--q-ckpt-run`` / ``--q-ckpt-step``
+is auto-derived from q's extty config (``model_name``, ``use_bf16``,
+``forward_ckpt_run/step``, both LoRA configs, and ``dataset_artifacts``). p
+and q are both run via native PyTorch — q under prefix-LM attention (its
+training regime), p under causal attention (its training regime).
+"""
+
 import copy
 import json
 import os
@@ -9,68 +28,85 @@ import torch
 from tqdm import tqdm
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
+from dialectic.experiments.launchers._eval_helpers import (
+    load_with_optional_lora,
+    resolve_eval_common_params,
+    strip_rng_state,
+)
 from dialectic.experiments.params import GenerateQCotParams
 from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
-from dialectic.rl.inverse_cot_eval import expressions_match
+from dialectic.rl.inverse_cot_eval import expressions_match, gsm8k_match
 
 
-@extty.experiment(project="generate-q-cot")
-def generate_q_cot_countdown(
+def _generate_q_cot(
     *,
     gen_params: GenerateQCotParams,
-    dataset_artifacts: list[str],
-):
-    torch.manual_seed(gen_params.seed)
-    model_info = MODEL_REGISTRY[gen_params.model_name]
+    dataset_artifacts: list[str] | None,
+    grade_fn,
+) -> None:
+    cfg = resolve_eval_common_params(gen_params, dataset_artifacts)
+
+    torch.manual_seed(cfg.seed)
+    model_info = MODEL_REGISTRY[cfg.model_name]
     tokenizer = model_info.load_tokenizer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if gen_params.use_bf16 else torch.float32
+    dtype = torch.bfloat16 if cfg.use_bf16 else torch.float32
 
-    # Load p
-    log.info(
-        f"Loading p from {gen_params.forward_ckpt_run} step {gen_params.forward_ckpt_step}"
-    )
+    # ---------------- p ----------------
+    log.info(f"Loading p from {cfg.forward_ckpt_run} step {cfg.forward_ckpt_step}")
     p = model_info.load_net(pretrained_weights=False)
-    project, run_name = gen_params.forward_ckpt_run.split("/")
+    p_project, p_run_name = cfg.forward_ckpt_run.split("/")
     p_ckpt = extty.load_checkpoint_from(
-        project=project,
-        run_name=run_name,
-        step=gen_params.forward_ckpt_step,
+        project=p_project,
+        run_name=p_run_name,
+        step=cfg.forward_ckpt_step,
         load_optimizer=False,
     )
-    p.load_state_dict(p_ckpt["model_state_dict"])
+    p_state = p_ckpt["model_state_dict"]
+    strip_rng_state(p_state)
+    load_with_optional_lora(
+        p,
+        p_state,
+        lora_rank=cfg.lora_rank,
+        lora_alpha=cfg.lora_alpha,
+        lora_target_modules=cfg.lora_target_modules,
+    )
     p = p.to(device=device, dtype=dtype)
     p.requires_grad_(False)
     p.eval()
 
+    # ---------------- q ----------------
     q = copy.deepcopy(p)
     for layer in q.layers:
         layer.self_attn.causal = False
-
     q = q.to(device=device, dtype=dtype)
 
-    # Load q checkpoint
-    log.info(f"Loading q from {gen_params.q_ckpt_run} step {gen_params.q_ckpt_step}")
-    q_project, q_run_name = gen_params.q_ckpt_run.split("/")
+    log.info(f"Loading q from {cfg.q_ckpt_run} step {cfg.q_ckpt_step}")
+    q_project, q_run_name = cfg.q_ckpt_run.split("/")
     q_ckpt = extty.load_checkpoint_from(
         project=q_project,
         run_name=q_run_name,
-        step=gen_params.q_ckpt_step,
+        step=cfg.q_ckpt_step,
         load_optimizer=False,
     )
-    state_dict = q_ckpt["model_state_dict"]
-    state_dict.pop("_rng_torch", None)
-    state_dict.pop("_rng_python", None)
-    state_dict.pop("_rng_cuda", None)
-    q.load_state_dict(state_dict)
+    q_state = q_ckpt["model_state_dict"]
+    strip_rng_state(q_state)
+    load_with_optional_lora(
+        q,
+        q_state,
+        lora_rank=cfg.q_lora_rank,
+        lora_alpha=cfg.q_lora_alpha,
+        lora_target_modules=cfg.q_lora_target_modules,
+    )
+    q.requires_grad_(False)
     q.eval()
 
-    # Load data
-    by_split = load_rollout_artifacts(dataset_artifacts, tokenizer)
+    # ---------------- data ----------------
+    by_split = load_rollout_artifacts(cfg.dataset_artifacts, tokenizer)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     total_generated = 0
@@ -81,6 +117,8 @@ def generate_q_cot_countdown(
         if not fcr_prompts:
             log.info(f"Skipping split {split_name}: no prompts with equations")
             continue
+        if cfg.max_prompts is not None:
+            fcr_prompts = fcr_prompts[: cfg.max_prompts]
 
         log.info(f"Generating CoTs for {len(fcr_prompts)} prompts (split={split_name})")
 
@@ -96,7 +134,7 @@ def generate_q_cot_countdown(
             batch = fcr_prompts[batch_start : batch_start + gen_params.batch_size]
             B = len(batch)
 
-            # Build q's prefix: prompt_ids + answer_ids
+            # q's prefix: prompt + " <answer> {gold} </answer>"
             q_prefix_id_lists = [
                 pr.prompt_ids
                 + tokenizer.encode(f" <answer> {pr.equation} </answer>").ids
@@ -114,7 +152,6 @@ def generate_q_cot_countdown(
                 q_prefix_ids[i, offset:] = torch.tensor(ids, device=device)
                 q_prefix_mask[i, offset:] = True
 
-            # q generates CoT
             with torch.no_grad():
                 q_completions = generate_hard_tokens(
                     net=q,
@@ -127,7 +164,7 @@ def generate_q_cot_countdown(
                     pad_token_id=model_info.pad_token_id,
                     max_tokens_generated=gen_params.max_tokens_generated,
                     use_kv_cache=True,
-                    use_bf16=gen_params.use_bf16,
+                    use_bf16=cfg.use_bf16,
                     attention_mask=q_prefix_mask,
                 ).tokens
 
@@ -136,7 +173,7 @@ def generate_q_cot_countdown(
                 for i in range(B)
             ]
 
-            # Feed q's CoT to p, check if p gets the right answer
+            # Prime p with prompt + <think>q_cot</think>, greedy-decode the answer
             prompt_strs = [tokenizer.decode(pr.prompt_ids) for pr in batch]
             primed_strs = [
                 ps + "<think>\n" + cot.strip() + "\n</think>\n\n"
@@ -161,7 +198,7 @@ def generate_q_cot_countdown(
                     max_tokens_generated=gen_params.max_tokens_generated,
                     use_kv_cache=True,
                     attention_mask=primed_mask,
-                    use_bf16=gen_params.use_bf16,
+                    use_bf16=cfg.use_bf16,
                 ).tokens
             primed_len = primed_ids.shape[1]
             p_strs = tokenizer.decode_batch(p_completions[:, primed_len:].tolist())
@@ -169,11 +206,8 @@ def generate_q_cot_countdown(
             for i in range(B):
                 pr = batch[i]
                 extracted = extract_from_answer_tags(p_strs[i])
-                fcr_correct = (
-                    extracted is not None
-                    and pr.equation is not None
-                    and expressions_match(extracted, pr.equation)
-                )
+                assert pr.equation is not None
+                fcr_correct = grade_fn(extracted, pr.equation)
 
                 entry = {
                     "prompt_ids": pr.prompt_ids,
@@ -199,7 +233,7 @@ def generate_q_cot_countdown(
             f"FCR={fcr_rate:.3f} ({split_fcr_correct}/{split_generated})"
         )
 
-        artifact_name = f"q-cot-{gen_params.model_name}-{ts}-{split_name}"
+        artifact_name = f"q-cot-{cfg.model_name}-{ts}-{split_name}"
         extty.save_artifact(
             name=artifact_name,
             path=tmpfile.name,
@@ -220,6 +254,36 @@ def generate_q_cot_countdown(
     )
 
 
+def _countdown_grade(extracted: str | None, gold: str) -> bool:
+    return extracted is not None and expressions_match(extracted, gold)
+
+
+@extty.experiment(project="generate-q-cot-countdown")
+def generate_q_cot_countdown(
+    *,
+    gen_params: GenerateQCotParams,
+    dataset_artifacts: list[str] | None = None,
+) -> None:
+    _generate_q_cot(
+        gen_params=gen_params,
+        dataset_artifacts=dataset_artifacts,
+        grade_fn=_countdown_grade,
+    )
+
+
+@extty.experiment(project="generate-q-cot-gsm8k")
+def generate_q_cot_gsm8k(
+    *,
+    gen_params: GenerateQCotParams,
+    dataset_artifacts: list[str] | None = None,
+) -> None:
+    _generate_q_cot(
+        gen_params=gen_params,
+        dataset_artifacts=dataset_artifacts,
+        grade_fn=gsm8k_match,
+    )
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
@@ -228,6 +292,14 @@ if __name__ == "__main__":
                 fn=generate_q_cot_countdown,
                 include_dataset_glob=True,
                 include_prompt_collection_id=False,
+                dataset_glob_required=False,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=generate_q_cot_gsm8k,
+                include_dataset_glob=True,
+                include_prompt_collection_id=False,
+                dataset_glob_required=False,
             ),
         ]
     )
