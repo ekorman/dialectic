@@ -36,10 +36,33 @@ def train_loop(
     net: BaseTransformer,
     opt: torch.optim.Optimizer,
     train_step: Callable[[int], StepFunctionReturn],
-    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
-    val_envs: Sequence[Env],
+    val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]] | None = None,
+    val_envs: Sequence[Env] | None = None,
+    val_dataset_fn: Callable[[], tuple[EvaluationResult, list[Example]]] | None = None,
+    val_dataset_label: str = "val",
     start_step: int = 0,
 ):
+    """Generic training loop with two interchangeable val regimes.
+
+    Pick exactly one of:
+
+    - ``val_envs`` + ``val_fn``: RL-style. ``train_loop`` iterates the envs,
+      calls ``env.reseed()`` before each, invokes ``val_fn(env)``, and
+      namespaces metrics as ``val/<env_label>/...``. Use this when val has
+      genuine env semantics (multiple held-out envs, env-driven reseed,
+      cross-env aggregation).
+    - ``val_dataset_fn``: dataset-style. ``train_loop`` calls it with no
+      arguments once per val invocation and namespaces metrics as
+      ``val/<val_dataset_label>/...``. Use this for SFT-flavored training
+      where there's a single held-out dataset and the val function reads
+      from a closure.
+
+    Pass none of them and val is skipped (e.g., when ``val_freq <= 0``).
+    """
+    if val_fn is not None and val_dataset_fn is not None:
+        raise ValueError("Pass either (val_fn + val_envs) or val_dataset_fn, not both")
+    if val_fn is not None and val_envs is None:
+        raise ValueError("val_fn requires val_envs to be provided")
     global _sigterm_received
     _sigterm_received = False
     prev_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -74,13 +97,20 @@ def train_loop(
             should_val = (
                 val_freq > 0 and step % val_freq == 0 or n_episodes >= max_episodes
             )
-            if is_main_process() and should_val:
+            has_val = val_fn is not None or val_dataset_fn is not None
+            if is_main_process() and should_val and has_val:
                 log.info(f"Running evaluation at step {step}")
                 raw_net = unwrap_model(net)
                 was_training = raw_net.training
                 raw_net.eval()
                 val_start = time.perf_counter()
-                val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
+                if val_dataset_fn is not None:
+                    val_metrics = run_dataset_validation(
+                        val_dataset_fn=val_dataset_fn, label=val_dataset_label
+                    )
+                else:
+                    assert val_fn is not None and val_envs is not None
+                    val_metrics = run_validation(val_envs=val_envs, val_fn=val_fn)
                 val_time = time.perf_counter() - val_start
                 if was_training:
                     raw_net.train()
@@ -114,6 +144,8 @@ def run_validation(
     val_envs: Sequence[Env],
     val_fn: Callable[[Env], tuple[EvaluationResult, list[Example]]],
 ) -> dict[str, Any]:
+    """Multi-env (RL-style) validation. Iterates envs, reseeds each, calls
+    ``val_fn`` per env, and aggregates with per-env metric namespaces."""
     metrics: dict[str, Any] = {}
     val_means: list[float] = []
 
@@ -121,20 +153,44 @@ def run_validation(
         env.reseed()
         label = str(env)
         result, examples = val_fn(env)
-
-        metrics[f"val/{label}/mean"] = result.reward_mean
-        metrics[f"val/{label}/std"] = result.reward_std
-        for comp_name, comp_val in result.component_means.items():
-            metrics[f"val/{label}/{comp_name}"] = comp_val
-        if examples:
-            metrics[f"val/{label}/example"] = extty.BatchExample(
-                prompts=[e.prompt for e in examples],
-                responses=[e.responses for e in examples],
-                rewards=[e.rewards for e in examples],
-            )
+        _populate_metrics(metrics, label=label, result=result, examples=examples)
         val_means.append(result.reward_mean)
 
     if val_means:
         metrics["val/mean"] = sum(val_means) / len(val_means)
 
     return metrics
+
+
+@torch.no_grad()
+def run_dataset_validation(
+    *,
+    val_dataset_fn: Callable[[], tuple[EvaluationResult, list[Example]]],
+    label: str,
+) -> dict[str, Any]:
+    """Single-call (SFT-style) validation. Invokes ``val_dataset_fn`` once
+    and namespaces its metrics under ``val/<label>/...``."""
+    metrics: dict[str, Any] = {}
+    result, examples = val_dataset_fn()
+    _populate_metrics(metrics, label=label, result=result, examples=examples)
+    metrics["val/mean"] = result.reward_mean
+    return metrics
+
+
+def _populate_metrics(
+    metrics: dict[str, Any],
+    *,
+    label: str,
+    result: EvaluationResult,
+    examples: list[Example],
+) -> None:
+    metrics[f"val/{label}/mean"] = result.reward_mean
+    metrics[f"val/{label}/std"] = result.reward_std
+    for comp_name, comp_val in result.component_means.items():
+        metrics[f"val/{label}/{comp_name}"] = comp_val
+    if examples:
+        metrics[f"val/{label}/example"] = extty.BatchExample(
+            prompts=[e.prompt for e in examples],
+            responses=[e.responses for e in examples],
+            rewards=[e.rewards for e in examples],
+        )

@@ -22,7 +22,6 @@ from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import SftParams
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
-from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
 from dialectic.rl.inverse_cot_data import load_rollout_artifacts
 from dialectic.rl.inverse_cot_eval import compute_baseline
@@ -468,7 +467,7 @@ def train_sft_inverse_cot_countdown(
             metrics=metrics,
         )
 
-    def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
+    def _val_fn() -> tuple[EvaluationResult, list[extty.Example]]:
         p_raw.eval()
 
         # Merge LoRA weights for faster generation, restore after
@@ -572,13 +571,7 @@ def train_sft_inverse_cot_countdown(
             component_means=component_means,
         ), examples
 
-    val_envs: list[Env] = []
-    if val_data or val_prompts:
-        from dialectic.rl.dataset_env import DatasetEnv
-
-        dummy_list = val_prompts if val_prompts else val_data
-        val_envs = [DatasetEnv(dummy_list, seed=2026, label="sft_val")]
-
+    has_val = bool(val_data) or bool(val_prompts)
     train_loop(
         max_episodes=sft_params.max_episodes,
         save_ckpt_freq=sft_params.save_ckpt_freq,
@@ -586,8 +579,8 @@ def train_sft_inverse_cot_countdown(
         net=p,
         opt=opt,
         train_step=_train_step,
-        val_fn=_val_fn,
-        val_envs=val_envs,
+        val_dataset_fn=_val_fn if has_val else None,
+        val_dataset_label="sft_val",
     )
     cleanup()
 

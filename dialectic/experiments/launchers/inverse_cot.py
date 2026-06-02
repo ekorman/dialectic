@@ -23,8 +23,6 @@ from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, freeze_base_params
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
-from dialectic.rl.dataset_env import DatasetEnv
-from dialectic.rl.env import Env
 from dialectic.rl.evaluate import EvaluationResult
 from dialectic.rl.inverse_cot_data import (
     build_contrastive_batch,
@@ -230,10 +228,10 @@ def _train_inverse_cot(
     if not rollout_data:
         raise ValueError("No training data found (split='train')")
 
-    val_envs: list[Env] = (
-        [DatasetEnv(val_rollout_data, seed=2026, label="inverse_cot_val")]
+    val_dataset_label = (
+        f"inverse_cot_val_n{len(val_rollout_data[: train_params.val_episodes or len(val_rollout_data)])}"
         if val_rollout_data
-        else []
+        else "inverse_cot_val"
     )
 
     def _train_step(_step_idx: int) -> StepFunctionReturn:
@@ -332,7 +330,7 @@ def _train_inverse_cot(
         else len(val_rollout_data)
     )
 
-    def _val_fn(_val_env: Env) -> tuple[EvaluationResult, list[extty.Example]]:
+    def _val_fn() -> tuple[EvaluationResult, list[extty.Example]]:
         # Val runs only on rank 0 via `train_loop`'s `is_main_process` gate
         # (the whole val block is inside `if is_main_process() and
         # extty.has_active_run():` in `training.py`). Every forward pass
@@ -538,8 +536,8 @@ def _train_inverse_cot(
         net=q,
         opt=opt,
         train_step=_train_step,
-        val_fn=_val_fn,
-        val_envs=val_envs,
+        val_dataset_fn=_val_fn if val_rollout_data else None,
+        val_dataset_label=val_dataset_label,
         start_step=start_step,
     )
     cleanup()
