@@ -18,6 +18,7 @@ from dialectic.distributed import (
     wrap_ddp,
 )
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
+from dialectic.experiments.launchers._eval_helpers import load_run_config
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import SftParams
 from dialectic.llm.registry import MODEL_REGISTRY
@@ -210,16 +211,139 @@ def _build_sft_batch(
     return input_ids, loss_mask
 
 
-def _validate_sft_data_params(sft_params: SftParams) -> None:
-    """Enforce the slot/mix_ratio contract before any GPU work happens.
+def _maybe_trace_q_ckpt_from_q_cot_artifact(sft_params: SftParams) -> None:
+    """If ``q_cot_artifact`` is set but ``q_ckpt_run`` isn't, look up the
+    artifact's producing run (every extty artifact carries the
+    ``run_project``/``run_name`` of the run that created it) and pull
+    ``q_ckpt_run``/``q_ckpt_step`` from that run's ``gen_params``.
 
-    Rules:
+    This collapses the chain ``q_cot_artifact → generate-q-cot run →
+    q_ckpt_run → inverse-cot run → forward_ckpt + dataset_artifacts``
+    so the user only needs to point at the q-cot artifact for everything
+    downstream to fall into place.
+    """
+    if sft_params.q_cot_artifact is None or sft_params.q_ckpt_run is not None:
+        return
+    try:
+        meta = extty.get_artifact(sft_params.q_cot_artifact)
+    except (KeyError, FileNotFoundError):
+        log.warning(
+            f"q-cot artifact {sft_params.q_cot_artifact!r} not found; "
+            "cannot trace q_ckpt_run from it"
+        )
+        return
+    if meta.run_project is None or meta.run_name is None:
+        log.warning(
+            f"q-cot artifact {sft_params.q_cot_artifact!r} has no producing-run "
+            "linkage; cannot trace q_ckpt_run from it"
+        )
+        return
+    try:
+        gen_run = extty.get_run(meta.run_project, meta.run_name)
+    except FileNotFoundError:
+        log.warning(
+            f"q-cot's producing run {meta.run_project}/{meta.run_name} not reachable; "
+            "cannot trace q_ckpt_run"
+        )
+        return
+    gen_params = (
+        gen_run.config.get("gen_params", {}) if isinstance(gen_run.config, dict) else {}
+    )
+    sft_params.q_ckpt_run = gen_params.get("q_ckpt_run")
+    sft_params.q_ckpt_step = gen_params.get("q_ckpt_step")
+    log.info(
+        f"Traced q_ckpt from q_cot_artifact: "
+        f"{sft_params.q_ckpt_run} step {sft_params.q_ckpt_step} "
+        f"(via run {meta.run_project}/{meta.run_name})"
+    )
+
+
+def _maybe_auto_derive_from_q_ckpt(sft_params: SftParams) -> None:
+    """When ``q_ckpt_run`` is set, fill in ``start_ckpt_run/step`` and
+    ``p_rollout_artifact`` from q's training config — the natural SFT root
+    is "the p that q was trained against, trained further on the same
+    rollouts q saw."
+
+    Explicit CLI values always win; this only fills holes. If
+    ``q_ckpt_run`` is ``None`` or the run isn't reachable, this is a no-op
+    and the user is expected to have set those fields themselves (validation
+    will catch the omission).
+    """
+    if sft_params.q_ckpt_run is None:
+        return
+    q_config = load_run_config(sft_params.q_ckpt_run)
+    if q_config is None:
+        log.warning(
+            f"q run {sft_params.q_ckpt_run!r} not reachable; skipping auto-derivation"
+        )
+        return
+
+    q_icp = q_config.get("inverse_cot_params", {}) if isinstance(q_config, dict) else {}
+    q_train = q_config.get("train_params", {}) if isinstance(q_config, dict) else {}
+
+    if sft_params.model_name is None:
+        sft_params.model_name = q_train.get("model_name")
+    if sft_params.use_bf16 is None:
+        if "use_bf16" in q_train:
+            sft_params.use_bf16 = bool(q_train["use_bf16"])
+
+    if sft_params.start_ckpt_run is None:
+        sft_params.start_ckpt_run = q_icp.get("forward_ckpt_run")
+    if sft_params.start_ckpt_step is None:
+        sft_params.start_ckpt_step = q_icp.get("forward_ckpt_step")
+
+    if sft_params.p_rollout_artifact is None:
+        cfg_artifacts = (
+            q_config.get("dataset_artifacts") if isinstance(q_config, dict) else None
+        )
+        if cfg_artifacts:
+            if len(cfg_artifacts) > 1:
+                log.warning(
+                    f"q run was trained on {len(cfg_artifacts)} artifacts; "
+                    f"using the first ({cfg_artifacts[0]!r}) for p_rollout_artifact. "
+                    "Pass --sft_params.p-rollout-artifact explicitly to override."
+                )
+            sft_params.p_rollout_artifact = cfg_artifacts[0]
+
+    log.info("Auto-derived from q ckpt:")
+    log.info(f"  model_name:         {sft_params.model_name}")
+    log.info(f"  use_bf16:           {sft_params.use_bf16}")
+    log.info(
+        f"  start_ckpt:         {sft_params.start_ckpt_run} step {sft_params.start_ckpt_step}"
+    )
+    log.info(f"  p_rollout_artifact: {sft_params.p_rollout_artifact}")
+
+
+def _validate_sft_params(sft_params: SftParams) -> None:
+    """Enforce launcher-level invariants before any GPU work happens.
+
+    SFT contract:
+    - ``start_ckpt_run`` / ``start_ckpt_step`` must be set. The dataclass
+      itself defaults them to ``None`` (inherited from ``_StartCkptMixin``)
+      so the same param shape works for launchers that don't need them,
+      but SFT always needs a starting checkpoint — training from raw
+      pretrained weights isn't the intended use.
+
+    Data slots:
     - At least one of ``q_cot_artifact`` / ``p_rollout_artifact`` must be set.
     - If only ``q_cot_artifact`` is set, ``mix_ratio`` must be 1.0 (no rollout
       data to draw from).
     - If only ``p_rollout_artifact`` is set, ``mix_ratio`` must be 0.0.
     - ``mix_ratio`` must lie in ``[0, 1]``.
     """
+    if sft_params.model_name is None:
+        raise ValueError(
+            "`model_name` is required (set --sft_params.model-name or pass a "
+            "reachable --sft_params.q-ckpt-run for auto-derivation)"
+        )
+    if sft_params.use_bf16 is None:
+        raise ValueError(
+            "`use_bf16` is required (set --sft_params.use-bf16 / --no-sft_params.use-bf16 "
+            "or pass a reachable --sft_params.q-ckpt-run for auto-derivation)"
+        )
+    if sft_params.start_ckpt_run is None or sft_params.start_ckpt_step is None:
+        raise ValueError("`start_ckpt_run` and `start_ckpt_step` are required for SFT")
+
     has_q = sft_params.q_cot_artifact is not None
     has_p = sft_params.p_rollout_artifact is not None
     if not has_q and not has_p:
@@ -243,7 +367,6 @@ def train_sft_inverse_cot_countdown(
     *,
     sft_params: SftParams,
 ):
-    _validate_sft_data_params(sft_params)
     init_distributed()
     rank = get_rank()
     world_size = get_world_size()
@@ -298,8 +421,6 @@ def train_sft_inverse_cot_countdown(
         )
         freeze_base_params(p)
 
-    if sft_params.freeze_embeddings:
-        p.embed_tokens.requires_grad_(False)
     trainable_params = [pa for pa in p.parameters() if pa.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=sft_params.lr)
 
@@ -384,14 +505,16 @@ def train_sft_inverse_cot_countdown(
     if is_distributed() and rank == 0:
         barrier()
 
-    # Load a separate rollout artifact for val-accuracy evaluation. This is
-    # only used as a source of val *prompts* (the launcher re-generates with
-    # p via vLLM in compute_baseline); the rollout artifact's own
-    # completions feed the "hard prompt" classification.
+    # Val-accuracy source: re-parse ``p_rollout_artifact`` as
+    # PreTokenizedPrompt objects so the val split's prompts can drive
+    # fresh p-generation via compute_baseline. The rollout artifact's
+    # pre-generated completions also feed the "hard prompt" classification.
+    # When p_rollout_artifact is None (pure q-CoT training), val accuracy
+    # is skipped — only val loss runs.
     val_prompts = []
-    if sft_params.val_rollout_artifact is not None:
+    if sft_params.p_rollout_artifact is not None:
         rollout_splits = load_rollout_artifacts(
-            [sft_params.val_rollout_artifact], tokenizer
+            [sft_params.p_rollout_artifact], tokenizer
         )
         val_prompts = rollout_splits.get("val", [])
         log.info(f"Loaded {len(val_prompts)} val prompts for accuracy eval")
@@ -585,6 +708,17 @@ def train_sft_inverse_cot_countdown(
     cleanup()
 
 
+def _resolve_sft_kwargs(kwargs: dict) -> None:
+    """Pre-launch resolver hook. Runs in ``run_experiments_parser`` before
+    the experiment function is invoked, so the resolved values land in
+    extty's config snapshot rather than appearing as ``None`` placeholders.
+    """
+    sft_params: SftParams = kwargs["sft_params"]
+    _maybe_trace_q_ckpt_from_q_cot_artifact(sft_params)
+    _maybe_auto_derive_from_q_ckpt(sft_params)
+    _validate_sft_params(sft_params)
+
+
 if __name__ == "__main__":
     run_experiments_parser(
         [
@@ -592,6 +726,7 @@ if __name__ == "__main__":
                 env_name="countdown",
                 fn=train_sft_inverse_cot_countdown,
                 include_prompt_collection_id=False,
+                resolve_kwargs=_resolve_sft_kwargs,
             ),
         ]
     )

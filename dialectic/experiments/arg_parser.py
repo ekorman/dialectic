@@ -94,6 +94,13 @@ class Experiment:
     include_prompt_collection_id: bool
     include_dataset_glob: bool = False
     dataset_glob_required: bool = True
+    resolve_kwargs: Callable[[dict], None] | None = None
+    """Optional hook invoked after kwargs are constructed but before ``fn``
+    is called. Mutates ``kwargs`` (typically the dataclass instances inside
+    it) so that auto-derived values are present *before* ``@extty.experiment``
+    snapshots the config. Useful for launchers that want resolved values
+    (e.g. ``model_name`` traced from a checkpoint reference) recorded in
+    extty alongside the raw CLI inputs."""
 
 
 def _build_parser(
@@ -180,6 +187,8 @@ def run_experiments_parser(experiments: list[Experiment]):
         for p in parameters[None]:
             kwargs[p.name] = load_dc_from_arg_parser_args(p.name, p.annotation, args)
         _resolve_extra_args(ex, kwargs, None)
+        if ex.resolve_kwargs is not None:
+            ex.resolve_kwargs(kwargs)
         return ex.fn(**kwargs)
 
     for ex in experiments:
@@ -189,4 +198,6 @@ def run_experiments_parser(experiments: list[Experiment]):
                 param_class = p.annotation
                 kwargs[p.name] = load_dc_from_arg_parser_args(p.name, param_class, args)
             _resolve_extra_args(ex, kwargs, ex.env_name)
+            if ex.resolve_kwargs is not None:
+                ex.resolve_kwargs(kwargs)
             return ex.fn(**kwargs)

@@ -1,10 +1,63 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+# ---------- Reusable mixins ------------------------------------------------
+#
+# All mixin classes are `@dataclass(kw_only=True)` so their fields land in
+# the keyword-only section of any subclass's ``__init__``. This sidesteps
+# the dataclass "required-before-default" ordering rule when a concrete
+# class with required positional fields composes one or more mixins.
+#
+# arg_parser always constructs dataclasses via keyword arguments, so the
+# kw_only marker has no effect on the CLI surface — every flag still maps
+# to a field name the same way.
+
+
+@dataclass(kw_only=True)
+class _LoraMixin:
+    """LoRA configuration for the trainable model.
+
+    Concrete defaults — used by launchers that train or merge LoRA at known
+    settings. Eval-side classes that want None-as-"auto-derive-from-config"
+    semantics (e.g. ``EvalCommonParams``) declare their LoRA fields inline.
+    """
+
+    lora_rank: int | None = None
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_modules: str = "all"
+
+
+@dataclass(kw_only=True)
+class _StartCkptMixin:
+    """Resume-from-checkpoint reference."""
+
+    start_ckpt_run: str | None = None
+    start_ckpt_step: int | None = None
+
+
+@dataclass(kw_only=True)
+class _ForwardCkptMixin:
+    """Reference to the forward (p) checkpoint that q is paired with."""
+
+    forward_ckpt_run: str | None = None
+    forward_ckpt_step: int | None = None
+
+
+@dataclass(kw_only=True)
+class _QCkptMixin:
+    """Reference to a q checkpoint (optional — e.g. SFT importance weighting)."""
+
+    q_ckpt_run: str | None = None
+    q_ckpt_step: int | None = None
+
+
+# ---------- Concrete param classes -----------------------------------------
 
 
 @dataclass
-class TrainParams:
+class TrainParams(_StartCkptMixin):
     model_name: str
     batch_size: int
     lr: float
@@ -19,8 +72,6 @@ class TrainParams:
     val_batch_size: int
     val_freq: int
     val_episodes: int | None = None
-    start_ckpt_run: str | None = None
-    start_ckpt_step: int | None = None
     save_ckpt_freq: int = sys.maxsize
     logprob_chunk_size: int = 64
     warmup_steps: int = 0
@@ -67,7 +118,7 @@ class MathEnvParams:
 
 
 @dataclass
-class InverseCotParams:
+class InverseCotParams(_LoraMixin, _ForwardCkptMixin):
     normalize_by_sequence_length: bool
     freeze_lm_head: bool
     gradient_checkpointing: bool = False
@@ -75,12 +126,6 @@ class InverseCotParams:
     contrastive_margin: float = 1.0
     train_group_size: int | None = None
     max_cot_tokens: int | None = None
-    forward_ckpt_run: str | None = None
-    forward_ckpt_step: int | None = None
-    lora_rank: int | None = None
-    lora_alpha: float = 16.0
-    lora_dropout: float = 0.0
-    lora_target_modules: str = "all"
 
 
 @dataclass
@@ -94,6 +139,11 @@ class EvalCommonParams:
     the p checkpoint). p's own LoRA settings are recursively pulled from the
     forward run's config when available. Any field passed on the CLI takes
     precedence over the derived value.
+
+    LoRA / q-LoRA fields are declared inline (not via ``_LoraMixin`` /
+    ``_QLoraMixin``) because they default to ``None`` to signal
+    "auto-derive from config" rather than the concrete defaults used by
+    training-side launchers.
 
     Launchers that need additional knobs (sampling temperature, vLLM
     settings, etc.) subclass this and add them.
@@ -129,7 +179,7 @@ class InverseCotEvalParams(EvalCommonParams):
 
 
 @dataclass
-class GrpoEvalParams:
+class GrpoEvalParams(_LoraMixin):
     model_name: str
     forward_ckpt_run: str
     forward_ckpt_step: int
@@ -139,9 +189,6 @@ class GrpoEvalParams:
     max_tokens_generated: int = 500
     temperature: float = 0.7
     n_samples: int = 8
-    lora_rank: int | None = None
-    lora_alpha: float = 16.0
-    lora_target_modules: str = "all"
     max_prompts: int | None = None
     gpu_memory_utilization: float = 0.90
 
@@ -157,11 +204,7 @@ class GenerateQCotParams(EvalCommonParams):
 
 
 @dataclass
-class SftParams:
-    model_name: str
-    start_ckpt_run: str
-    start_ckpt_step: int
-    use_bf16: bool
+class SftParams(_LoraMixin, _StartCkptMixin, _QCkptMixin):
     batch_size: int
     lr: float
     max_episodes: int
@@ -179,15 +222,12 @@ class SftParams:
     mix_ratio: float = 1.0
     warmup_steps: int = 0
     max_tokens_generated: int = 500
-    val_rollout_artifact: str | None = None
     val_pass_at_n: int = 1
-    freeze_embeddings: bool = False
-    q_ckpt_run: str | None = None
-    q_ckpt_step: int | None = None
-    lora_rank: int | None = None
-    lora_alpha: float = 16.0
-    lora_dropout: float = 0.0
-    lora_target_modules: str = "all"
+    # Keyword-only + Optional so the launcher's resolver can fill them in
+    # from the q checkpoint's training config when ``q_ckpt_run`` is set.
+    # Validation enforces non-None after derivation.
+    model_name: str | None = field(default=None, kw_only=True)
+    use_bf16: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -205,7 +245,7 @@ class CombineJsonlParams:
 
 
 @dataclass
-class RolloutGenParams:
+class RolloutGenParams(_StartCkptMixin):
     model_name: str
     batch_size: int
     seed: int
@@ -216,5 +256,3 @@ class RolloutGenParams:
     n_neg_min: int
     use_bf16: bool
     n_shards: int = 1
-    start_ckpt_run: str | None = None
-    start_ckpt_step: int | None = None
