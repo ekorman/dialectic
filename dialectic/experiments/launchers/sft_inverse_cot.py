@@ -18,14 +18,22 @@ from dialectic.distributed import (
     wrap_ddp,
 )
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
-from dialectic.experiments.launchers._eval_helpers import load_run_config
+from dialectic.experiments.launchers._eval_helpers import (
+    load_run_config,
+    rollout_artifact_from_q_config,
+)
 from dialectic.experiments.models import load_model_and_opt
 from dialectic.experiments.params import SftParams
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.evaluate import EvaluationResult
-from dialectic.rl.inverse_cot_data import load_rollout_artifacts
-from dialectic.rl.inverse_cot_eval import compute_baseline
+from dialectic.rl.inverse_cot_data import load_rollout_artifact
+from dialectic.rl.inverse_cot_eval import (
+    GradeFn,
+    compute_baseline,
+    expressions_match,
+    gsm8k_match,
+)
 from dialectic.training import StepFunctionReturn, train_loop
 
 
@@ -218,7 +226,7 @@ def _maybe_trace_q_ckpt_from_q_cot_artifact(sft_params: SftParams) -> None:
     ``q_ckpt_run``/``q_ckpt_step`` from that run's ``gen_params``.
 
     This collapses the chain ``q_cot_artifact → generate-q-cot run →
-    q_ckpt_run → inverse-cot run → forward_ckpt + dataset_artifacts``
+    q_ckpt_run → inverse-cot run → forward_ckpt + p_rollout_artifact``
     so the user only needs to point at the q-cot artifact for everything
     downstream to fall into place.
     """
@@ -293,17 +301,7 @@ def _maybe_auto_derive_from_q_ckpt(sft_params: SftParams) -> None:
         sft_params.start_ckpt_step = q_icp.get("forward_ckpt_step")
 
     if sft_params.p_rollout_artifact is None:
-        cfg_artifacts = (
-            q_config.get("dataset_artifacts") if isinstance(q_config, dict) else None
-        )
-        if cfg_artifacts:
-            if len(cfg_artifacts) > 1:
-                log.warning(
-                    f"q run was trained on {len(cfg_artifacts)} artifacts; "
-                    f"using the first ({cfg_artifacts[0]!r}) for p_rollout_artifact. "
-                    "Pass --sft_params.p-rollout-artifact explicitly to override."
-                )
-            sft_params.p_rollout_artifact = cfg_artifacts[0]
+        sft_params.p_rollout_artifact = rollout_artifact_from_q_config(q_config)
 
     log.info("Auto-derived from q ckpt:")
     log.info(f"  model_name:         {sft_params.model_name}")
@@ -362,11 +360,23 @@ def _validate_sft_params(sft_params: SftParams) -> None:
         )
 
 
-@extty.experiment(project="sft-inverse-cot-countdown")
-def train_sft_inverse_cot_countdown(
+def _train_sft_inverse_cot(
     *,
     sft_params: SftParams,
+    grade_fn: GradeFn,
+    val_from_train_holdout: bool,
 ):
+    """Env-agnostic SFT body. Env-specific behavior enters through two knobs:
+
+    - ``grade_fn``: how the val-accuracy pass grades p's generations.
+    - ``val_from_train_holdout``: where training-time validation data comes
+      from. Countdown datasets carry a genuine train/val/test split, so the
+      artifact's val split is a legitimate validation set (``False``). GSM8K
+      only has official train/test — the pipeline loads the test set into
+      the "val" slot, so using it for training-time validation would
+      contaminate the final holdout; instead a random ``n_val_holdout``
+      prompts are split off the train data (``True``).
+    """
     init_distributed()
     rank = get_rank()
     world_size = get_world_size()
@@ -479,13 +489,75 @@ def train_sft_inverse_cot_countdown(
     train_q_cot = q_cot_by_split.get("train", [])
     train_p_rollout = p_rollout_by_split.get("train", [])
 
-    # Val-loss source: prefer q-CoT val split when present (it's what
-    # actually exercises the inverse-CoT supervision); fall back to rollout
-    # val when only rollouts are loaded.
-    if q_cot_by_split:
-        val_data = q_cot_by_split.get("val", [])
+    val_prompts = []
+    if val_from_train_holdout:
+        # Training-time validation comes from a random holdout of TRAIN
+        # prompts — the artifact's "val" slot (GSM8K's official test set) is
+        # never consumed during training so it stays clean for final test
+        # metrics. The holdout is sampled at the prompt level (not the
+        # example level) so a held-out prompt's other completions can't leak
+        # into training, and with a rank-independent RNG (no ``+ rank``
+        # offset) so every DDP rank excludes the same prompts.
+        holdout_rng = random.Random(sft_params.seed)
+        if sft_params.p_rollout_artifact is not None:
+            # PreTokenizedPrompt objects retain the gold answer and the
+            # rollout completions, so the held-out prompts can drive
+            # fresh-generation val accuracy (compute_baseline) including
+            # the hard-prompt bucket.
+            rollout_splits = load_rollout_artifact(
+                sft_params.p_rollout_artifact, tokenizer, filter_train_split=False
+            )
+            rollout_train_prompts = rollout_splits.get("train", [])
+            n_holdout = min(sft_params.n_val_holdout, len(rollout_train_prompts))
+            val_prompts = (
+                holdout_rng.sample(rollout_train_prompts, n_holdout)
+                if n_holdout > 0
+                else []
+            )
+            holdout_keys = {tuple(pr.prompt_ids) for pr in val_prompts}
+        else:
+            # Pure q-CoT mode: no rollout artifact to source gold answers
+            # from, so hold out at the q-cot prompt level. Val accuracy is
+            # skipped (no equations available); val loss still runs.
+            unique_keys = sorted({tuple(ex["prompt_ids"]) for ex in train_q_cot})
+            n_holdout = min(sft_params.n_val_holdout, len(unique_keys))
+            holdout_keys = (
+                set(holdout_rng.sample(unique_keys, n_holdout))
+                if n_holdout > 0
+                else set()
+            )
+
+        def _split_holdout(pool: list[dict]) -> tuple[list[dict], list[dict]]:
+            kept: list[dict] = []
+            held: list[dict] = []
+            for ex in pool:
+                (held if tuple(ex["prompt_ids"]) in holdout_keys else kept).append(ex)
+            return kept, held
+
+        train_q_cot, val_q_cot = _split_holdout(train_q_cot)
+        train_p_rollout, val_p_rollout = _split_holdout(train_p_rollout)
+        val_data = val_q_cot + val_p_rollout
+
+        log.info(
+            f"Val holdout: {len(holdout_keys)} train prompts held out — "
+            f"{len(val_q_cot)} q-cot + {len(val_p_rollout)} rollout examples for "
+            f"val loss, {len(val_prompts)} prompts for val accuracy. "
+            "Artifact val/test splits untouched (reserved for final test metrics)."
+        )
     else:
+        # The artifact carries a genuine train/val/test split (countdown):
+        # use its val split for training-time validation; test remains the
+        # final holdout. Val loss always comes from the rollout val split —
+        # q-cot artifacts are train-only by construction (generate_q_cot
+        # emits one artifact per split, and synthesis targets train), so
+        # they never carry val data.
         val_data = p_rollout_by_split.get("val", [])
+        if sft_params.p_rollout_artifact is not None:
+            rollout_splits = load_rollout_artifact(
+                sft_params.p_rollout_artifact, tokenizer
+            )
+            val_prompts = rollout_splits.get("val", [])
+            log.info(f"Loaded {len(val_prompts)} val prompts for accuracy eval")
 
     if sft_params.mix_ratio > 0 and not train_q_cot:
         raise ValueError(
@@ -504,20 +576,6 @@ def train_sft_inverse_cot_countdown(
 
     if is_distributed() and rank == 0:
         barrier()
-
-    # Val-accuracy source: re-parse ``p_rollout_artifact`` as
-    # PreTokenizedPrompt objects so the val split's prompts can drive
-    # fresh p-generation via compute_baseline. The rollout artifact's
-    # pre-generated completions also feed the "hard prompt" classification.
-    # When p_rollout_artifact is None (pure q-CoT training), val accuracy
-    # is skipped — only val loss runs.
-    val_prompts = []
-    if sft_params.p_rollout_artifact is not None:
-        rollout_splits = load_rollout_artifacts(
-            [sft_params.p_rollout_artifact], tokenizer
-        )
-        val_prompts = rollout_splits.get("val", [])
-        log.info(f"Loaded {len(val_prompts)} val prompts for accuracy eval")
 
     def _train_step(_step_idx: int) -> StepFunctionReturn:
         p.train()
@@ -655,6 +713,7 @@ def train_sft_inverse_cot_countdown(
                 pad_token_id=model_info.pad_token_id,
                 max_tokens_generated=sft_params.max_tokens_generated,
                 batch_size=sft_params.val_batch_size,
+                grade_fn=grade_fn,
                 use_bf16=sft_params.use_bf16,
                 temperature=sft_params.temperature,
                 n_samples=sft_params.val_pass_at_n,
@@ -708,6 +767,39 @@ def train_sft_inverse_cot_countdown(
     cleanup()
 
 
+def _countdown_grade(extracted: str | None, gold: str) -> bool:
+    return extracted is not None and expressions_match(extracted, gold)
+
+
+@extty.experiment(project="sft-inverse-cot-countdown")
+def train_sft_inverse_cot_countdown(
+    *,
+    sft_params: SftParams,
+):
+    # Countdown datasets carry a genuine train/val/test split — validate
+    # against the artifact's val split; test remains the final holdout.
+    _train_sft_inverse_cot(
+        sft_params=sft_params,
+        grade_fn=_countdown_grade,
+        val_from_train_holdout=False,
+    )
+
+
+@extty.experiment(project="sft-inverse-cot-gsm8k")
+def train_sft_inverse_cot_gsm8k(
+    *,
+    sft_params: SftParams,
+):
+    # GSM8K only has official train/test; the pipeline loads test into the
+    # "val" slot, so training-time validation must come from a train holdout
+    # to keep the test set clean for final metrics.
+    _train_sft_inverse_cot(
+        sft_params=sft_params,
+        grade_fn=gsm8k_match,
+        val_from_train_holdout=True,
+    )
+
+
 def _resolve_sft_kwargs(kwargs: dict) -> None:
     """Pre-launch resolver hook. Runs in ``run_experiments_parser`` before
     the experiment function is invoked, so the resolved values land in
@@ -725,6 +817,12 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=train_sft_inverse_cot_countdown,
+                include_prompt_collection_id=False,
+                resolve_kwargs=_resolve_sft_kwargs,
+            ),
+            Experiment(
+                env_name="gsm8k",
+                fn=train_sft_inverse_cot_gsm8k,
                 include_prompt_collection_id=False,
                 resolve_kwargs=_resolve_sft_kwargs,
             ),

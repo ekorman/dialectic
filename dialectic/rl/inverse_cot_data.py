@@ -23,28 +23,28 @@ class PreTokenizedPrompt:
     equation: str | None = None
 
 
-def load_rollout_artifacts(
-    artifact_names: list[str],
+def load_rollout_artifact(
+    artifact_name: str,
     tokenizer: Tokenizer,
     max_cot_tokens: int | None = None,
     min_completions_per_prompt: int = 2,
     filter_train_split: bool = True,
 ) -> dict[str, list[PreTokenizedPrompt]]:
-    """Load rollout data from multiple artifacts, grouped by split.
+    """Load rollout data from an artifact, grouped by split.
 
     Returns dict mapping split name to list of PreTokenizedPrompt.
     Entries without a split field go under "train".
 
-    Tokenization is done via a single ``encode_batch`` call per shard
-    rather than per-string ``encode`` calls. For a typical shard (~200
-    prompts × 32 completions = ~13k strings per shard) this is ~10-30×
-    faster because the tokenizers library parallelizes batch encoding
-    across threads on the Rust side.
+    Tokenization is done via a single ``encode_batch`` call rather than
+    per-string ``encode`` calls. For a typical artifact (thousands of
+    prompts × 32 completions) this is ~10-30× faster because the
+    tokenizers library parallelizes batch encoding across threads on
+    the Rust side.
 
     Parameters
     ----------
-    artifact_names
-        Names of extty rollout artifacts to load.
+    artifact_name
+        Name of the extty rollout artifact to load.
     tokenizer
         Fast tokenizer for the target model. Will be reset (no padding,
         no truncation) before use to protect against caller-side mutation.
@@ -72,101 +72,89 @@ def load_rollout_artifacts(
     tokenizer.no_truncation()
 
     by_split: dict[str, list[PreTokenizedPrompt]] = {}
-    total_completions_dropped = 0
-    total_prompts_dropped = 0
-    for name in artifact_names:
-        data = extty.load_artifact(name, cache=True)
-        if not isinstance(data, bytes):
-            raise ValueError(f"Expected bytes from artifact {name}, got {type(data)}")
-
-        entries: list[dict] = [
-            json.loads(line) for line in data.decode().splitlines() if line.strip()
-        ]
-        if not entries:
-            log.info(f"Loaded 0 prompts from artifact '{name}'")
-            continue
-
-        # Build a single flat list of all strings to tokenize for this
-        # shard. Layout: [prompt_0, prompt_1, ..., prompt_{N-1},
-        # ans_0_0, cot_0_0, ans_0_1, cot_0_1, ..., ans_{N-1}_{K-1}, cot_{N-1}_{K-1}]
-        texts: list[str] = [entry["prompt_str"] for entry in entries]
-        completion_offsets: list[
-            int
-        ] = []  # one per entry: where its first ans_id lives
-        for entry in entries:
-            completion_offsets.append(len(texts))
-            for comp in entry["completions"]:
-                texts.append(" " + comp["answer"])
-                texts.append(comp["cot"])
-
-        encoded = tokenizer.encode_batch(texts)
-
-        shard_kept = 0
-        shard_comp_dropped = 0
-        shard_prompt_dropped = 0
-        for i, entry in enumerate(entries):
-            prompt_ids = encoded[i].ids
-            completions: list[PreTokenizedCompletion] = []
-            cursor = completion_offsets[i]
-            for comp in entry["completions"]:
-                answer_ids = encoded[cursor].ids
-                cot_ids = encoded[cursor + 1].ids
-                cursor += 2
-                if max_cot_tokens is not None and len(cot_ids) > max_cot_tokens:
-                    shard_comp_dropped += 1
-                    continue
-                completions.append(
-                    PreTokenizedCompletion(
-                        answer_ids=list(answer_ids),
-                        cot_ids=list(cot_ids),
-                        is_correct=comp["is_correct"],
-                    )
-                )
-
-            equation = entry.get("equation")
-            if equation and "=" in equation:
-                equation = equation.split("=")[0].strip()
-            split = entry.get("split", "train")
-
-            if split == "train" and filter_train_split:
-                has_correct = any(c.is_correct for c in completions)
-                has_incorrect = any(not c.is_correct for c in completions)
-                if (
-                    len(completions) < min_completions_per_prompt
-                    or not has_correct
-                    or not has_incorrect
-                ):
-                    shard_prompt_dropped += 1
-                    continue
-            elif not completions:
-                shard_prompt_dropped += 1
-                continue
-            by_split.setdefault(split, []).append(
-                PreTokenizedPrompt(
-                    prompt_ids=list(prompt_ids),
-                    completions=completions,
-                    equation=equation,
-                )
-            )
-            shard_kept += 1
-
-        total_completions_dropped += shard_comp_dropped
-        total_prompts_dropped += shard_prompt_dropped
-        if shard_comp_dropped or shard_prompt_dropped:
-            log.info(
-                f"Loaded {shard_kept} prompts from artifact '{name}' "
-                f"(dropped {shard_comp_dropped} completions over max_cot_tokens={max_cot_tokens}, "
-                f"{shard_prompt_dropped} prompts with too few / unmixed completions)"
-            )
-        else:
-            log.info(f"Loaded {shard_kept} prompts from artifact '{name}'")
-
-    if total_completions_dropped or total_prompts_dropped:
-        log.info(
-            f"Length filter: dropped {total_completions_dropped} completions and "
-            f"{total_prompts_dropped} prompts across all shards "
-            f"(max_cot_tokens={max_cot_tokens}, min_completions_per_prompt={min_completions_per_prompt})"
+    data = extty.load_artifact(artifact_name, cache=True)
+    if not isinstance(data, bytes):
+        raise ValueError(
+            f"Expected bytes from artifact {artifact_name}, got {type(data)}"
         )
+
+    entries: list[dict] = [
+        json.loads(line) for line in data.decode().splitlines() if line.strip()
+    ]
+    if not entries:
+        log.info(f"Loaded 0 prompts from artifact '{artifact_name}'")
+        return by_split
+
+    # Build a single flat list of all strings to tokenize. Layout:
+    # [prompt_0, prompt_1, ..., prompt_{N-1},
+    # ans_0_0, cot_0_0, ans_0_1, cot_0_1, ..., ans_{N-1}_{K-1}, cot_{N-1}_{K-1}]
+    texts: list[str] = [entry["prompt_str"] for entry in entries]
+    completion_offsets: list[int] = []  # one per entry: where its first ans_id lives
+    for entry in entries:
+        completion_offsets.append(len(texts))
+        for comp in entry["completions"]:
+            texts.append(" " + comp["answer"])
+            texts.append(comp["cot"])
+
+    encoded = tokenizer.encode_batch(texts)
+
+    n_kept = 0
+    n_comp_dropped = 0
+    n_prompt_dropped = 0
+    for i, entry in enumerate(entries):
+        prompt_ids = encoded[i].ids
+        completions: list[PreTokenizedCompletion] = []
+        cursor = completion_offsets[i]
+        for comp in entry["completions"]:
+            answer_ids = encoded[cursor].ids
+            cot_ids = encoded[cursor + 1].ids
+            cursor += 2
+            if max_cot_tokens is not None and len(cot_ids) > max_cot_tokens:
+                n_comp_dropped += 1
+                continue
+            completions.append(
+                PreTokenizedCompletion(
+                    answer_ids=list(answer_ids),
+                    cot_ids=list(cot_ids),
+                    is_correct=comp["is_correct"],
+                )
+            )
+
+        equation = entry.get("equation")
+        if equation and "=" in equation:
+            equation = equation.split("=")[0].strip()
+        split = entry.get("split", "train")
+
+        if split == "train" and filter_train_split:
+            has_correct = any(c.is_correct for c in completions)
+            has_incorrect = any(not c.is_correct for c in completions)
+            if (
+                len(completions) < min_completions_per_prompt
+                or not has_correct
+                or not has_incorrect
+            ):
+                n_prompt_dropped += 1
+                continue
+        elif not completions:
+            n_prompt_dropped += 1
+            continue
+        by_split.setdefault(split, []).append(
+            PreTokenizedPrompt(
+                prompt_ids=list(prompt_ids),
+                completions=completions,
+                equation=equation,
+            )
+        )
+        n_kept += 1
+
+    if n_comp_dropped or n_prompt_dropped:
+        log.info(
+            f"Loaded {n_kept} prompts from artifact '{artifact_name}' "
+            f"(dropped {n_comp_dropped} completions over max_cot_tokens={max_cot_tokens}, "
+            f"{n_prompt_dropped} prompts with too few / unmixed completions)"
+        )
+    else:
+        log.info(f"Loaded {n_kept} prompts from artifact '{artifact_name}'")
     for split, prompts in sorted(by_split.items()):
         n_all_correct = sum(
             1 for p in prompts if all(c.is_correct for c in p.completions)

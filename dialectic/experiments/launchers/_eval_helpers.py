@@ -35,7 +35,7 @@ class ResolvedEvalCommonParams:
     q_lora_rank: int | None
     q_lora_alpha: float
     q_lora_target_modules: str
-    dataset_artifacts: list[str]
+    p_rollout_artifact: str
     seed: int
     split: str
     max_prompts: int | None
@@ -87,17 +87,39 @@ def _pick_lora_section(config: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def rollout_artifact_from_q_config(q_config: dict[str, Any]) -> str | None:
+    """Recover the p-rollout artifact a q run was trained on.
+
+    New q runs record it as ``inverse_cot_params.p_rollout_artifact``
+    (single str); older runs recorded a top-level ``dataset_artifacts``
+    list (via the since-removed ``--dataset-glob`` plumbing). Handle both
+    so lineage tracing keeps working for existing checkpoints.
+    """
+    icp = q_config.get("inverse_cot_params")
+    if isinstance(icp, dict) and icp.get("p_rollout_artifact"):
+        return icp["p_rollout_artifact"]
+    legacy = q_config.get("dataset_artifacts")
+    if legacy:
+        if len(legacy) > 1:
+            log.warning(
+                f"q run was trained on {len(legacy)} artifacts; using the "
+                f"first ({legacy[0]!r}). Pass the artifact explicitly to "
+                "override."
+            )
+        return legacy[0]
+    return None
+
+
 def resolve_eval_common_params(
     eval_params: EvalCommonParams,
-    dataset_artifacts: list[str] | None,
 ) -> ResolvedEvalCommonParams:
     """Fill in every ``None`` field on the shared common-eval surface.
 
     Strategy:
     1. Load q's config from ``q_ckpt_run``. From it, take ``model_name``,
        ``use_bf16``, the q-LoRA settings (``inverse_cot_params.lora_*``),
-       the forward-checkpoint reference, and the ``dataset_artifacts`` list
-       (the same rollout artifact q was trained on).
+       the forward-checkpoint reference, and the p-rollout artifact (the
+       same rollout artifact q was trained on).
     2. Load the forward run's config (the GRPO/SFT run that produced p).
        Take p's LoRA settings from whichever param section has ``lora_rank``.
     3. Any explicit value the user set on the CLI overrides the derived one.
@@ -168,16 +190,14 @@ def resolve_eval_common_params(
     p_lora_alpha = p_lora_alpha if p_lora_alpha is not None else 16.0
     p_lora_target_modules = p_lora_target_modules or "all"
 
-    if dataset_artifacts is None:
-        cfg_artifacts = (
-            q_config.get("dataset_artifacts") if isinstance(q_config, dict) else None
+    p_rollout_artifact = eval_params.p_rollout_artifact
+    if p_rollout_artifact is None and isinstance(q_config, dict):
+        p_rollout_artifact = rollout_artifact_from_q_config(q_config)
+    if p_rollout_artifact is None:
+        raise ValueError(
+            "`p_rollout_artifact` is not set and could not be derived from "
+            "the q run's config."
         )
-        if not cfg_artifacts:
-            raise ValueError(
-                "No `dataset_artifacts` set via --dataset-glob and the q run's "
-                "config has no `dataset_artifacts` field to fall back to."
-            )
-        dataset_artifacts = list(cfg_artifacts)
 
     resolved = ResolvedEvalCommonParams(
         q_ckpt_run=eval_params.q_ckpt_run,
@@ -192,7 +212,7 @@ def resolve_eval_common_params(
         q_lora_rank=q_lora_rank,
         q_lora_alpha=q_lora_alpha,
         q_lora_target_modules=q_lora_target_modules,
-        dataset_artifacts=dataset_artifacts,
+        p_rollout_artifact=p_rollout_artifact,
         seed=eval_params.seed,
         split=eval_params.split,
         max_prompts=eval_params.max_prompts,
@@ -203,7 +223,6 @@ def resolve_eval_common_params(
 
 def resolve_inverse_cot_eval_params(
     eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str] | None,
 ) -> ResolvedInverseCotEvalParams:
     """Resolve the FCR-specific param surface: common fields + sampling knobs.
 
@@ -211,7 +230,7 @@ def resolve_inverse_cot_eval_params(
     FCR-specific knobs (``temperature``, ``n_samples``, vLLM settings) are
     pure CLI inputs — no derivation, so they're copied through verbatim.
     """
-    common = resolve_eval_common_params(eval_params, dataset_artifacts)
+    common = resolve_eval_common_params(eval_params)
     return ResolvedInverseCotEvalParams(
         **common.__dict__,
         batch_size=eval_params.batch_size,
@@ -238,7 +257,7 @@ def _log_resolved(resolved: ResolvedEvalCommonParams) -> None:
     log.info(
         f"  q LoRA:               rank={resolved.q_lora_rank} alpha={resolved.q_lora_alpha} target={resolved.q_lora_target_modules}"
     )
-    log.info(f"  dataset_artifacts:    {resolved.dataset_artifacts}")
+    log.info(f"  p_rollout_artifact:   {resolved.p_rollout_artifact}")
 
 
 def resolve_lora_targets(target_modules: str) -> tuple[str, ...]:

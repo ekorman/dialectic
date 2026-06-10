@@ -1,6 +1,5 @@
 import sys
 from dataclasses import dataclass, field
-from typing import Literal
 
 # ---------- Reusable mixins ------------------------------------------------
 #
@@ -109,18 +108,13 @@ class GSM8kParams:
 
 
 @dataclass
-class MathEnvParams:
-    difficulty: Literal["trivial", "easy", "medium"]
-    direct_arithmetic_prob: float = 0.2
-    twostep_arithmetic_prob: float = 0.3
-    word_problem_prob: float = 0.35
-    number_properties_prob: float = 0.15
-
-
-@dataclass
 class InverseCotParams(_LoraMixin, _ForwardCkptMixin):
     normalize_by_sequence_length: bool
     freeze_lm_head: bool
+    # The p-rollout artifact q trains on. Required at runtime (validated in
+    # the launcher); has no derivation anchor since q training is the root
+    # of the inverse-CoT lineage.
+    p_rollout_artifact: str | None = None
     gradient_checkpointing: bool = False
     contrastive_weight: float = 1.0
     contrastive_margin: float = 1.0
@@ -161,6 +155,10 @@ class EvalCommonParams:
     q_lora_rank: int | None = None
     q_lora_alpha: float | None = None
     q_lora_target_modules: str | None = None
+    # The rollout artifact to read prompts/completions from. Auto-derived
+    # from the q run's training config (the artifact q was trained on)
+    # when not set.
+    p_rollout_artifact: str | None = None
     seed: int = 42
     split: str = "val"
     max_prompts: int | None = None
@@ -180,10 +178,21 @@ class InverseCotEvalParams(EvalCommonParams):
 
 @dataclass
 class GrpoEvalParams(_LoraMixin):
-    model_name: str
-    forward_ckpt_run: str
-    forward_ckpt_step: int
-    use_bf16: bool
+    """GRPO p-evaluator inputs.
+
+    Only one model is in scope here (the checkpoint being evaluated), so
+    the field is called ``ckpt_run`` rather than ``forward_ckpt_run`` —
+    "forward" only carries meaning in inverse-CoT contexts where q is
+    paired with p.
+
+    The minimal CLI invocation is
+    ``--eval_params.p-rollout-artifact <name>``: the artifact's producing-run
+    metadata is traced back to its ``rollout_gen_params.start_ckpt_run/step``,
+    which gives the ckpt to evaluate. ``model_name`` and ``use_bf16`` are
+    then pulled from that ckpt's ``train_params``. Any field passed on the
+    CLI overrides the corresponding step in the derivation chain.
+    """
+
     seed: int = 42
     split: str = "val"
     max_tokens_generated: int = 500
@@ -191,6 +200,14 @@ class GrpoEvalParams(_LoraMixin):
     n_samples: int = 8
     max_prompts: int | None = None
     gpu_memory_utilization: float = 0.90
+    # Keyword-only + Optional so the launcher's resolver hook can fill
+    # them in from the rollout artifact's producing run and the forward
+    # checkpoint's training config before extty snapshots the kwargs.
+    p_rollout_artifact: str | None = field(default=None, kw_only=True)
+    model_name: str | None = field(default=None, kw_only=True)
+    ckpt_run: str | None = field(default=None, kw_only=True)
+    ckpt_step: int | None = field(default=None, kw_only=True)
+    use_bf16: bool | None = field(default=None, kw_only=True)
 
 
 @dataclass
@@ -201,6 +218,11 @@ class GenerateQCotParams(EvalCommonParams):
     batch_size: int = 16
     max_tokens_generated: int = 500
     temperature: float = 0.3
+    # Which split of the rollout artifact to generate q-CoTs for. Overrides
+    # the EvalCommonParams default of "val": synthesis targets training
+    # data — only the train split's q-CoTs are ever consumed (by SFT), so
+    # generating for val/test burns GPU on artifacts nothing reads.
+    split: str = "train"
 
 
 @dataclass
@@ -223,6 +245,12 @@ class SftParams(_LoraMixin, _StartCkptMixin, _QCkptMixin):
     warmup_steps: int = 0
     max_tokens_generated: int = 500
     val_pass_at_n: int = 1
+    # Only used by envs whose datasets lack a genuine val split (gsm8k):
+    # training-time validation is a random holdout of this many TRAIN
+    # prompts, keeping the artifact's "val" slot (the official test set)
+    # clean for final test metrics. Envs with a real train/val/test split
+    # (countdown) validate against the artifact's val split and ignore this.
+    n_val_holdout: int = 100
     # Keyword-only + Optional so the launcher's resolver can fill them in
     # from the q checkpoint's training config when ``q_ckpt_run`` is set.
     # Validation enforces non-None after derivation.
@@ -240,19 +268,17 @@ class DatasetGenParams:
 
 
 @dataclass
-class CombineJsonlParams:
-    name_prefix: str
-
-
-@dataclass
 class RolloutGenParams(_StartCkptMixin):
+    """Note: rollout artifacts are COMPLETE — every prompt is emitted
+    regardless of its correctness mix. Any filtering (mixed-correctness for
+    q training, ``is_correct`` for SFT, …) happens explicitly at load time
+    in the consumer.
+    """
+
     model_name: str
     batch_size: int
     seed: int
     temperature: float
     max_tokens_generated: int
     group_size: int
-    n_pos_min: int
-    n_neg_min: int
     use_bf16: bool
-    n_shards: int = 1

@@ -4,10 +4,9 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, Literal
+from typing import Generic
 
-from dialectic.rl.math import generate_problem
-from dialectic.rl.types import QA, A, EnvResponse, T
+from dialectic.rl.types import A, EnvResponse, T
 
 
 class EpisodeIsDoneError(RuntimeError):
@@ -25,90 +24,6 @@ class Env(ABC, Generic[T, A]):
 
     @abstractmethod
     def step(self, action: A) -> EnvResponse[T] | None: ...
-
-
-class ArithmeticEnv(Env[QA[float], None]):
-    """
-    Toy RL environment for simple arithmetic problems.
-
-    Generates random arithmetic problems for validating RL algorithms
-    with small LLMs. Single-step episodes.
-
-    Parameters
-    ----------
-    min_value : int, optional
-        Minimum value for operands. Default is 0.
-    max_value : int, optional
-        Maximum value for operands. Default is 100.
-    operations : tuple[str, ...], optional
-        Operations to use. Default is ("+", "-").
-    num_operands : int, optional
-        Number of operands in each problem. Default is 2.
-    """
-
-    def __init__(
-        self,
-        min_value: int = 0,
-        max_value: int = 100,
-        operations: tuple[str, ...] = ("+", "-"),
-        num_operands: int = 2,
-    ):
-        self.min_value = min_value
-        self.max_value = max_value
-        self.operations = operations
-        self.num_operands = num_operands
-        self.rng = random.Random()
-
-    def reseed(self) -> None:
-        pass
-
-    def _generate_problem(self) -> tuple[str, float]:
-        """
-        Generate a random arithmetic problem.
-
-        Returns
-        -------
-        tuple[str, int | float]
-            Question string and correct answer.
-        """
-        operands = [
-            self.rng.randint(self.min_value, self.max_value)
-            for _ in range(self.num_operands)
-        ]
-        ops = [self.rng.choice(self.operations) for _ in range(self.num_operands - 1)]
-
-        expr_parts = [str(operands[0])]
-        for i, op in enumerate(ops):
-            expr_parts.append(op)
-            expr_parts.append(str(operands[i + 1]))
-        expression = " ".join(expr_parts)
-
-        result: int | float = operands[0]
-        for i, op in enumerate(ops):
-            if op == "+":
-                result += operands[i + 1]
-            elif op == "-":
-                result -= operands[i + 1]
-            elif op == "*":
-                result *= operands[i + 1]
-            elif op == "/":
-                result /= operands[i + 1]
-
-        result = float(result)
-
-        question = f"What is {expression}?"
-        return question, result
-
-    def reset(self, seed: int | None = None) -> EnvResponse[QA[float]]:
-        self.rng.seed(seed)
-        q, a = self._generate_problem()
-        return EnvResponse(
-            is_done=True,
-            data=QA(question=q, answer=a),
-        )
-
-    def step(self, action: None):
-        raise EpisodeIsDoneError
 
 
 class GSM8kEnv(Env["MathState", None]):
@@ -360,67 +275,3 @@ class MathState:
     prompt: str
     answer: str
     problem_type: str
-
-
-class MathEnv(Env[MathState, None]):
-    """
-    Math problem environment.
-
-    Generates random math problems using MathDatasetConfig.
-    Single-step episodes.
-
-    Parameters
-    ----------
-    config : MathDatasetConfig
-        Problem mix and difficulty configuration.
-    seed : int or None
-        Random seed for reproducibility.
-    """
-
-    def __init__(
-        self,
-        *,
-        direct_arithmetic_prob: float,
-        twostep_arithmetic_prob: float,
-        word_problem_prob: float,
-        number_properties_prob: float,
-        difficulty: Literal["trivial", "easy", "medium"],
-        seed: int | None = None,
-    ):
-        self.direct_arithmetic_prob = direct_arithmetic_prob
-        self.twostep_arithmetic_prob = twostep_arithmetic_prob
-        self.word_problem_prob = word_problem_prob
-        self.number_properties_prob = number_properties_prob
-        self.difficulty = difficulty
-
-        self._seed = seed
-        self.rng = random.Random(seed)
-
-    def reseed(self) -> None:
-        self.rng = random.Random(self._seed)
-
-    def __str__(self) -> str:
-        return f"math_{self.difficulty}"
-
-    def reset(self, seed: int | None = None) -> EnvResponse[MathState]:
-        if seed is not None:
-            self.rng.seed(seed)
-        problem = generate_problem(
-            direct_arithmetic_prob=self.direct_arithmetic_prob,
-            twostep_arithmetic_prob=self.twostep_arithmetic_prob,
-            word_problem_prob=self.word_problem_prob,
-            number_properties_prob=self.number_properties_prob,
-            difficulty=self.difficulty,
-            rng=self.rng,
-        )
-        return EnvResponse(
-            is_done=True,
-            data=MathState(
-                prompt=problem.question,
-                answer=str(problem.answer),
-                problem_type=problem.problem_type,
-            ),
-        )
-
-    def step(self, action: None):
-        raise EpisodeIsDoneError

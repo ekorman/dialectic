@@ -3,7 +3,7 @@ import tempfile
 
 import pytest
 
-from dialectic.rl.env import ArithmeticEnv, CountdownEnv, EpisodeIsDoneError, GSM8kEnv
+from dialectic.rl.env import CountdownEnv, EpisodeIsDoneError, GSM8kEnv
 from dialectic.rl.types import EnvResponse
 
 
@@ -34,7 +34,7 @@ def sample_data() -> str:
 @pytest.fixture
 def env(sample_data: str) -> GSM8kEnv:
     """Create a GSM8kEnv with sample data."""
-    return GSM8kEnv(path=sample_data, eval_mode=True)
+    return GSM8kEnv(path=sample_data, prompt_template="{question}", eval_mode=True)
 
 
 class TestGSM8kEnv:
@@ -51,44 +51,23 @@ class TestGSM8kEnv:
 
     def test_cycles_through_all_problems(self, env: GSM8kEnv):
         """Test that environment cycles through all problems."""
-        seen_questions = set()
+        seen_prompts = set()
 
         for _ in range(3):
             resp = env.reset()
-            seen_questions.add(resp.data.question)
+            seen_prompts.add(resp.data.prompt)
 
-        assert len(seen_questions) == 3
+        assert len(seen_prompts) == 3
 
     def test_seed_reproducibility(self, sample_data: str):
         """Test that same seed produces same sequence."""
-        env1 = GSM8kEnv(path=sample_data, eval_mode=False)
-        env2 = GSM8kEnv(path=sample_data, eval_mode=False)
+        env1 = GSM8kEnv(path=sample_data, prompt_template="{question}", eval_mode=False)
+        env2 = GSM8kEnv(path=sample_data, prompt_template="{question}", eval_mode=False)
 
         resp1 = env1.reset(seed=123)
         resp2 = env2.reset(seed=123)
 
         assert resp1 == resp2
-
-
-class TestArithmeticEnv:
-    def test_reset_returns_question(self):
-        """Test that reset returns a question string."""
-        env = ArithmeticEnv()
-        resp = env.reset()
-        q = resp.data.question
-
-        assert q.startswith("What is")
-        assert q.endswith("?")
-
-    def test_arithmetic_env(self):
-        env = ArithmeticEnv()
-        s = env.reset()
-        assert s.is_done
-        assert s.data.question.startswith("What is")
-        assert isinstance(s.data.answer, float)
-
-        with pytest.raises(EpisodeIsDoneError):
-            env.step(None)
 
 
 class TestCountdownEnv:

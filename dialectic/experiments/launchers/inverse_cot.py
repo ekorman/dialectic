@@ -27,7 +27,7 @@ from dialectic.rl.evaluate import EvaluationResult
 from dialectic.rl.inverse_cot_data import (
     build_contrastive_batch,
     build_shuffled_batch,
-    load_rollout_artifacts,
+    load_rollout_artifact,
     subsample_completions,
 )
 from dialectic.rl.inverse_cot_eval import compute_fcr
@@ -40,18 +40,23 @@ def _train_inverse_cot(
     train_params: TrainParams,
     inverse_cot_params: InverseCotParams,
     prompt_collection: PromptCollection,
-    dataset_artifacts: list[str],
 ):
     """Env-agnostic inverse-CoT training body.
 
-    Consumes pre-tokenized rollout artifacts via ``load_rollout_artifacts``;
-    no env-specific code paths in the training loop or ``_val_fn``. The
-    loader already enforces ``has_correct AND has_incorrect`` per train-split
-    prompt (see ``dialectic/rl/inverse_cot_data.py:131-140``), so rollout
-    artifacts generated with ``n_pos_min=0, n_neg_min=0`` (e.g. for eval
-    coverage) get correctly pruned to mixed prompts on the training side
-    while val keeps the all-correct / all-incorrect buckets needed by FCR.
+    Consumes the pre-tokenized rollout artifact named by
+    ``inverse_cot_params.p_rollout_artifact``; no env-specific code paths in
+    the training loop or ``_val_fn``. Rollout artifacts are complete (every
+    prompt, regardless of correctness mix); the loader enforces
+    ``has_correct AND has_incorrect`` per train-split prompt (see
+    ``dialectic/rl/inverse_cot_data.py``) — the contrastive loss needs both
+    classes per group — while val passes through unfiltered, keeping the
+    all-correct / all-incorrect buckets needed by FCR.
     """
+    if inverse_cot_params.p_rollout_artifact is None:
+        raise ValueError(
+            "`p_rollout_artifact` is required: pass "
+            "--inverse_cot_params.p-rollout-artifact"
+        )
     init_distributed()
     rank = get_rank()
     world_size = get_world_size()
@@ -208,9 +213,12 @@ def _train_inverse_cot(
         f"(rank {rank}/{world_size}, local_batch_size={local_batch_size})"
     )
 
-    log.info(f"[rank {rank}] loading {len(dataset_artifacts)} rollout artifact(s)")
-    by_split = load_rollout_artifacts(
-        dataset_artifacts,
+    log.info(
+        f"[rank {rank}] loading rollout artifact "
+        f"{inverse_cot_params.p_rollout_artifact}"
+    )
+    by_split = load_rollout_artifact(
+        inverse_cot_params.p_rollout_artifact,
         tokenizer,
         max_cot_tokens=inverse_cot_params.max_cot_tokens,
         # Ensure post-filter prompts retain enough rollouts for
@@ -432,11 +440,11 @@ def _train_inverse_cot(
             # emits exactly `len(prompt.completions)` rows per prompt, so we
             # walk the batch using its returned per-prompt `group_sizes`.
             # The uniform-stride shortcut here used to assume every prompt
-            # had `train_group_size` completions, but on val splits where
-            # rollouts were generated with `n_pos_min=0`/`n_neg_min=0`
-            # (e.g. GSM8K), all-correct / all-incorrect prompts pass
-            # through `subsample_completions` unchanged and break that
-            # assumption — hence the per-prompt stride below.
+            # had `train_group_size` completions, but val splits are
+            # unfiltered (artifacts are complete), so all-correct /
+            # all-incorrect prompts pass through `subsample_completions`
+            # unchanged and break that assumption — hence the per-prompt
+            # stride below.
             if len(examples) < 20:
                 ex_offset = 0
                 for prompt_data, prompt_group_size in zip(batch_prompts, group_sizes):
@@ -549,13 +557,11 @@ def train_inverse_cot_countdown(
     train_params: TrainParams,
     inverse_cot_params: InverseCotParams,
     prompt_collection: PromptCollection,
-    dataset_artifacts: list[str],
 ):
     return _train_inverse_cot(
         train_params=train_params,
         inverse_cot_params=inverse_cot_params,
         prompt_collection=prompt_collection,
-        dataset_artifacts=dataset_artifacts,
     )
 
 
@@ -565,13 +571,11 @@ def train_inverse_cot_gsm8k(
     train_params: TrainParams,
     inverse_cot_params: InverseCotParams,
     prompt_collection: PromptCollection,
-    dataset_artifacts: list[str],
 ):
     return _train_inverse_cot(
         train_params=train_params,
         inverse_cot_params=inverse_cot_params,
         prompt_collection=prompt_collection,
-        dataset_artifacts=dataset_artifacts,
     )
 
 
@@ -582,13 +586,11 @@ if __name__ == "__main__":
                 env_name="countdown",
                 fn=train_inverse_cot_countdown,
                 include_prompt_collection_id=True,
-                include_dataset_glob=True,
             ),
             Experiment(
                 env_name="gsm8k",
                 fn=train_inverse_cot_gsm8k,
                 include_prompt_collection_id=True,
-                include_dataset_glob=True,
             ),
         ]
     )

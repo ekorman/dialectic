@@ -35,7 +35,7 @@ from dialectic.llm.inverse_cot import create_prefix_lm_mask
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.inverse_cot_data import load_rollout_artifacts
+from dialectic.rl.inverse_cot_data import load_rollout_artifact
 
 
 def _import_sklearn():
@@ -86,14 +86,10 @@ def _score_p_causal(
     return log_probs.mean().item()
 
 
-def _eval_q_verifier(
-    *,
-    eval_params: EvalCommonParams,
-    dataset_artifacts: list[str] | None,
-) -> None:
+def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
     roc_auc_score, average_precision_score = _import_sklearn()
 
-    cfg = resolve_eval_common_params(eval_params, dataset_artifacts)
+    cfg = resolve_eval_common_params(eval_params)
 
     torch.manual_seed(cfg.seed)
     model_info = MODEL_REGISTRY[cfg.model_name]
@@ -149,8 +145,8 @@ def _eval_q_verifier(
     q.requires_grad_(False)
     q.eval()
 
-    by_split = load_rollout_artifacts(
-        cfg.dataset_artifacts, tokenizer, filter_train_split=False
+    by_split = load_rollout_artifact(
+        cfg.p_rollout_artifact, tokenizer, filter_train_split=False
     )
     prompts = by_split.get(cfg.split, [])
     if not prompts:
@@ -454,21 +450,13 @@ def _eval_q_verifier(
 
 
 @extty.experiment(project="eval-q-verifier-countdown")
-def eval_q_verifier_countdown(
-    *,
-    eval_params: EvalCommonParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
-    _eval_q_verifier(eval_params=eval_params, dataset_artifacts=dataset_artifacts)
+def eval_q_verifier_countdown(*, eval_params: EvalCommonParams) -> None:
+    _eval_q_verifier(eval_params=eval_params)
 
 
 @extty.experiment(project="eval-q-verifier-gsm8k")
-def eval_q_verifier_gsm8k(
-    *,
-    eval_params: EvalCommonParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
-    _eval_q_verifier(eval_params=eval_params, dataset_artifacts=dataset_artifacts)
+def eval_q_verifier_gsm8k(*, eval_params: EvalCommonParams) -> None:
+    _eval_q_verifier(eval_params=eval_params)
 
 
 if __name__ == "__main__":
@@ -477,16 +465,12 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=eval_q_verifier_countdown,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
             Experiment(
                 env_name="gsm8k",
                 fn=eval_q_verifier_gsm8k,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
         ]
     )

@@ -12,7 +12,7 @@ correctness flag from p's downstream greedy decode.
 
 Like the eval launchers, every field except ``--q-ckpt-run`` / ``--q-ckpt-step``
 is auto-derived from q's extty config (``model_name``, ``use_bf16``,
-``forward_ckpt_run/step``, both LoRA configs, and ``dataset_artifacts``). p
+``forward_ckpt_run/step``, both LoRA configs, and ``p_rollout_artifact``). p
 and q are both run via native PyTorch — q under prefix-LM attention (its
 training regime), p under causal attention (its training regime).
 """
@@ -38,17 +38,17 @@ from dialectic.llm.generate import generate_hard_tokens
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.inverse_cot_data import load_rollout_artifacts
+from dialectic.rl.inverse_cot_data import load_rollout_artifact
 from dialectic.rl.inverse_cot_eval import expressions_match, gsm8k_match
 
 
 def _generate_q_cot(
     *,
     gen_params: GenerateQCotParams,
-    dataset_artifacts: list[str] | None,
     grade_fn,
+    env_name: str,
 ) -> None:
-    cfg = resolve_eval_common_params(gen_params, dataset_artifacts)
+    cfg = resolve_eval_common_params(gen_params)
 
     torch.manual_seed(cfg.seed)
     model_info = MODEL_REGISTRY[cfg.model_name]
@@ -106,7 +106,23 @@ def _generate_q_cot(
     q.eval()
 
     # ---------------- data ----------------
-    by_split = load_rollout_artifacts(cfg.dataset_artifacts, tokenizer)
+    # filter_train_split=False: the default mixed-correctness filter exists
+    # for q TRAINING (the contrastive loss needs ≥1 correct and ≥1 incorrect
+    # completion per prompt). For q-CoT synthesis we want every prompt —
+    # especially the all-incorrect ones, which are exactly the rescue
+    # targets where a q-generated CoT adds the most SFT value.
+    by_split = load_rollout_artifact(
+        cfg.p_rollout_artifact, tokenizer, filter_train_split=False
+    )
+    # Only the requested split (default "train") is processed — q-CoT
+    # synthesis targets training data; generating for val/test produces
+    # artifacts nothing consumes.
+    if cfg.split not in by_split:
+        raise ValueError(
+            f"split {cfg.split!r} not found in rollout artifact "
+            f"(available: {sorted(by_split)})"
+        )
+    by_split = {cfg.split: by_split[cfg.split]}
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     total_generated = 0
@@ -223,6 +239,15 @@ def _generate_q_cot(
 
             pbar.update(B)
             pbar.set_postfix(fcr=f"{split_fcr_correct}/{split_generated}")
+            # step = prompts processed, so the x-axis reads as raw progress
+            # (a batch-index step axis is easy to misread as a percentage).
+            extty.log(
+                {
+                    "pct_processed": 100.0 * split_generated / len(fcr_prompts),
+                    "fcr_rate": split_fcr_correct / split_generated,
+                },
+                step=split_generated,
+            )
 
         pbar.close()
         tmpfile.close()
@@ -233,7 +258,7 @@ def _generate_q_cot(
             f"FCR={fcr_rate:.3f} ({split_fcr_correct}/{split_generated})"
         )
 
-        artifact_name = f"q-cot-{cfg.model_name}-{ts}-{split_name}"
+        artifact_name = f"q-cot-{env_name}-{cfg.model_name}-{ts}-{split_name}"
         extty.save_artifact(
             name=artifact_name,
             path=tmpfile.name,
@@ -259,28 +284,20 @@ def _countdown_grade(extracted: str | None, gold: str) -> bool:
 
 
 @extty.experiment(project="generate-q-cot-countdown")
-def generate_q_cot_countdown(
-    *,
-    gen_params: GenerateQCotParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
+def generate_q_cot_countdown(*, gen_params: GenerateQCotParams) -> None:
     _generate_q_cot(
         gen_params=gen_params,
-        dataset_artifacts=dataset_artifacts,
         grade_fn=_countdown_grade,
+        env_name="countdown",
     )
 
 
 @extty.experiment(project="generate-q-cot-gsm8k")
-def generate_q_cot_gsm8k(
-    *,
-    gen_params: GenerateQCotParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
+def generate_q_cot_gsm8k(*, gen_params: GenerateQCotParams) -> None:
     _generate_q_cot(
         gen_params=gen_params,
-        dataset_artifacts=dataset_artifacts,
         grade_fn=gsm8k_match,
+        env_name="gsm8k",
     )
 
 
@@ -290,16 +307,12 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=generate_q_cot_countdown,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
             Experiment(
                 env_name="gsm8k",
                 fn=generate_q_cot_gsm8k,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
         ]
     )

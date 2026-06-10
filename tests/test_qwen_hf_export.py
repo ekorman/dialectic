@@ -1,20 +1,23 @@
-"""Fast, network-free checks for ``export_qwen3_to_hf_dir``.
+"""Checks for ``export_qwen3_to_hf_dir``.
 
-The heavy HF round-trip lives in ``test_vllm_matches_pytorch.py`` behind
-``TEST_LLM_AGAINST_HF``. These tests are cheap: a tiny dialectic-Qwen net,
-an in-memory programmatic tokenizer, and asserts on the synthesized
-``config.json`` and directory layout.
+Most tests are fast and network-free: a tiny dialectic-Qwen net, an
+in-memory programmatic tokenizer, and asserts on the synthesized
+``config.json`` and directory layout. The heavy HF round-trip at the
+bottom is gated behind ``TEST_LLM_AGAINST_HF``.
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 
+import pytest
 import safetensors.torch as safetensors_torch
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 
-from dialectic.llm.qwen import create_qwen
+from dialectic.llm.qwen import create_qwen, load_qwen3_06b
 from dialectic.llm.qwen_hf_export import (
     _qwen3_config_from_net,
     export_qwen3_to_hf_dir,
@@ -140,3 +143,38 @@ def test_export_strips_caller_padding_mutation(tmp_path: Path):
     assert reloaded.truncation is None
 
     assert tokenizer.padding is not None
+
+
+@pytest.mark.skipif(
+    os.getenv("TEST_LLM_AGAINST_HF") is None,
+    reason="skipping `test_qwen_hf_export_round_trip` since env variable `TEST_LLM_AGAINST_HF` not set",
+)
+def test_qwen_hf_export_round_trip():
+    """Loads Qwen3-0.6B from the dialectic path, exports to an HF-format
+    dir, reloads via ``AutoModelForCausalLM``, and asserts the two produce
+    the same last-token logits on a random input. Catches any key-mapping
+    or weight-tying regression in the exporter.
+    """
+    from transformers import AutoModelForCausalLM
+
+    net = load_qwen3_06b(pretrained_weights=True).eval()
+    tokenizer = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        export_qwen3_to_hf_dir(
+            net,
+            tokenizer=tokenizer,
+            out_dir=tmp,
+            eos_token_id=151645,
+            pad_token_id=151643,
+        )
+        hf_model = AutoModelForCausalLM.from_pretrained(tmp, dtype=torch.float32).eval()
+
+    x = torch.randint(0, hf_model.config.vocab_size, size=(1, 10))
+    with torch.inference_mode():
+        torch.testing.assert_close(
+            net(x),
+            hf_model(x).logits[:, -1:],
+            atol=1e-4,
+            rtol=1e-4,
+        )

@@ -9,7 +9,7 @@ from dialectic.rl.inverse_cot_data import (
     PreTokenizedCompletion,
     PreTokenizedPrompt,
     build_shuffled_batch,
-    load_rollout_artifacts,
+    load_rollout_artifact,
     subsample_completions,
 )
 from dialectic.rl.inverse_cot_eval import expressions_match
@@ -288,7 +288,7 @@ class TestJsonlRoundTrip:
             inverse_cot_data.extty, "load_artifact", lambda name, **kwargs: jsonl_bytes
         )
 
-        by_split = load_rollout_artifacts(["test-artifact"], tokenizer)
+        by_split = load_rollout_artifact("test-artifact", tokenizer)
         assert "train" in by_split
         loaded = by_split["train"]
         assert len(loaded) == 1
@@ -304,9 +304,8 @@ class TestJsonlRoundTrip:
         from dialectic.rl import inverse_cot_data
 
         # Each prompt needs at least one correct AND one incorrect
-        # completion to pass `load_rollout_artifacts`'s mixed-correctness
-        # invariant (which `generate_inverse_cot_rollouts` already enforces
-        # at rollout generation time via `--n-pos-min 1 --n-neg-min 1`).
+        # completion to pass `load_rollout_artifact`'s mixed-correctness
+        # train-split filter.
         entries = [
             {
                 "prompt_str": "solve this",
@@ -351,7 +350,7 @@ class TestJsonlRoundTrip:
             inverse_cot_data.extty, "load_artifact", lambda name, **kwargs: jsonl_bytes
         )
 
-        by_split = load_rollout_artifacts(["test"], tokenizer)
+        by_split = load_rollout_artifact("test", tokenizer)
         loaded = by_split["train"]
         assert loaded[0].equation == "(1 + 2)"
         assert loaded[1].equation is None
@@ -501,8 +500,8 @@ class TestMaxCotTokensFilter:
             inverse_cot_data.extty, "load_artifact", lambda name, **kwargs: jsonl_bytes
         )
 
-        by_split = load_rollout_artifacts(
-            ["test"],
+        by_split = load_rollout_artifact(
+            "test",
             tokenizer,
             max_cot_tokens=100,
             min_completions_per_prompt=2,
@@ -526,7 +525,7 @@ class TestMaxCotTokensFilter:
             inverse_cot_data.extty, "load_artifact", lambda name, **kwargs: jsonl_bytes
         )
 
-        by_split = load_rollout_artifacts(["test"], tokenizer, max_cot_tokens=None)
+        by_split = load_rollout_artifact("test", tokenizer, max_cot_tokens=None)
         assert len(by_split["train"]) == 1
         assert len(by_split["train"][0].completions) == 2
 
@@ -546,8 +545,8 @@ class TestMaxCotTokensFilter:
             inverse_cot_data.extty, "load_artifact", lambda name, **kwargs: jsonl_bytes
         )
 
-        by_split = load_rollout_artifacts(
-            ["test"], tokenizer, min_completions_per_prompt=4
+        by_split = load_rollout_artifact(
+            "test", tokenizer, min_completions_per_prompt=4
         )
         assert by_split.get("train", []) == []
 

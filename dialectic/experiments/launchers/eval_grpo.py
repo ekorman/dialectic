@@ -4,13 +4,16 @@ import extty
 import torch
 
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
+from dialectic.experiments.launchers._eval_helpers import (
+    load_run_config,
+)
 from dialectic.experiments.params import GrpoEvalParams
 from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
 from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.inverse_cot_data import load_rollout_artifacts
+from dialectic.rl.inverse_cot_data import load_rollout_artifact
 from dialectic.rl.inverse_cot_eval import (
     HARD_PROMPT_THRESHOLD,
     expressions_match,
@@ -40,27 +43,143 @@ def _resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
     )
 
 
+def _maybe_trace_ckpt_from_rollout_artifact(
+    eval_params: GrpoEvalParams,
+) -> None:
+    """If ``ckpt_run`` is unset but ``p_rollout_artifact`` is given,
+    trace ``p_rollout_artifact → producing run → rollout_gen_params.start_ckpt_*``
+    to recover the GRPO checkpoint that produced the rollouts.
+    """
+    if eval_params.ckpt_run is not None:
+        return
+    if eval_params.p_rollout_artifact is None:
+        return
+    name = eval_params.p_rollout_artifact
+    try:
+        meta = extty.get_artifact(name)
+    except (KeyError, FileNotFoundError):
+        log.warning(f"Rollout artifact {name!r} not found; cannot trace ckpt from it")
+        return
+    if meta.run_project is None or meta.run_name is None:
+        log.warning(
+            f"Rollout artifact {name!r} has no producing-run linkage; cannot trace ckpt"
+        )
+        return
+    try:
+        rollout_run = extty.get_run(meta.run_project, meta.run_name)
+    except FileNotFoundError:
+        log.warning(
+            f"Rollout's producing run {meta.run_project}/{meta.run_name} not reachable; "
+            "cannot trace ckpt"
+        )
+        return
+    rgp = (
+        rollout_run.config.get("rollout_gen_params", {})
+        if isinstance(rollout_run.config, dict)
+        else {}
+    )
+    eval_params.ckpt_run = rgp.get("start_ckpt_run")
+    eval_params.ckpt_step = rgp.get("start_ckpt_step")
+    log.info(
+        f"Traced ckpt from p_rollout_artifact: "
+        f"{eval_params.ckpt_run} step {eval_params.ckpt_step} "
+        f"(via run {meta.run_project}/{meta.run_name})"
+    )
+
+
+def _maybe_auto_derive_from_ckpt(eval_params: GrpoEvalParams) -> None:
+    """Pull ``model_name`` / ``use_bf16`` (and p-LoRA, if the ckpt was an
+    SFT/inverse-CoT run with LoRA) from the checkpoint's training config.
+    No-op if ``ckpt_run`` is ``None`` or unreachable.
+    """
+    if eval_params.ckpt_run is None:
+        return
+    fwd_config = load_run_config(eval_params.ckpt_run)
+    if fwd_config is None:
+        return
+    train = fwd_config.get("train_params", {}) if isinstance(fwd_config, dict) else {}
+    if eval_params.model_name is None:
+        eval_params.model_name = train.get("model_name")
+    if eval_params.use_bf16 is None and "use_bf16" in train:
+        eval_params.use_bf16 = bool(train["use_bf16"])
+
+    # p-LoRA: if the ckpt's training run was SFT-with-LoRA or inverse-CoT
+    # (neither applies for plain GRPO), pull the LoRA spec. Only fire when
+    # the user hasn't set lora_rank explicitly.
+    if eval_params.lora_rank is None and isinstance(fwd_config, dict):
+        for section_name in ("inverse_cot_params", "sft_params", "train_params"):
+            section = fwd_config.get(section_name)
+            if isinstance(section, dict) and section.get("lora_rank") is not None:
+                eval_params.lora_rank = section.get("lora_rank")
+                if eval_params.lora_alpha == 16.0:  # the _LoraMixin default
+                    eval_params.lora_alpha = float(section.get("lora_alpha", 16.0))
+                if eval_params.lora_target_modules == "all":
+                    eval_params.lora_target_modules = section.get(
+                        "lora_target_modules", "all"
+                    )
+                break
+
+    log.info("Auto-derived from ckpt:")
+    log.info(f"  model_name:  {eval_params.model_name}")
+    log.info(f"  use_bf16:    {eval_params.use_bf16}")
+    log.info(
+        f"  p LoRA:      rank={eval_params.lora_rank} "
+        f"alpha={eval_params.lora_alpha} target={eval_params.lora_target_modules}"
+    )
+
+
+def _validate_grpo_eval_params(eval_params: GrpoEvalParams) -> None:
+    if eval_params.p_rollout_artifact is None:
+        raise ValueError(
+            "`p_rollout_artifact` is required: pass --eval_params.p-rollout-artifact "
+            "(the rollout artifact to eval against — also gives us the ckpt "
+            "via producing-run metadata)"
+        )
+    if eval_params.ckpt_run is None or eval_params.ckpt_step is None:
+        raise ValueError(
+            "`ckpt_run`/`ckpt_step` could not be resolved. Either "
+            "pass them explicitly or use a p_rollout_artifact whose producing run "
+            "has `rollout_gen_params.start_ckpt_run` set."
+        )
+    if eval_params.model_name is None:
+        raise ValueError(
+            "`model_name` is required (set --eval_params.model-name or pass a "
+            "--eval_params.ckpt-run whose train_params carries model_name)"
+        )
+    if eval_params.use_bf16 is None:
+        raise ValueError(
+            "`use_bf16` is required (set --eval_params.use-bf16 or pass a "
+            "--eval_params.ckpt-run whose train_params carries use_bf16)"
+        )
+
+
 def _eval_grpo(
     *,
     eval_params: GrpoEvalParams,
-    dataset_artifacts: list[str],
     grade_fn: GradeFn,
 ) -> None:
+    # Validation/resolution ran in the launcher's resolve_kwargs hook before
+    # extty snapshotted the config — at this point all the Optional fields
+    # are concrete. The asserts narrow the types for the type-checker.
+    assert eval_params.p_rollout_artifact is not None
+    assert eval_params.model_name is not None
+    assert eval_params.ckpt_run is not None
+    assert eval_params.ckpt_step is not None
+    assert eval_params.use_bf16 is not None
+
     torch.manual_seed(eval_params.seed)
     model_info = MODEL_REGISTRY[eval_params.model_name]
     tokenizer = model_info.load_tokenizer()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if eval_params.use_bf16 else torch.float32
 
-    log.info(
-        f"Loading p from {eval_params.forward_ckpt_run} step {eval_params.forward_ckpt_step}"
-    )
+    log.info(f"Loading p from {eval_params.ckpt_run} step {eval_params.ckpt_step}")
     p = model_info.load_net(pretrained_weights=False)
-    p_project, p_run_name = eval_params.forward_ckpt_run.split("/")
+    p_project, p_run_name = eval_params.ckpt_run.split("/")
     p_ckpt = extty.load_checkpoint_from(
         project=p_project,
         run_name=p_run_name,
-        step=eval_params.forward_ckpt_step,
+        step=eval_params.ckpt_step,
         load_optimizer=False,
     )
     p_state = p_ckpt["model_state_dict"]
@@ -85,8 +204,8 @@ def _eval_grpo(
     p.requires_grad_(False)
     p.eval()
 
-    by_split = load_rollout_artifacts(
-        dataset_artifacts, tokenizer, filter_train_split=False
+    by_split = load_rollout_artifact(
+        eval_params.p_rollout_artifact, tokenizer, filter_train_split=False
     )
     prompts = by_split.get(eval_params.split, [])
     prompts = [pr for pr in prompts if pr.equation is not None]
@@ -204,26 +323,28 @@ def _countdown_grade(extracted: str | None, gold: str) -> bool:
 def eval_grpo_countdown(
     *,
     eval_params: GrpoEvalParams,
-    dataset_artifacts: list[str],
 ) -> None:
-    _eval_grpo(
-        eval_params=eval_params,
-        dataset_artifacts=dataset_artifacts,
-        grade_fn=_countdown_grade,
-    )
+    _eval_grpo(eval_params=eval_params, grade_fn=_countdown_grade)
 
 
 @extty.experiment(project="eval-grpo-gsm8k")
 def eval_grpo_gsm8k(
     *,
     eval_params: GrpoEvalParams,
-    dataset_artifacts: list[str],
 ) -> None:
-    _eval_grpo(
-        eval_params=eval_params,
-        dataset_artifacts=dataset_artifacts,
-        grade_fn=gsm8k_match,
-    )
+    _eval_grpo(eval_params=eval_params, grade_fn=gsm8k_match)
+
+
+def _resolve_grpo_eval_kwargs(kwargs: dict) -> None:
+    """Pre-launch resolver hook. Trace ckpt from the rollout artifact's
+    producing run, then derive model_name/use_bf16/p-LoRA from the ckpt's
+    training config. Mutates ``kwargs["eval_params"]`` in place so extty's
+    config snapshot reflects the resolved values.
+    """
+    eval_params: GrpoEvalParams = kwargs["eval_params"]
+    _maybe_trace_ckpt_from_rollout_artifact(eval_params)
+    _maybe_auto_derive_from_ckpt(eval_params)
+    _validate_grpo_eval_params(eval_params)
 
 
 if __name__ == "__main__":
@@ -232,14 +353,14 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=eval_grpo_countdown,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
+                resolve_kwargs=_resolve_grpo_eval_kwargs,
             ),
             Experiment(
                 env_name="gsm8k",
                 fn=eval_grpo_gsm8k,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
+                resolve_kwargs=_resolve_grpo_eval_kwargs,
             ),
         ]
     )

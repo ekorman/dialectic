@@ -6,15 +6,15 @@ loader + an entry in ``__main__``:
 1. Env-specific problem loaders (``_load_countdown_problems`` /
    ``_load_gsm8k_problems``).
 2. Shared model + vLLM init (``_init_vllm_and_state_to_str``).
-3. Shared shard / generate / upload loop
+3. Shared generate / parse / upload loop
    (``_run_rollout_generation_loop``), which is env-agnostic and dispatches
-   grading via the caller-supplied ``filter_fn``.
+   grading via the caller-supplied ``parse_fn``.
 4. Thin ``@extty.experiment`` wrappers per env.
 
-For a small model like Qwen3-0.6B the vLLM backend is typically 10–25×
-faster than the PyTorch equivalent thanks to vLLM's continuous batching,
-PagedAttention, and automatic prefix-cache reuse across the ``group_size``
-samples per prompt.
+Single-process by design: vLLM's continuous batching saturates one GPU, and
+for a small model like Qwen3-0.6B it's typically 10–25× faster than the
+PyTorch equivalent thanks to PagedAttention and automatic prefix-cache reuse
+across the ``group_size`` samples per prompt.
 """
 
 import dataclasses
@@ -29,19 +29,11 @@ import extty
 import torch
 from tqdm import tqdm
 
-from dialectic.distributed import (
-    barrier,
-    cleanup,
-    get_rank,
-    get_world_size,
-    init_distributed,
-    is_main_process,
-)
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.envs import get_state_to_str
-from dialectic.experiments.launchers._rollout_filter import (
-    filter_countdown_rollouts,
-    filter_gsm8k_rollouts,
+from dialectic.experiments.launchers._rollout_parsing import (
+    parse_countdown_rollouts,
+    parse_gsm8k_rollouts,
 )
 from dialectic.experiments.params import GSM8kParams, RolloutGenParams
 from dialectic.experiments.prompts import PromptCollection
@@ -102,7 +94,7 @@ def _load_gsm8k_problems(
     """Load GSM8K problems from a local JSONL, tag with split.
 
     The parsed gold answer is stashed both in the ``MathState`` payload
-    (for grading by ``filter_gsm8k_rollouts``) and in the passthrough
+    (for grading by ``parse_gsm8k_rollouts``) and in the passthrough
     ``equation`` field (so it lands in the emitted artifact's entry and
     flows into ``PreTokenizedPrompt.equation`` downstream).
     """
@@ -170,10 +162,13 @@ def _init_vllm_and_state_to_str(
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
 ) -> tuple["LLM", ModelInfo, Callable]:
-    """Build the per-rank vLLM engine + chat-formatted ``state_to_str``."""
-    init_distributed()
-    rank = get_rank()
-    torch.manual_seed(rollout_gen_params.seed + rank)
+    """Build the vLLM engine + chat-formatted ``state_to_str``."""
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "rollout generation is single-process (sharding support was "
+            "removed); run without torchrun — vLLM saturates one GPU"
+        )
+    torch.manual_seed(rollout_gen_params.seed)
 
     model_info = MODEL_REGISTRY[rollout_gen_params.model_name]
     tokenizer = model_info.load_tokenizer()
@@ -212,7 +207,7 @@ def _init_vllm_and_state_to_str(
         max_model_len=max_model_len,
         gpu_memory_utilization=0.90,
         dtype="bfloat16" if rollout_gen_params.use_bf16 else "float16",
-        seed=rollout_gen_params.seed + rank,
+        seed=rollout_gen_params.seed,
     )
     del net
     torch.cuda.empty_cache()
@@ -227,141 +222,88 @@ def _run_rollout_generation_loop(
     rollout_gen_params: RolloutGenParams,
     prompt_collection: PromptCollection,
     all_problems: list[tuple[EnvResponse, dict]],
-    filter_fn: Callable[..., list[dict]],
+    parse_fn: Callable[..., list[dict]],
+    env_name: str,
 ) -> None:
-    """Env-agnostic shard / generate / filter / upload loop.
+    """Env-agnostic generate / parse / upload loop (single process, one
+    artifact).
 
-    ``filter_fn`` must accept the same kwargs as ``filter_countdown_rollouts``
-    and ``filter_gsm8k_rollouts``; ``_rollout_filter`` exposes both with that
-    contract.
+    ``parse_fn`` must accept the same kwargs as ``parse_countdown_rollouts``
+    and ``parse_gsm8k_rollouts``; ``_rollout_parsing`` exposes both with that
+    contract. Every prompt is emitted (artifacts are complete); consumers
+    apply their own filtering at load time.
     """
-    rank = get_rank()
-    world_size = get_world_size()
-    log.info(f"Total: {len(all_problems)} problems across {world_size} rank(s)")
-
     n_total = len(all_problems)
-    n_shards = rollout_gen_params.n_shards
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log.info(f"Total: {n_total} problems")
 
-    if n_shards < world_size:
-        raise ValueError(f"n_shards ({n_shards}) must be >= world_size ({world_size})")
-
-    shard_size = (n_total + n_shards - 1) // n_shards
-    total_kept = 0
-
-    my_shard_indices = list(range(rank, n_shards, world_size))
-    my_n_problems = sum(
-        min((idx + 1) * shard_size, n_total) - idx * shard_size
-        for idx in my_shard_indices
+    tmpfile = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".jsonl",
+        delete=False,
+        prefix="inverse_cot_rollouts_vllm_",
     )
-    pbar = tqdm(
-        total=my_n_problems,
-        desc=f"Generating rollouts (rank {rank}, vllm)",
-        disable=not is_main_process(),
-    )
-    for shard_idx in my_shard_indices:
-        shard_start = shard_idx * shard_size
-        shard_end = min(shard_start + shard_size, n_total)
-        shard_problems = all_problems[shard_start:shard_end]
+    log.info(f"Writing rollouts to {tmpfile.name}")
 
-        tmpfile = tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".jsonl",
-            delete=False,
-            prefix="inverse_cot_rollouts_vllm_",
-        )
-        log.info(
-            f"Shard {shard_idx + 1}/{n_shards}: "
-            f"{len(shard_problems)} problems -> {tmpfile.name}"
-        )
-
-        shard_kept = 0
+    n_written = 0
+    pbar = tqdm(total=n_total, desc="Generating rollouts (vllm)")
+    try:
         problem_idx = 0
-        try:
-            while problem_idx < len(shard_problems):
-                batch_end = min(
-                    problem_idx + rollout_gen_params.batch_size, len(shard_problems)
-                )
-                batch = shard_problems[problem_idx:batch_end]
-                batch_responses = [resp for resp, _ in batch]
-                batch_extra = [extra for _, extra in batch]
-                batch_prompts = [state_to_str(resp.data) for resp in batch_responses]
-                problem_idx = batch_end
+        while problem_idx < n_total:
+            batch_end = min(problem_idx + rollout_gen_params.batch_size, n_total)
+            batch = all_problems[problem_idx:batch_end]
+            batch_responses = [resp for resp, _ in batch]
+            batch_extra = [extra for _, extra in batch]
+            batch_prompts = [state_to_str(resp.data) for resp in batch_responses]
+            problem_idx = batch_end
 
-                completions_by_problem = _vllm_generate_group(
-                    llm,
-                    batch_prompts,
-                    group_size=rollout_gen_params.group_size,
-                    temperature=rollout_gen_params.temperature,
-                    max_tokens_generated=rollout_gen_params.max_tokens_generated,
-                    eos_token_id=model_info.eos_token_id,
-                    seed=rollout_gen_params.seed + rank + shard_start + problem_idx,
-                )
-
-                kept = filter_fn(
-                    prompts=batch_prompts,
-                    env_responses=batch_responses,
-                    extra_fields=batch_extra,
-                    completions_by_problem=completions_by_problem,
-                    n_pos_min=rollout_gen_params.n_pos_min,
-                    n_neg_min=rollout_gen_params.n_neg_min,
-                )
-                for entry in kept:
-                    tmpfile.write(json.dumps(entry) + "\n")
-                shard_kept += len(kept)
-                pbar.update(len(batch))
-                pbar.set_postfix(
-                    shard=f"{shard_idx + 1}/{n_shards}", kept=total_kept + shard_kept
-                )
-                if is_main_process() and extty.has_active_run():
-                    extty.log(
-                        {
-                            "processed": shard_start + problem_idx,
-                            "kept": total_kept + shard_kept,
-                            "shard": shard_idx + 1,
-                        },
-                        step=shard_start + problem_idx,
-                    )
-        finally:
-            tmpfile.close()
-
-            base_name = (
-                f"inverse-cot-rollouts-{rollout_gen_params.model_name}-"
-                f"g{rollout_gen_params.group_size}-{ts}"
+            completions_by_problem = _vllm_generate_group(
+                llm,
+                batch_prompts,
+                group_size=rollout_gen_params.group_size,
+                temperature=rollout_gen_params.temperature,
+                max_tokens_generated=rollout_gen_params.max_tokens_generated,
+                eos_token_id=model_info.eos_token_id,
+                seed=rollout_gen_params.seed + problem_idx,
             )
-            if n_shards > 1:
-                n_digits = len(str(n_shards))
-                artifact_name = f"{base_name}-shard{str(shard_idx + 1).zfill(n_digits)}"
-            else:
-                artifact_name = base_name
-            meta = extty.save_artifact(
-                name=artifact_name,
-                path=tmpfile.name,
-                description=(
-                    f"Inverse CoT rollouts shard {shard_idx + 1}/{n_shards}: "
-                    f"{shard_kept}/{len(shard_problems)} prompts, "
-                    f"group_size={rollout_gen_params.group_size} (vllm)"
-                ),
-                metadata={
-                    "rollout_gen_params": dataclasses.asdict(rollout_gen_params),
-                    "prompt_collection": dataclasses.asdict(prompt_collection),
-                    "shard_idx": shard_idx,
-                    "n_shards": n_shards,
-                    "backend": "vllm",
-                },
-            )
-            os.unlink(tmpfile.name)
-            log.info(f"Uploaded shard {shard_idx + 1}/{n_shards}: {meta}")
 
-        total_kept += shard_kept
+            entries = parse_fn(
+                prompts=batch_prompts,
+                env_responses=batch_responses,
+                extra_fields=batch_extra,
+                completions_by_problem=completions_by_problem,
+            )
+            for entry in entries:
+                tmpfile.write(json.dumps(entry) + "\n")
+            n_written += len(entries)
+            pbar.update(len(batch))
+            if extty.has_active_run():
+                extty.log({"processed": problem_idx}, step=problem_idx)
+    finally:
+        tmpfile.close()
+
+        artifact_name = (
+            f"inverse-cot-rollouts-{env_name}-{rollout_gen_params.model_name}-"
+            f"g{rollout_gen_params.group_size}-{ts}"
+        )
+        meta = extty.save_artifact(
+            name=artifact_name,
+            path=tmpfile.name,
+            description=(
+                f"Inverse CoT rollouts: {n_written}/{n_total} prompts, "
+                f"group_size={rollout_gen_params.group_size} (vllm)"
+            ),
+            metadata={
+                "rollout_gen_params": dataclasses.asdict(rollout_gen_params),
+                "prompt_collection": dataclasses.asdict(prompt_collection),
+                "backend": "vllm",
+            },
+        )
+        os.unlink(tmpfile.name)
+        log.info(f"Uploaded: {meta}")
 
     pbar.close()
-    log.info(
-        f"Rank {rank} done: {total_kept} prompts kept "
-        f"across {len(my_shard_indices)} shard(s)"
-    )
-    barrier()
-    cleanup()
+    log.info(f"Done: {n_written} prompts written")
 
 
 # --- Experiment wrappers ----------------------------------------------------
@@ -393,7 +335,8 @@ def generate_inverse_cot_rollouts_vllm_countdown(
         rollout_gen_params=rollout_gen_params,
         prompt_collection=prompt_collection,
         all_problems=all_problems,
-        filter_fn=filter_countdown_rollouts,
+        parse_fn=parse_countdown_rollouts,
+        env_name="countdown",
     )
 
 
@@ -423,7 +366,8 @@ def generate_inverse_cot_rollouts_vllm_gsm8k(
         rollout_gen_params=rollout_gen_params,
         prompt_collection=prompt_collection,
         all_problems=all_problems,
-        filter_fn=filter_gsm8k_rollouts,
+        parse_fn=parse_gsm8k_rollouts,
+        env_name="gsm8k",
     )
 
 

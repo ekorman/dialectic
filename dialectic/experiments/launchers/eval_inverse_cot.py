@@ -18,7 +18,7 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
-from dialectic.rl.inverse_cot_data import PreTokenizedPrompt, load_rollout_artifacts
+from dialectic.rl.inverse_cot_data import PreTokenizedPrompt, load_rollout_artifact
 from dialectic.rl.inverse_cot_eval import (
     HARD_PROMPT_THRESHOLD,
     EvalFcrResult,
@@ -144,10 +144,9 @@ def _aggregate_fcr(
 def _eval_inverse_cot(
     *,
     eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str] | None,
     grade_fn: GradeFn,
 ) -> None:
-    cfg = resolve_inverse_cot_eval_params(eval_params, dataset_artifacts)
+    cfg = resolve_inverse_cot_eval_params(eval_params)
 
     torch.manual_seed(cfg.seed)
     model_info = MODEL_REGISTRY[cfg.model_name]
@@ -205,8 +204,8 @@ def _eval_inverse_cot(
     q.eval()
 
     # ---------------- data ----------------
-    by_split = load_rollout_artifacts(
-        cfg.dataset_artifacts, tokenizer, filter_train_split=False
+    by_split = load_rollout_artifact(
+        cfg.p_rollout_artifact, tokenizer, filter_train_split=False
     )
     prompts = by_split.get(cfg.split, [])
     prompts = [pr for pr in prompts if pr.equation is not None]
@@ -458,29 +457,13 @@ def _countdown_grade(extracted: str | None, gold: str) -> bool:
 
 
 @extty.experiment(project="eval-inverse-cot-countdown")
-def eval_inverse_cot_countdown(
-    *,
-    eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
-    _eval_inverse_cot(
-        eval_params=eval_params,
-        dataset_artifacts=dataset_artifacts,
-        grade_fn=_countdown_grade,
-    )
+def eval_inverse_cot_countdown(*, eval_params: InverseCotEvalParams) -> None:
+    _eval_inverse_cot(eval_params=eval_params, grade_fn=_countdown_grade)
 
 
 @extty.experiment(project="eval-inverse-cot-gsm8k")
-def eval_inverse_cot_gsm8k(
-    *,
-    eval_params: InverseCotEvalParams,
-    dataset_artifacts: list[str] | None = None,
-) -> None:
-    _eval_inverse_cot(
-        eval_params=eval_params,
-        dataset_artifacts=dataset_artifacts,
-        grade_fn=gsm8k_match,
-    )
+def eval_inverse_cot_gsm8k(*, eval_params: InverseCotEvalParams) -> None:
+    _eval_inverse_cot(eval_params=eval_params, grade_fn=gsm8k_match)
 
 
 if __name__ == "__main__":
@@ -489,16 +472,12 @@ if __name__ == "__main__":
             Experiment(
                 env_name="countdown",
                 fn=eval_inverse_cot_countdown,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
             Experiment(
                 env_name="gsm8k",
                 fn=eval_inverse_cot_gsm8k,
-                include_dataset_glob=True,
                 include_prompt_collection_id=False,
-                dataset_glob_required=False,
             ),
         ]
     )

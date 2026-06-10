@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from tokenizers import Tokenizer
@@ -8,6 +9,10 @@ from dialectic.llm.generate import generate_hard_tokens
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import PreTokenizedPrompt
+
+GradeFn = Callable[[str | None, str], bool]
+"""Grades an extracted answer string against the gold answer. Implementations
+must handle ``None`` (extraction failure) by returning ``False``."""
 
 
 def expressions_match(pred: str, gt: str) -> bool:
@@ -120,6 +125,7 @@ def compute_baseline(
     pad_token_id: int,
     max_tokens_generated: int,
     batch_size: int,
+    grade_fn: GradeFn,
     use_bf16: bool = False,
     temperature: float = 1.0,
     n_samples: int = 1,
@@ -128,7 +134,9 @@ def compute_baseline(
 
     For each prompt, p generates ``n_samples`` completions. A prompt
     counts as correct if **any** of the N samples produces the right
-    answer (pass@N).
+    answer (pass@N). Correctness is decided by ``grade_fn`` (env-specific:
+    arithmetic-expression equality for countdown, numeric tolerance for
+    gsm8k).
     """
     device = next(p.parameters()).device
     baseline_prompts = [pr for pr in prompts if pr.equation is not None]
@@ -180,12 +188,7 @@ def compute_baseline(
                     continue
                 pr = batch[i]
                 extracted = extract_from_answer_tags(completion_strs[i])
-                is_match = (
-                    extracted is not None
-                    and pr.equation is not None
-                    and expressions_match(extracted, pr.equation)
-                )
-                if is_match:
+                if pr.equation is not None and grade_fn(extracted, pr.equation):
                     per_prompt_correct[i] = True
 
         for i in range(B):
