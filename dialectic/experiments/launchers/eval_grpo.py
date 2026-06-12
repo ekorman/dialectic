@@ -1,3 +1,4 @@
+import math
 from typing import Callable
 
 import extty
@@ -29,6 +30,30 @@ except ModuleNotFoundError:
 
 
 GradeFn = Callable[[str | None, str], bool]
+
+
+def _pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al. 2021): ``1 - C(n-c, k) / C(n, k)``.
+
+    Estimates the probability that at least one of k samples is correct,
+    given c correct out of n drawn — using all n samples for every k, so
+    it's both unbiased and lower-variance than grading any k-subset.
+    At k == n it reduces exactly to ``any``-of-n.
+    """
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def _pass_at_ks(n_samples: int) -> list[int]:
+    """Powers of two up to ``n_samples``, plus ``n_samples`` itself."""
+    ks = []
+    k = 1
+    while k < n_samples:
+        ks.append(k)
+        k *= 2
+    ks.append(n_samples)
+    return ks
 
 
 def _resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
@@ -247,69 +272,62 @@ def _eval_grpo(
         use_tqdm=True,
     )
 
-    total = 0
-    any_correct_total = 0
-    hard_total = 0
-    hard_any_correct_total = 0
-    sample_total = 0
-    sample_correct_total = 0
-    hard_sample_total = 0
-    hard_sample_correct_total = 0
-
+    # Per prompt: (n drawn, c correct, is_hard). pass@k for every k is then
+    # estimated from the full n samples via `_pass_at_k` — no subsetting.
+    counts: list[tuple[int, int, bool]] = []
     for pr, out in zip(prompts, vllm_outputs):
         assert pr.equation is not None
         per_sample_correct = [
             grade_fn(extract_from_answer_tags(sample.text), pr.equation)
             for sample in out.outputs
         ]
-        any_correct = any(per_sample_correct)
-        n_correct = sum(per_sample_correct)
-
         artifact_rate = (
             sum(c.is_correct for c in pr.completions) / len(pr.completions)
             if pr.completions
             else 0.0
         )
         is_hard = artifact_rate <= HARD_PROMPT_THRESHOLD
+        counts.append((len(per_sample_correct), sum(per_sample_correct), is_hard))
 
-        total += 1
-        sample_total += len(per_sample_correct)
-        sample_correct_total += n_correct
-        if any_correct:
-            any_correct_total += 1
-        if is_hard:
-            hard_total += 1
-            hard_sample_total += len(per_sample_correct)
-            hard_sample_correct_total += n_correct
-            if any_correct:
-                hard_any_correct_total += 1
+    total = len(counts)
+    hard_counts = [(n, c) for n, c, is_hard in counts if is_hard]
+    hard_total = len(hard_counts)
 
-    pass_at_n = any_correct_total / max(total, 1)
-    pass_rate_at_n = sample_correct_total / max(sample_total, 1)
-    hard_pass_at_n = hard_any_correct_total / max(hard_total, 1)
-    hard_pass_rate_at_n = hard_sample_correct_total / max(hard_sample_total, 1)
+    pass_rate_at_n = sum(c for n, c, _ in counts) / max(sum(n for n, _, _ in counts), 1)
+    hard_pass_rate_at_n = sum(c for _, c in hard_counts) / max(
+        sum(n for n, _ in hard_counts), 1
+    )
+
+    ks = _pass_at_ks(eval_params.n_samples)
+    pass_at_k = {
+        k: sum(_pass_at_k(n, c, k) for n, c, _ in counts) / max(total, 1) for k in ks
+    }
+    hard_pass_at_k = {
+        k: sum(_pass_at_k(n, c, k) for n, c in hard_counts) / max(hard_total, 1)
+        for k in ks
+    }
 
     log.info(
-        f"Results ({total} prompts, n_samples={eval_params.n_samples}, "
-        f"temp={eval_params.temperature}):"
+        f"Results ({total} prompts, {hard_total} hard, "
+        f"n_samples={eval_params.n_samples}, temp={eval_params.temperature}):"
     )
-    log.info(f"  pass_at_n:        {pass_at_n:.4f} ({any_correct_total}/{total})")
-    log.info(f"  pass_rate_at_n:   {pass_rate_at_n:.4f}")
-    log.info(
-        f"  hard_pass_at_n:   {hard_pass_at_n:.4f} ({hard_any_correct_total}/{hard_total} hard)"
-    )
+    log.info(f"  pass_rate_at_n:      {pass_rate_at_n:.4f}")
     log.info(f"  hard_pass_rate_at_n: {hard_pass_rate_at_n:.4f}")
+    for k in ks:
+        log.info(
+            f"  pass_at_{k}: {pass_at_k[k]:.4f}   hard_pass_at_{k}: {hard_pass_at_k[k]:.4f}"
+        )
 
     if extty.has_active_run():
         extty.log(
             {
                 "n_prompts": total,
                 "n_samples": eval_params.n_samples,
-                "pass_at_n": pass_at_n,
                 "pass_rate_at_n": pass_rate_at_n,
-                "hard_pass_at_n": hard_pass_at_n,
                 "hard_pass_rate_at_n": hard_pass_rate_at_n,
                 "hard_total": hard_total,
+                **{f"pass_at_{k}": pass_at_k[k] for k in ks},
+                **{f"hard_pass_at_{k}": hard_pass_at_k[k] for k in ks},
             },
             step=0,
         )

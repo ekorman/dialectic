@@ -242,6 +242,11 @@ class SftParams(_LoraMixin, _StartCkptMixin, _QCkptMixin):
     q_cot_artifact: str | None = None
     p_rollout_artifact: str | None = None
     mix_ratio: float = 1.0
+    # Drop q-cot training examples whose prompt was ALL-correct in the
+    # p-rollout artifact: p already solves those reliably, so q's CoT adds
+    # no signal there and dilutes the hard/rescue prompts that SFT exists
+    # to fix. Disable with --sft_params.no-drop-all-correct-q-cots.
+    drop_all_correct_q_cots: bool = True
     warmup_steps: int = 0
     max_tokens_generated: int = 500
     val_pass_at_n: int = 1

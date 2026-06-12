@@ -29,6 +29,7 @@ from dialectic.log import log
 from dialectic.rl.evaluate import EvaluationResult
 from dialectic.rl.inverse_cot_data import load_rollout_artifact
 from dialectic.rl.inverse_cot_eval import (
+    HARD_PROMPT_THRESHOLD,
     GradeFn,
     compute_baseline,
     expressions_match,
@@ -479,15 +480,38 @@ def _train_sft_inverse_cot(
             eos_token_id=model_info.eos_token_id,
         )
     p_rollout_by_split: dict[str, list[dict]] = {}
+    rollout_splits: dict[str, list] = {}
     if sft_params.p_rollout_artifact is not None:
         p_rollout_by_split = _load_p_rollout_artifact(
             sft_params.p_rollout_artifact,
             tokenizer,
             eos_token_id=model_info.eos_token_id,
         )
+        # Unfiltered prompt-level view of the same artifact: keeps per-prompt
+        # correctness rates (for the all-correct q-cot filter and holdout
+        # stratification) and gold answers (for val accuracy).
+        rollout_splits = load_rollout_artifact(
+            sft_params.p_rollout_artifact, tokenizer, filter_train_split=False
+        )
 
     train_q_cot = q_cot_by_split.get("train", [])
     train_p_rollout = p_rollout_by_split.get("train", [])
+
+    if sft_params.drop_all_correct_q_cots and train_q_cot and rollout_splits:
+        all_correct_keys = {
+            tuple(pr.prompt_ids)
+            for pr in rollout_splits.get("train", [])
+            if pr.completions and all(c.is_correct for c in pr.completions)
+        }
+        n_before = len(train_q_cot)
+        train_q_cot = [
+            ex for ex in train_q_cot if tuple(ex["prompt_ids"]) not in all_correct_keys
+        ]
+        log.info(
+            f"drop_all_correct_q_cots: kept {len(train_q_cot)}/{n_before} q-cot "
+            f"examples ({n_before - len(train_q_cot)} on prompts p already solves "
+            f"in every rollout)"
+        )
 
     val_prompts = []
     if val_from_train_holdout:
@@ -499,20 +523,42 @@ def _train_sft_inverse_cot(
         # into training, and with a rank-independent RNG (no ``+ rank``
         # offset) so every DDP rank excludes the same prompts.
         holdout_rng = random.Random(sft_params.seed)
-        if sft_params.p_rollout_artifact is not None:
+        if rollout_splits:
             # PreTokenizedPrompt objects retain the gold answer and the
             # rollout completions, so the held-out prompts can drive
             # fresh-generation val accuracy (compute_baseline) including
             # the hard-prompt bucket.
-            rollout_splits = load_rollout_artifact(
-                sft_params.p_rollout_artifact, tokenizer, filter_train_split=False
-            )
+            #
+            # Stratify the holdout half/half between hard prompts (artifact
+            # rate <= HARD_PROMPT_THRESHOLD) and the rest. A uniform sample
+            # mirrors the train distribution, which on mostly-solved datasets
+            # (gsm8k) yields single-digit hard counts — far too few to
+            # measure the hard_pass@N metric the run is optimizing for.
             rollout_train_prompts = rollout_splits.get("train", [])
-            n_holdout = min(sft_params.n_val_holdout, len(rollout_train_prompts))
-            val_prompts = (
-                holdout_rng.sample(rollout_train_prompts, n_holdout)
-                if n_holdout > 0
-                else []
+
+            def _artifact_rate(pr) -> float:
+                if not pr.completions:
+                    return 0.0
+                return sum(c.is_correct for c in pr.completions) / len(pr.completions)
+
+            hard_pool = [
+                pr
+                for pr in rollout_train_prompts
+                if _artifact_rate(pr) <= HARD_PROMPT_THRESHOLD
+            ]
+            easy_pool = [
+                pr
+                for pr in rollout_train_prompts
+                if _artifact_rate(pr) > HARD_PROMPT_THRESHOLD
+            ]
+            n_hard = min(sft_params.n_val_holdout // 2, len(hard_pool))
+            n_easy = min(sft_params.n_val_holdout - n_hard, len(easy_pool))
+            val_prompts = holdout_rng.sample(hard_pool, n_hard) + holdout_rng.sample(
+                easy_pool, n_easy
+            )
+            log.info(
+                f"Stratified val holdout: {n_hard} hard (of {len(hard_pool)}) + "
+                f"{n_easy} easy (of {len(easy_pool)}) prompts"
             )
             holdout_keys = {tuple(pr.prompt_ids) for pr in val_prompts}
         else:
@@ -552,10 +598,7 @@ def _train_sft_inverse_cot(
         # emits one artifact per split, and synthesis targets train), so
         # they never carry val data.
         val_data = p_rollout_by_split.get("val", [])
-        if sft_params.p_rollout_artifact is not None:
-            rollout_splits = load_rollout_artifact(
-                sft_params.p_rollout_artifact, tokenizer
-            )
+        if rollout_splits:
             val_prompts = rollout_splits.get("val", [])
             log.info(f"Loaded {len(val_prompts)} val prompts for accuracy eval")
 
@@ -725,6 +768,8 @@ def _train_sft_inverse_cot(
             )
             component_means[n_label] = baseline_result.accuracy
             component_means[f"hard_{n_label}"] = baseline_result.hard_accuracy
+            component_means["pass_rate"] = baseline_result.pass_rate
+            component_means["hard_pass_rate"] = baseline_result.hard_pass_rate
             torch.random.set_rng_state(val_rng_state)
 
         n_label = (

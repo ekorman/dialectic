@@ -113,6 +113,11 @@ class BaselineResult:
     correct: int
     hard_accuracy: float
     hard_total: int
+    # Per-sample mean correctness (over total*n_samples generations). At
+    # n_samples=N this is ~N x lower-variance than the any-of-N accuracy,
+    # making it the better checkpoint-selection signal on small val sets.
+    pass_rate: float
+    hard_pass_rate: float
 
 
 @torch.no_grad()
@@ -134,7 +139,8 @@ def compute_baseline(
 
     For each prompt, p generates ``n_samples`` completions. A prompt
     counts as correct if **any** of the N samples produces the right
-    answer (pass@N). Correctness is decided by ``grade_fn`` (env-specific:
+    answer (pass@N); ``pass_rate`` additionally reports the per-sample
+    mean. Correctness is decided by ``grade_fn`` (env-specific:
     arithmetic-expression equality for countdown, numeric tolerance for
     gsm8k).
     """
@@ -145,6 +151,10 @@ def compute_baseline(
     correct = 0
     hard_total = 0
     hard_correct = 0
+    sample_total = 0
+    sample_correct = 0
+    hard_sample_total = 0
+    hard_sample_correct = 0
 
     n_batches = (len(baseline_prompts) + batch_size - 1) // batch_size
     for batch_idx, batch_start in enumerate(
@@ -164,7 +174,7 @@ def compute_baseline(
             token_ids[i, offset:] = torch.tensor(pr.prompt_ids, device=device)
             attention_mask[i, offset:] = True
 
-        per_prompt_correct = [False] * B
+        per_prompt_n_correct = [0] * B
         for _sample in range(n_samples):
             completions = generate_hard_tokens(
                 net=p,
@@ -184,12 +194,10 @@ def compute_baseline(
             )
 
             for i in range(B):
-                if per_prompt_correct[i]:
-                    continue
                 pr = batch[i]
                 extracted = extract_from_answer_tags(completion_strs[i])
                 if pr.equation is not None and grade_fn(extracted, pr.equation):
-                    per_prompt_correct[i] = True
+                    per_prompt_n_correct[i] += 1
 
         for i in range(B):
             pr = batch[i]
@@ -200,12 +208,16 @@ def compute_baseline(
             )
 
             total += 1
-            if per_prompt_correct[i]:
+            sample_total += n_samples
+            sample_correct += per_prompt_n_correct[i]
+            if per_prompt_n_correct[i] > 0:
                 correct += 1
 
             if p_rate <= HARD_PROMPT_THRESHOLD:
                 hard_total += 1
-                if per_prompt_correct[i]:
+                hard_sample_total += n_samples
+                hard_sample_correct += per_prompt_n_correct[i]
+                if per_prompt_n_correct[i] > 0:
                     hard_correct += 1
 
     return BaselineResult(
@@ -214,6 +226,8 @@ def compute_baseline(
         correct=correct,
         hard_accuracy=hard_correct / max(hard_total, 1),
         hard_total=hard_total,
+        pass_rate=sample_correct / max(sample_total, 1),
+        hard_pass_rate=hard_sample_correct / max(hard_sample_total, 1),
     )
 
 
