@@ -37,7 +37,7 @@ def load_rollout_artifact(
 
     Tokenization is done via a single ``encode_batch`` call rather than
     per-string ``encode`` calls. For a typical artifact (thousands of
-    prompts × 32 completions) this is ~10-30× faster because the
+    prompts x 32 completions) this is ~10-30x faster because the
     tokenizers library parallelizes batch encoding across threads on
     the Rust side.
 
