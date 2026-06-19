@@ -514,7 +514,8 @@ def _train_sft_inverse_cot(
         )
 
     val_prompts = []
-    if val_from_train_holdout:
+    val_data: list[dict] = []
+    if val_from_train_holdout and sft_params.n_val_holdout > 0:
         # Training-time validation comes from a random holdout of TRAIN
         # prompts — the artifact's "val" slot (GSM8K's official test set) is
         # never consumed during training so it stays clean for final test
@@ -589,6 +590,15 @@ def _train_sft_inverse_cot(
             f"{len(val_q_cot)} q-cot + {len(val_p_rollout)} rollout examples for "
             f"val loss, {len(val_prompts)} prompts for val accuracy. "
             "Artifact val/test splits untouched (reserved for final test metrics)."
+        )
+    elif val_from_train_holdout:
+        # n_val_holdout == 0: hold nothing out — use ALL train data and
+        # disable in-training val. Checkpoints are evaluated separately on the
+        # test learning curve (see docs reporting protocol). The has_val guard
+        # below turns the val step off when val_data/val_prompts are empty.
+        log.info(
+            "n_val_holdout=0: no train holdout — all train data used; "
+            "in-training val disabled (evaluate checkpoints separately)."
         )
     else:
         # The artifact carries a genuine train/val/test split (countdown):

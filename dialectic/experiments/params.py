@@ -253,9 +253,13 @@ class SftParams(_LoraMixin, _StartCkptMixin, _QCkptMixin):
     # Only used by envs whose datasets lack a genuine val split (gsm8k):
     # training-time validation is a random holdout of this many TRAIN
     # prompts, keeping the artifact's "val" slot (the official test set)
-    # clean for final test metrics. Envs with a real train/val/test split
-    # (countdown) validate against the artifact's val split and ignore this.
-    n_val_holdout: int = 100
+    # clean for final test metrics. **0 disables the holdout entirely** — all
+    # train data is used and in-training val is turned off (evaluate
+    # checkpoints separately on the test learning curve). Default is 0 since
+    # the reporting protocol no longer selects checkpoints from a small val.
+    # Envs with a real train/val/test split (countdown) validate against the
+    # artifact's val split and ignore this.
+    n_val_holdout: int = 0
     # Keyword-only + Optional so the launcher's resolver can fill them in
     # from the q checkpoint's training config when ``q_ckpt_run`` is set.
     # Validation enforces non-None after derivation.
