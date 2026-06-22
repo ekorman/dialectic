@@ -206,7 +206,16 @@ class GrpoEvalParams(_LoraMixin):
     p_rollout_artifact: str | None = field(default=None, kw_only=True)
     model_name: str | None = field(default=None, kw_only=True)
     ckpt_run: str | None = field(default=None, kw_only=True)
-    ckpt_step: int | None = field(default=None, kw_only=True)
+    # Which checkpoint step(s) of ``ckpt_run`` to evaluate. A spec string:
+    #   single   — "63000"
+    #   range    — "1000..160000..1000" (start..stop..step, stop inclusive);
+    #              or "a..b" for every saved checkpoint in [a, b]
+    #   list     — "1000,2000,3000"
+    #   omitted  — None: evaluate ALL saved checkpoints of ``ckpt_run``
+    # Each evaluated step is logged at ``step=ckpt_step`` so extty's native
+    # step-axis is the learning curve. Specs are intersected with the run's
+    # actually-saved checkpoints.
+    ckpt_step: str | None = field(default=None, kw_only=True)
     use_bf16: bool | None = field(default=None, kw_only=True)
 
 

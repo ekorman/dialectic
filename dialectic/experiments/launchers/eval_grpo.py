@@ -11,7 +11,7 @@ from dialectic.experiments.launchers._eval_helpers import (
 from dialectic.experiments.params import GrpoEvalParams
 from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm
+from dialectic.llm.vllm_weight_sync import build_vllm_for_training, sync_weights_to_vllm
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifact
@@ -54,6 +54,75 @@ def _pass_at_ks(n_samples: int) -> list[int]:
         k *= 2
     ks.append(n_samples)
     return ks
+
+
+def _bucket_metrics(bucket: list[tuple[int, int]], ks: list[int]) -> dict:
+    """``pass_rate`` (per-sample mean) and unbiased ``pass@k`` for a prompt subset.
+
+    ``bucket`` is a list of ``(n_drawn, n_correct)`` per prompt.
+    """
+    total = len(bucket)
+    n_gen = sum(n for n, _ in bucket)
+    return {
+        "total": total,
+        "pass_rate_at_n": sum(c for _, c in bucket) / max(n_gen, 1),
+        "pass_at_k": {
+            k: sum(_pass_at_k(n, c, k) for n, c in bucket) / max(total, 1) for k in ks
+        },
+    }
+
+
+def _available_ckpt_steps(ckpt_run: str) -> list[int]:
+    """Saved checkpoint steps for ``ckpt_run`` (``project/run_name``), sorted."""
+    project, run_name = ckpt_run.split("/")
+    run = extty.get_run(project, run_name)
+    return sorted(c.step for c in run.checkpoints)
+
+
+def _resolve_ckpt_steps(spec: str | None, available: list[int]) -> list[int]:
+    """Expand a ckpt-step spec into the concrete steps to evaluate.
+
+    Specs (see ``GrpoEvalParams.ckpt_step``): ``None``/``"all"`` → every
+    saved checkpoint; ``"a..b..s"`` → ``range(a, b+1, s)``; ``"a..b"`` → every
+    saved checkpoint in ``[a, b]``; ``"x,y,z"`` → that list; ``"63000"`` →
+    single step. Every spec is intersected with ``available`` (warning on
+    requested-but-missing steps); an empty result raises.
+    """
+    available_set = set(available)
+    spec = spec.strip() if spec is not None else None
+
+    if spec is None or spec == "all":
+        requested = list(available)
+    elif ".." in spec:
+        parts = spec.split("..")
+        if len(parts) == 3:
+            a, b, s = (int(p) for p in parts)
+            requested = list(range(a, b + 1, s))
+        elif len(parts) == 2:
+            a, b = (int(p) for p in parts)
+            requested = [x for x in available if a <= x <= b]
+        else:
+            raise ValueError(
+                f"bad ckpt-step range {spec!r} (expected 'a..b' or 'a..b..step')"
+            )
+    elif "," in spec:
+        requested = [int(p) for p in spec.split(",") if p.strip()]
+    else:
+        requested = [int(spec)]
+
+    steps = [x for x in requested if x in available_set]
+    missing = [x for x in requested if x not in available_set]
+    if missing:
+        log.warning(
+            f"{len(missing)} requested step(s) have no saved checkpoint and are "
+            f"skipped: {missing[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+    if not steps:
+        raise ValueError(
+            f"ckpt-step spec {spec!r} resolved to no available checkpoints "
+            f"(available: {available[:10]}{'...' if len(available) > 10 else ''})"
+        )
+    return steps
 
 
 def _resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
@@ -104,7 +173,9 @@ def _maybe_trace_ckpt_from_rollout_artifact(
         else {}
     )
     eval_params.ckpt_run = rgp.get("start_ckpt_run")
-    eval_params.ckpt_step = rgp.get("start_ckpt_step")
+    traced_step = rgp.get("start_ckpt_step")
+    # ckpt_step is a spec string; the rollout trace yields a single base step.
+    eval_params.ckpt_step = str(traced_step) if traced_step is not None else None
     log.info(
         f"Traced ckpt from p_rollout_artifact: "
         f"{eval_params.ckpt_run} step {eval_params.ckpt_step} "
@@ -122,11 +193,26 @@ def _maybe_auto_derive_from_ckpt(eval_params: GrpoEvalParams) -> None:
     fwd_config = load_run_config(eval_params.ckpt_run)
     if fwd_config is None:
         return
-    train = fwd_config.get("train_params", {}) if isinstance(fwd_config, dict) else {}
+    # model_name / use_bf16 live in train_params for GRPO checkpoints but in
+    # sft_params for SFT checkpoints (which have no train_params). Check both.
+    sections = [
+        fwd_config[s]
+        for s in ("train_params", "sft_params")
+        if isinstance(fwd_config, dict) and isinstance(fwd_config.get(s), dict)
+    ]
+
+    def _first(key):
+        for sec in sections:
+            if sec.get(key) is not None:
+                return sec[key]
+        return None
+
     if eval_params.model_name is None:
-        eval_params.model_name = train.get("model_name")
-    if eval_params.use_bf16 is None and "use_bf16" in train:
-        eval_params.use_bf16 = bool(train["use_bf16"])
+        eval_params.model_name = _first("model_name")
+    if eval_params.use_bf16 is None:
+        bf16 = _first("use_bf16")
+        if bf16 is not None:
+            eval_params.use_bf16 = bool(bf16)
 
     # p-LoRA: if the ckpt's training run was SFT-with-LoRA or inverse-CoT
     # (neither applies for plain GRPO), pull the LoRA spec. Only fire when
@@ -160,12 +246,14 @@ def _validate_grpo_eval_params(eval_params: GrpoEvalParams) -> None:
             "(the rollout artifact to eval against — also gives us the ckpt "
             "via producing-run metadata)"
         )
-    if eval_params.ckpt_run is None or eval_params.ckpt_step is None:
+    if eval_params.ckpt_run is None:
         raise ValueError(
-            "`ckpt_run`/`ckpt_step` could not be resolved. Either "
-            "pass them explicitly or use a p_rollout_artifact whose producing run "
-            "has `rollout_gen_params.start_ckpt_run` set."
+            "`ckpt_run` could not be resolved. Either pass --eval_params.ckpt-run "
+            "or use a p_rollout_artifact whose producing run has "
+            "`rollout_gen_params.start_ckpt_run` set."
         )
+    # ckpt_step may be None here: it means "evaluate all saved checkpoints of
+    # ckpt_run". The concrete step list is resolved in _eval_grpo.
     if eval_params.model_name is None:
         raise ValueError(
             "`model_name` is required (set --eval_params.model-name or pass a "
@@ -184,51 +272,27 @@ def _eval_grpo(
     grade_fn: GradeFn,
 ) -> None:
     # Validation/resolution ran in the launcher's resolve_kwargs hook before
-    # extty snapshotted the config — at this point all the Optional fields
-    # are concrete. The asserts narrow the types for the type-checker.
+    # extty snapshotted the config — at this point the non-step Optional fields
+    # are concrete. ``ckpt_step`` may still be None (= "all saved checkpoints").
+    # The asserts narrow the types for the type-checker.
     assert eval_params.p_rollout_artifact is not None
     assert eval_params.model_name is not None
     assert eval_params.ckpt_run is not None
-    assert eval_params.ckpt_step is not None
     assert eval_params.use_bf16 is not None
 
     torch.manual_seed(eval_params.seed)
     model_info = MODEL_REGISTRY[eval_params.model_name]
     tokenizer = model_info.load_tokenizer()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if eval_params.use_bf16 else torch.float32
-
-    log.info(f"Loading p from {eval_params.ckpt_run} step {eval_params.ckpt_step}")
-    p = model_info.load_net(pretrained_weights=False)
     p_project, p_run_name = eval_params.ckpt_run.split("/")
-    p_ckpt = extty.load_checkpoint_from(
-        project=p_project,
-        run_name=p_run_name,
-        step=eval_params.ckpt_step,
-        load_optimizer=False,
+
+    steps = _resolve_ckpt_steps(
+        eval_params.ckpt_step, _available_ckpt_steps(eval_params.ckpt_run)
     )
-    p_state = p_ckpt["model_state_dict"]
-    for key in ("_rng_torch", "_rng_python", "_rng_cuda"):
-        p_state.pop(key, None)
+    log.info(
+        f"Evaluating {len(steps)} checkpoint(s) of {eval_params.ckpt_run}: {steps}"
+    )
 
-    if eval_params.lora_rank is not None:
-        targets = _resolve_lora_targets(eval_params.lora_target_modules)
-        apply_lora(
-            p,
-            rank=eval_params.lora_rank,
-            alpha=eval_params.lora_alpha,
-            target_modules=targets,
-        )
-        p.load_state_dict(p_state)
-        merge_lora(p)
-        log.info(f"Loaded and merged LoRA weights (rank={eval_params.lora_rank})")
-    else:
-        p.load_state_dict(p_state)
-
-    p = p.to(device=device, dtype=dtype)
-    p.requires_grad_(False)
-    p.eval()
-
+    # ---------------- data (loaded once, shared across checkpoints) -----------
     by_split = load_rollout_artifact(
         eval_params.p_rollout_artifact, tokenizer, filter_train_split=False
     )
@@ -246,19 +310,6 @@ def _eval_grpo(
         f"temperature={eval_params.temperature})"
     )
 
-    llm = load_dialectic_qwen_as_vllm(
-        p,
-        tokenizer=tokenizer,
-        eos_token_id=model_info.eos_token_id,
-        pad_token_id=model_info.pad_token_id,
-        max_model_len=eval_params.max_tokens_generated + 1024,
-        gpu_memory_utilization=eval_params.gpu_memory_utilization,
-        dtype="bfloat16" if eval_params.use_bf16 else "float16",
-        seed=eval_params.seed,
-    )
-    del p
-    torch.cuda.empty_cache()
-
     sampling_params = SamplingParams(
         n=eval_params.n_samples,
         temperature=eval_params.temperature if eval_params.temperature > 0 else 0.0,
@@ -266,71 +317,132 @@ def _eval_grpo(
         stop_token_ids=[model_info.eos_token_id],
         seed=eval_params.seed,
     )
-    vllm_outputs = llm.generate(
-        [TokensPrompt(prompt_token_ids=pr.prompt_ids) for pr in prompts],
-        sampling_params,
-        use_tqdm=True,
-    )
-
-    # Per prompt: (n drawn, c correct, is_hard). pass@k for every k is then
-    # estimated from the full n samples via `_pass_at_k` — no subsetting.
-    counts: list[tuple[int, int, bool]] = []
-    for pr, out in zip(prompts, vllm_outputs):
-        assert pr.equation is not None
-        per_sample_correct = [
-            grade_fn(extract_from_answer_tags(sample.text), pr.equation)
-            for sample in out.outputs
-        ]
-        artifact_rate = (
-            sum(c.is_correct for c in pr.completions) / len(pr.completions)
-            if pr.completions
-            else 0.0
-        )
-        is_hard = artifact_rate <= HARD_PROMPT_THRESHOLD
-        counts.append((len(per_sample_correct), sum(per_sample_correct), is_hard))
-
-    total = len(counts)
-    hard_counts = [(n, c) for n, c, is_hard in counts if is_hard]
-    hard_total = len(hard_counts)
-
-    pass_rate_at_n = sum(c for n, c, _ in counts) / max(sum(n for n, _, _ in counts), 1)
-    hard_pass_rate_at_n = sum(c for _, c in hard_counts) / max(
-        sum(n for n, _ in hard_counts), 1
-    )
-
     ks = _pass_at_ks(eval_params.n_samples)
-    pass_at_k = {
-        k: sum(_pass_at_k(n, c, k) for n, c, _ in counts) / max(total, 1) for k in ks
-    }
-    hard_pass_at_k = {
-        k: sum(_pass_at_k(n, c, k) for n, c in hard_counts) / max(hard_total, 1)
-        for k in ks
-    }
+    vllm_prompts = [TokensPrompt(prompt_token_ids=pr.prompt_ids) for pr in prompts]
 
-    log.info(
-        f"Results ({total} prompts, {hard_total} hard, "
-        f"n_samples={eval_params.n_samples}, temp={eval_params.temperature}):"
-    )
-    log.info(f"  pass_rate_at_n:      {pass_rate_at_n:.4f}")
-    log.info(f"  hard_pass_rate_at_n: {hard_pass_rate_at_n:.4f}")
-    for k in ks:
+    def _load_ckpt_model(step: int):
+        """Load one checkpoint as a plain (LoRA-merged) model on CPU.
+
+        Kept on CPU so it doesn't compete with the persistent vLLM engine for
+        VRAM — its weights are pushed into the engine via ``sync_weights_to_vllm``.
+        """
+        net = model_info.load_net(pretrained_weights=False)
+        ckpt = extty.load_checkpoint_from(
+            project=p_project, run_name=p_run_name, step=step, load_optimizer=False
+        )
+        state = ckpt["model_state_dict"]
+        for key in ("_rng_torch", "_rng_python", "_rng_cuda"):
+            state.pop(key, None)
+        if eval_params.lora_rank is not None:
+            targets = _resolve_lora_targets(eval_params.lora_target_modules)
+            apply_lora(
+                net,
+                rank=eval_params.lora_rank,
+                alpha=eval_params.lora_alpha,
+                target_modules=targets,
+            )
+            net.load_state_dict(state)
+            merge_lora(net)
+        else:
+            net.load_state_dict(state)
+        net.requires_grad_(False)
+        net.eval()
+        return net
+
+    # ---------------- sweep: build engine once, hot-swap weights -------------
+    llm = None
+    for step in steps:
+        log.info(f"=== checkpoint step {step} ===")
+        model = _load_ckpt_model(step)
+        if llm is None:
+            # Build the engine from the first checkpoint; subsequent checkpoints
+            # reuse it via sync_weights_to_vllm (enforce_eager makes that safe).
+            llm = build_vllm_for_training(
+                model,
+                tokenizer=tokenizer,
+                eos_token_id=model_info.eos_token_id,
+                pad_token_id=model_info.pad_token_id,
+                max_model_len=eval_params.max_tokens_generated + 1024,
+                gpu_memory_utilization=eval_params.gpu_memory_utilization,
+                dtype="bfloat16" if eval_params.use_bf16 else "float16",
+                seed=eval_params.seed,
+            )
+        sync_weights_to_vllm(llm, model)
+        del model
+
+        vllm_outputs = llm.generate(vllm_prompts, sampling_params, use_tqdm=True)
+
+        # Per prompt: (n drawn, c correct, is_hard, is_all_incorrect). Buckets:
+        #   hard          — artifact_rate <= threshold (base solves rarely)
+        #   all_incorrect — base NEVER solved it in its rollouts (rate == 0).
+        # all_incorrect is the cleanest rescue test: rejection sampling (mix=0)
+        # has zero training data for these prompts by construction, so any gain
+        # there is pure q. pass@k for every k is estimated from the full n
+        # samples via `_pass_at_k` — no subsetting.
+        counts: list[tuple[int, int, bool, bool]] = []
+        for pr, out in zip(prompts, vllm_outputs):
+            assert pr.equation is not None
+            per_sample_correct = [
+                grade_fn(extract_from_answer_tags(sample.text), pr.equation)
+                for sample in out.outputs
+            ]
+            n_correct_artifact = sum(c.is_correct for c in pr.completions)
+            artifact_rate = (
+                n_correct_artifact / len(pr.completions) if pr.completions else 0.0
+            )
+            counts.append(
+                (
+                    len(per_sample_correct),
+                    sum(per_sample_correct),
+                    artifact_rate <= HARD_PROMPT_THRESHOLD,
+                    n_correct_artifact == 0,
+                )
+            )
+
+        all_b = _bucket_metrics([(n, c) for n, c, _, _ in counts], ks)
+        hard_b = _bucket_metrics([(n, c) for n, c, h, _ in counts if h], ks)
+        ai_b = _bucket_metrics([(n, c) for n, c, _, ai in counts if ai], ks)
+
         log.info(
-            f"  pass_at_{k}: {pass_at_k[k]:.4f}   hard_pass_at_{k}: {hard_pass_at_k[k]:.4f}"
+            f"  step {step}: {all_b['total']} prompts, "
+            f"{hard_b['total']} hard, {ai_b['total']} all-incorrect"
         )
+        for label, b in [("all", all_b), ("hard", hard_b), ("all_incorrect", ai_b)]:
+            log.info(
+                f"    [{label}] pass_rate_at_n={b['pass_rate_at_n']:.4f}  "
+                + "  ".join(f"pass@{k}={b['pass_at_k'][k]:.4f}" for k in ks)
+            )
 
-    if extty.has_active_run():
-        extty.log(
-            {
-                "n_prompts": total,
+        if extty.has_active_run():
+            # step = checkpoint step → extty's native step-axis is the learning
+            # curve across checkpoints (no select-then-report).
+            metrics: dict = {
                 "n_samples": eval_params.n_samples,
-                "pass_rate_at_n": pass_rate_at_n,
-                "hard_pass_rate_at_n": hard_pass_rate_at_n,
-                "hard_total": hard_total,
-                **{f"pass_at_{k}": pass_at_k[k] for k in ks},
-                **{f"hard_pass_at_{k}": hard_pass_at_k[k] for k in ks},
-            },
-            step=0,
-        )
+                # all prompts (legacy key names preserved)
+                "n_prompts": all_b["total"],
+                "pass_rate_at_n": all_b["pass_rate_at_n"],
+                **{f"pass_at_{k}": all_b["pass_at_k"][k] for k in ks},
+                # hard bucket
+                "hard_total": hard_b["total"],
+                "hard_pass_rate_at_n": hard_b["pass_rate_at_n"],
+                **{f"hard_pass_at_{k}": hard_b["pass_at_k"][k] for k in ks},
+            }
+            # all-incorrect bucket (only when present, to avoid a spurious
+            # flat-zero curve on splits with none).
+            if ai_b["total"] > 0:
+                metrics["all_incorrect_total"] = ai_b["total"]
+                metrics["all_incorrect_pass_rate_at_n"] = ai_b["pass_rate_at_n"]
+                metrics.update(
+                    {f"all_incorrect_pass_at_{k}": ai_b["pass_at_k"][k] for k in ks}
+                )
+            extty.log(metrics, step=step)
+
+        # Free the ~1.2 GB local checkpoint cache (S3 copy untouched) so a long
+        # sweep doesn't fill the disk. Best-effort: never abort the sweep on it.
+        try:
+            extty.delete_local_checkpoint(p_project, p_run_name, step)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"could not delete local checkpoint {step}: {exc}")
 
 
 def _countdown_grade(extracted: str | None, gold: str) -> bool:
