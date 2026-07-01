@@ -190,6 +190,29 @@ def _load_p_rollout_artifact(
     return by_split
 
 
+def _parse_save_ckpt_steps(spec: str) -> set[int]:
+    """Expand a save-checkpoint step spec into explicit step numbers.
+
+    Mirrors ``eval_grpo.py``'s ``ckpt_step`` syntax: ``"a..b..s"`` →
+    ``range(a, b + 1, s)``; ``"x,y,z"`` → that list; ``"n"`` → a single step.
+    Unlike eval there are no saved checkpoints to intersect against, so the
+    spec stands alone (the ``"a..b"`` "every available in range" form has no
+    meaning here and is rejected).
+    """
+    spec = spec.strip()
+    if ".." in spec:
+        parts = spec.split("..")
+        if len(parts) != 3:
+            raise ValueError(
+                f"bad save_ckpt_steps range {spec!r} (expected 'a..b..step')"
+            )
+        a, b, s = (int(p) for p in parts)
+        return set(range(a, b + 1, s))
+    if "," in spec:
+        return {int(p) for p in spec.split(",") if p.strip()}
+    return {int(spec)}
+
+
 def _build_sft_batch(
     examples: list[dict], pad_token_id: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -808,10 +831,23 @@ def _train_sft_inverse_cot(
             component_means=component_means,
         ), examples
 
+    save_ckpt_steps = (
+        _parse_save_ckpt_steps(sft_params.save_ckpt_steps)
+        if sft_params.save_ckpt_steps is not None
+        else None
+    )
+    if save_ckpt_steps is not None:
+        log.info(
+            f"Checkpoint schedule from save_ckpt_steps={sft_params.save_ckpt_steps!r}: "
+            f"{len(save_ckpt_steps)} steps "
+            f"({sorted(save_ckpt_steps)[:5]}{'...' if len(save_ckpt_steps) > 5 else ''})"
+        )
+
     has_val = bool(val_data) or bool(val_prompts)
     train_loop(
         max_episodes=sft_params.max_episodes,
         save_ckpt_freq=sft_params.save_ckpt_freq,
+        save_ckpt_steps=save_ckpt_steps,
         val_freq=sft_params.val_freq,
         net=p,
         opt=opt,
