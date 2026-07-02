@@ -41,6 +41,7 @@ def train_loop(
     val_dataset_fn: Callable[[], tuple[EvaluationResult, list[Example]]] | None = None,
     val_dataset_label: str = "val",
     start_step: int = 0,
+    save_ckpt_steps: set[int] | None = None,
 ):
     """Generic training loop with two interchangeable val regimes.
 
@@ -63,6 +64,14 @@ def train_loop(
         raise ValueError("Pass either (val_fn + val_envs) or val_dataset_fn, not both")
     if val_fn is not None and val_envs is None:
         raise ValueError("val_fn requires val_envs to be provided")
+
+    def _should_save_ckpt(s: int) -> bool:
+        # An explicit step schedule, when given, fully overrides the periodic
+        # ``save_ckpt_freq`` cadence.
+        if save_ckpt_steps is not None:
+            return s in save_ckpt_steps
+        return s % save_ckpt_freq == 0
+
     global _sigterm_received
     _sigterm_received = False
     prev_handler = signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -83,7 +92,7 @@ def train_loop(
                 metrics.update({"step_time": step_time})
                 extty.log(metrics, step=step)
 
-                if step % save_ckpt_freq == 0:
+                if _should_save_ckpt(step):
                     ckpt_state = unwrap_model(net).state_dict()
                     ckpt_state["_rng_torch"] = torch.random.get_rng_state()
                     ckpt_state["_rng_python"] = random.getstate()
@@ -125,7 +134,7 @@ def train_loop(
     finally:
         signal.signal(signal.SIGTERM, prev_handler)
 
-    if is_main_process() and step % save_ckpt_freq != 0 and extty.has_active_run():
+    if is_main_process() and not _should_save_ckpt(step) and extty.has_active_run():
         ckpt_state = unwrap_model(net).state_dict()
         ckpt_state["_rng_torch"] = torch.random.get_rng_state()
         ckpt_state["_rng_python"] = random.getstate()

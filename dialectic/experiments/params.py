@@ -246,6 +246,12 @@ class SftParams(_LoraMixin, _StartCkptMixin, _QCkptMixin):
     val_batch_size: int = 16
     val_episodes: int | None = None
     save_ckpt_freq: int = sys.maxsize
+    # Optional explicit checkpoint schedule, overriding ``save_ckpt_freq``
+    # when set. Same spec syntax as ``eval_grpo.py``'s ``ckpt_step``:
+    # ``"a..b..s"`` → ``range(a, b + 1, s)``; ``"x,y,z"`` → that list;
+    # ``"n"`` → a single step. E.g. ``"1000..121000..6000"`` saves at step
+    # 1000 and then every 6000 steps thereafter.
+    save_ckpt_steps: str | None = None
     accumulation_steps: int = 1
     compile_model: bool = False
     q_cot_artifact: str | None = None
