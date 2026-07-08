@@ -39,6 +39,7 @@ class ResolvedEvalCommonParams:
     seed: int
     split: str
     max_prompts: int | None
+    dump_scores: bool
 
 
 @dataclass
@@ -216,6 +217,7 @@ def resolve_eval_common_params(
         seed=eval_params.seed,
         split=eval_params.split,
         max_prompts=eval_params.max_prompts,
+        dump_scores=eval_params.dump_scores,
     )
     _log_resolved(resolved)
     return resolved

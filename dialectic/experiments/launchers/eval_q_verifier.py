@@ -5,13 +5,33 @@ For each prompt in the rollout data:
    - Compute q(CoT | extracted_answer, P) — log prob of the CoT under q conditioned on p's own answer
    - Compute p(CoT, answer | P) — log prob under causal p as a baseline
 2. Compare scores for correct vs incorrect completions
-3. Report: ROC AUC, PR AUC, score gap, and accuracy of "pick highest q-score" as a
-   selection strategy — for both q and p_self, with q-vs-p_self lifts.
+3. Report: ROC AUC, PR AUC, score gap, and best-of-N selection accuracy — for
+   q against two baselines: ``p_self`` and ``length`` (see below).
 
-The p_self baseline answers the meaningful question: did training q on
-``p(CoT | answer)`` make it a better verifier than just asking p its own
-confidence? If ``q_roc_auc <= p_self_roc_auc`` then q is just rediscovering p's
-intrinsic uncertainty and isn't pulling its weight as a separate model.
+Two baselines frame every metric:
+
+- ``p_self``: score each completion by p's own causal log prob. Answers "did
+  training q on ``p(CoT | answer)`` beat just asking p its confidence?" If
+  ``q_roc_auc <= p_self_roc_auc`` then q is just rediscovering p's intrinsic
+  uncertainty. (In practice p ≈ non-discriminating: the completions are p's
+  own samples, so its avg per-token log prob is ~flat across correctness.)
+- ``length``: score by ``-cot_len`` (shorter CoT ⇒ predict correct). In
+  countdown, wrong rollouts ramble, so length alone is a strong but
+  content-blind selector — and pooled AUC is dominated by it. The number that
+  actually measures q's reasoning signal is its lift over ``length``, not over
+  ``p_self`` or random.
+- ``self_consist``: model-free majority vote — score each completion by how
+  many of the prompt's completions agree on its answer VALUE (env-specific:
+  countdown evaluates the expression, gsm8k parses the number). This is the
+  cheap RIVAL method, not a confound control: if q can't beat it on fixed-N
+  selection, q's edge has to come from its per-item capabilities (early-stop,
+  N=1, abstention) rather than raw selection accuracy.
+
+Because pooled AUC over-credits the length confound, the HEADLINE selection
+metric is best-of-N on MIXED prompts only (those with both a correct and an
+incorrect completion) — all-correct/all-incorrect prompts are dropped since
+every ranker scores identically there. A length-stratified split (does q still
+pick right when the shortest CoT is wrong?) isolates q's non-length signal.
 
 Correctness is read from the rollout artifact's ``is_correct`` flag, so this
 launcher is env-agnostic — same body for countdown and gsm8k.
@@ -19,6 +39,8 @@ launcher is env-agnostic — same body for countdown and gsm8k.
 
 import copy
 import random
+from collections import Counter
+from typing import Callable, Hashable
 
 import extty
 import torch
@@ -36,6 +58,35 @@ from dialectic.llm.registry import MODEL_REGISTRY
 from dialectic.log import log
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.inverse_cot_data import load_rollout_artifact
+
+AnswerValueFn = Callable[[str | None], Hashable | None]
+"""Maps an extracted answer string to a hashable vote value for the
+self-consistency baseline, or ``None`` when it can't be parsed (those
+completions cast no vote). Env-specific: countdown evaluates the expression so
+that all target-hitting answers collapse to one value; gsm8k parses the number."""
+
+
+def _countdown_answer_value(ans: str | None) -> Hashable | None:
+    """Evaluate a countdown answer expression to its numeric value so that
+    distinct-but-equivalent correct expressions (e.g. ``(8+75)+(25*10)`` and
+    ``((25*10)+75+8)``) vote together on the same target value."""
+    if ans is None:
+        return None
+    try:
+        return round(float(eval(ans, {"__builtins__": {}}, {})), 6)
+    except Exception:
+        return None
+
+
+def _gsm8k_answer_value(ans: str | None) -> Hashable | None:
+    """Parse a gsm8k answer to a numeric value (thousands-commas stripped), so
+    ``"1,000"`` and ``"1000"`` vote together."""
+    if ans is None:
+        return None
+    try:
+        return round(float(ans.replace(",", "").strip()), 6)
+    except Exception:
+        return None
 
 
 def _import_sklearn():
@@ -86,7 +137,9 @@ def _score_p_causal(
     return log_probs.mean().item()
 
 
-def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
+def _eval_q_verifier(
+    *, eval_params: EvalCommonParams, answer_value_fn: AnswerValueFn
+) -> None:
     roc_auc_score, average_precision_score = _import_sklearn()
 
     cfg = resolve_eval_common_params(eval_params)
@@ -163,6 +216,14 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
     all_q_scores: list[float] = []
     all_p_scores: list[float] = []
     all_is_correct: list[int] = []
+    # CoT token length per completion — drives the length-only confound
+    # baseline (shorter CoT ⇒ predict correct).
+    all_cot_len: list[int] = []
+    # Self-consistency score per completion — fraction of the prompt's
+    # completions that agree on this completion's answer value (a model-free
+    # majority-vote baseline). Prompt-normalized so it's comparable in the
+    # pooled AUC.
+    all_sc_score: list[float] = []
 
     correct_q_scores: list[float] = []
     incorrect_q_scores: list[float] = []
@@ -177,11 +238,36 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
     n_prompts_evaluated = 0
     q_best_of_n_correct = 0
     p_best_of_n_correct = 0
+    length_best_of_n_correct = 0
+    sc_best_of_n_correct = 0
     best_of_n_total = 0
     random_correct = 0
     random_total = 0
+    # Mixed-only selection (prompts with BOTH a correct and an incorrect
+    # completion) — the headline selection metric. All-correct/all-incorrect
+    # prompts are dropped because every ranker scores identically there.
+    mixed_total = 0
+    q_mixed_correct = 0
+    p_mixed_correct = 0
+    length_mixed_correct = 0
+    sc_mixed_correct = 0
+    random_mixed_correct = 0
+    # Length-stratified within mixed prompts: split by whether the length
+    # ranker's own pick is correct. q's accuracy on the "adversarial" stratum
+    # (shortest CoT is wrong) is q signal that length cannot explain.
+    len_aligned_total = 0
+    len_adv_total = 0
+    q_len_aligned_correct = 0
+    q_len_adv_correct = 0
+    p_len_adv_correct = 0
+    sc_len_adv_correct = 0
+    random_len_adv_correct = 0
     selection_rng = random.Random(cfg.seed + 1)
     examples: list[extty.Example] = []
+    # Per-completion score dump (only when cfg.dump_scores). One entry per
+    # evaluated prompt, each a list of its completions' records — the prompt
+    # grouping is what the early-stopping Pareto simulation needs.
+    per_prompt_scores: list[list[dict]] = []
 
     for pr_idx, pr in enumerate(prompts):
         if not pr.completions or pr.equation is None:
@@ -189,8 +275,9 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
 
         prompt_str = tokenizer.decode(pr.prompt_ids)
 
-        # Per-completion (q_score, p_score, is_correct, response_str) tuples
-        scored: list[tuple[float, float, bool, str]] = []
+        # Per-completion (q_score, p_score, is_correct, response_str, cot_len,
+        # answer_value) tuples. answer_value drives the self-consistency vote.
+        scored: list[tuple[float, float, bool, str, int, Hashable | None]] = []
 
         for comp in pr.completions:
             answer_str = tokenizer.decode(comp.answer_ids)
@@ -224,15 +311,19 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
             p_score = _score_p_causal(p, p_full_ids, p_prefix_len, device)
 
             is_correct = comp.is_correct
+            answer_value = answer_value_fn(extracted_answer)
             response_str = (
                 f"[q={q_score:.3f}] [p={p_score:.3f}] [correct={is_correct}] "
                 f"[answer={answer_str}]\n{cot_str}"
             )
-            scored.append((q_score, p_score, is_correct, response_str))
+            scored.append(
+                (q_score, p_score, is_correct, response_str, cot_len, answer_value)
+            )
 
             all_q_scores.append(q_score)
             all_p_scores.append(p_score)
             all_is_correct.append(int(is_correct))
+            all_cot_len.append(cot_len)
 
             if is_correct:
                 correct_q_scores.append(q_score)
@@ -252,20 +343,97 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
 
         n_prompts_evaluated += 1
 
-        # Best-of-N selection for both rankers
+        if cfg.dump_scores:
+            per_prompt_scores.append(
+                [
+                    {
+                        "q": x[0],
+                        "p": x[1],
+                        "correct": bool(x[2]),
+                        "val": x[5],
+                        "cot_len": x[4],
+                    }
+                    for x in scored
+                ]
+            )
+
+        # Best-of-N selection for each ranker. `length` is a confound
+        # baseline — "pick the shortest CoT". In countdown, wrong rollouts
+        # ramble, so length alone is a strong but content-blind selector; q
+        # only earns its keep by beating it. `random` is seeded for
+        # reproducibility.
         q_best = max(scored, key=lambda x: x[0])
         p_best = max(scored, key=lambda x: x[1])
+        length_best = min(scored, key=lambda x: x[4])
+        random_comp = selection_rng.choice(scored)
+
+        # Self-consistency (majority vote): score each completion by how many
+        # of the prompt's completions agree on its answer VALUE — a model-free
+        # rival, not a confound control. Pick the modal value, ties broken
+        # randomly. Completions with an unparseable answer (value None) cast no
+        # vote. The per-completion normalized vote share feeds the pooled AUC.
+        value_counts = Counter(x[5] for x in scored if x[5] is not None)
+        n_comp = len(scored)
+        sc_votes = [
+            value_counts.get(x[5], 0) if x[5] is not None else 0 for x in scored
+        ]
+        for v in sc_votes:
+            all_sc_score.append(v / n_comp)
+        max_votes = max(sc_votes, default=0)
+        sc_best = selection_rng.choice(
+            [x for x, v in zip(scored, sc_votes) if v == max_votes]
+        )
+
         best_of_n_total += 1
+        random_total += 1
         if q_best[2]:
             q_best_of_n_correct += 1
         if p_best[2]:
             p_best_of_n_correct += 1
-
-        # Random baseline: pick a random completion (seeded for reproducibility)
-        random_comp = selection_rng.choice(scored)
-        random_total += 1
+        if length_best[2]:
+            length_best_of_n_correct += 1
+        if sc_best[2]:
+            sc_best_of_n_correct += 1
         if random_comp[2]:
             random_correct += 1
+
+        # Mixed-only selection (headline metric): on all-correct or
+        # all-incorrect prompts every ranker's pick lands the same, so they
+        # only dilute the comparison. Restrict to prompts with both classes.
+        has_correct = any(x[2] for x in scored)
+        has_incorrect = any(not x[2] for x in scored)
+        if has_correct and has_incorrect:
+            mixed_total += 1
+            if q_best[2]:
+                q_mixed_correct += 1
+            if p_best[2]:
+                p_mixed_correct += 1
+            if length_best[2]:
+                length_mixed_correct += 1
+            if sc_best[2]:
+                sc_mixed_correct += 1
+            if random_comp[2]:
+                random_mixed_correct += 1
+
+            # Length-stratified (residual-confound isolation): split mixed
+            # prompts by whether the length ranker's own pick is correct. On
+            # the adversarial stratum the shortest CoT is wrong, so any
+            # accuracy q keeps there is content signal NOT explained by length
+            # (length acc is 1.0 on aligned, 0.0 on adversarial by construction).
+            if length_best[2]:
+                len_aligned_total += 1
+                if q_best[2]:
+                    q_len_aligned_correct += 1
+            else:
+                len_adv_total += 1
+                if q_best[2]:
+                    q_len_adv_correct += 1
+                if p_best[2]:
+                    p_len_adv_correct += 1
+                if sc_best[2]:
+                    sc_len_adv_correct += 1
+                if random_comp[2]:
+                    random_len_adv_correct += 1
 
         if len(examples) < 20:
             sorted_comps = sorted(scored, key=lambda x: x[0], reverse=True)
@@ -307,7 +475,21 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
 
     q_best_of_n_acc = q_best_of_n_correct / max(best_of_n_total, 1)
     p_best_of_n_acc = p_best_of_n_correct / max(best_of_n_total, 1)
+    length_best_of_n_acc = length_best_of_n_correct / max(best_of_n_total, 1)
+    sc_best_of_n_acc = sc_best_of_n_correct / max(best_of_n_total, 1)
     random_acc = random_correct / max(random_total, 1)
+
+    q_mixed_acc = q_mixed_correct / max(mixed_total, 1)
+    p_mixed_acc = p_mixed_correct / max(mixed_total, 1)
+    length_mixed_acc = length_mixed_correct / max(mixed_total, 1)
+    sc_mixed_acc = sc_mixed_correct / max(mixed_total, 1)
+    random_mixed_acc = random_mixed_correct / max(mixed_total, 1)
+
+    q_len_aligned_acc = q_len_aligned_correct / max(len_aligned_total, 1)
+    q_len_adv_acc = q_len_adv_correct / max(len_adv_total, 1)
+    p_len_adv_acc = p_len_adv_correct / max(len_adv_total, 1)
+    sc_len_adv_acc = sc_len_adv_correct / max(len_adv_total, 1)
+    random_len_adv_acc = random_len_adv_correct / max(len_adv_total, 1)
 
     # AUCs require both classes to be present. With "correct" as the positive
     # label, ROC AUC = P(q_score(correct) > q_score(incorrect)), PR AUC =
@@ -329,10 +511,25 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
         p_pr_auc_on_incorrect = float(
             average_precision_score(y_true_incorrect, [-s for s in all_p_scores])
         )
+        # Length-only confound baseline: shorter CoT ⇒ correct, so the
+        # "correct-positive" score is -cot_len (and +cot_len for incorrect).
+        length_roc_auc = float(roc_auc_score(y_true, [-l for l in all_cot_len]))
+        length_pr_auc_on_correct = float(
+            average_precision_score(y_true, [-l for l in all_cot_len])
+        )
+        length_pr_auc_on_incorrect = float(
+            average_precision_score(y_true_incorrect, all_cot_len)
+        )
+        # Self-consistency: higher vote share ⇒ predict correct. (Only ROC-AUC
+        # is kept — the PR-AUC split was pruned from the logged metrics.)
+        sc_roc_auc = float(roc_auc_score(y_true, all_sc_score))
     else:
         q_roc_auc = p_roc_auc = 0.0
         q_pr_auc_on_correct = p_pr_auc_on_correct = 0.0
         q_pr_auc_on_incorrect = p_pr_auc_on_incorrect = 0.0
+        length_roc_auc = 0.0
+        length_pr_auc_on_correct = length_pr_auc_on_incorrect = 0.0
+        sc_roc_auc = 0.0
         log.warning(
             "Only one class present in the eval set; AUC metrics will be uninformative."
         )
@@ -345,34 +542,80 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
     )
     log.info("")
     log.info(
-        "  Discrimination (higher is better; lift_vs_p_self > 0 = q beats p alone):"
+        "  Discrimination (pooled over all completions — inflated by CoT-length "
+        "confound; see length column):"
     )
     log.info(
         f"    roc_auc:            q={q_roc_auc:.4f}  p_self={p_roc_auc:.4f}  "
-        f"lift={q_roc_auc - p_roc_auc:+.4f}  (random floor = 0.5)"
+        f"length={length_roc_auc:.4f}  self_consist={sc_roc_auc:.4f}  "
+        f"lift_vs_len={q_roc_auc - length_roc_auc:+.4f}  "
+        f"lift_vs_sc={q_roc_auc - sc_roc_auc:+.4f}  (random floor = 0.5)"
     )
     log.info(
         f"    pr_auc on correct:  q={q_pr_auc_on_correct:.4f}  p_self={p_pr_auc_on_correct:.4f}  "
-        f"lift={q_pr_auc_on_correct - p_pr_auc_on_correct:+.4f}  "
+        f"length={length_pr_auc_on_correct:.4f}  "
+        f"lift_vs_p={q_pr_auc_on_correct - p_pr_auc_on_correct:+.4f}  "
+        f"lift_vs_len={q_pr_auc_on_correct - length_pr_auc_on_correct:+.4f}  "
         f"(random floor = {prevalence_correct:.4f})"
     )
     log.info(
         f"    pr_auc on incorrect:q={q_pr_auc_on_incorrect:.4f}  p_self={p_pr_auc_on_incorrect:.4f}  "
-        f"lift={q_pr_auc_on_incorrect - p_pr_auc_on_incorrect:+.4f}  "
+        f"length={length_pr_auc_on_incorrect:.4f}  "
+        f"lift_vs_p={q_pr_auc_on_incorrect - p_pr_auc_on_incorrect:+.4f}  "
+        f"lift_vs_len={q_pr_auc_on_incorrect - length_pr_auc_on_incorrect:+.4f}  "
         f"(random floor = {prevalence_incorrect:.4f})"
     )
     log.info("")
-    log.info("  Selection (best-of-N):")
+    log.info("  Selection — best-of-N, ALL prompts (incl. all-correct/all-incorrect):")
     log.info(
-        f"    q   : {q_best_of_n_acc:.4f} ({q_best_of_n_correct}/{best_of_n_total})"
+        f"    q     : {q_best_of_n_acc:.4f} ({q_best_of_n_correct}/{best_of_n_total})"
     )
     log.info(
         f"    p_self: {p_best_of_n_acc:.4f} ({p_best_of_n_correct}/{best_of_n_total})"
     )
-    log.info(f"    random: {random_acc:.4f} ({random_correct}/{random_total})")
     log.info(
-        f"    lift (q − p_self):  {q_best_of_n_acc - p_best_of_n_acc:+.4f}    "
-        f"lift (q − random): {q_best_of_n_acc - random_acc:+.4f}"
+        f"    length: {length_best_of_n_acc:.4f} ({length_best_of_n_correct}/{best_of_n_total})"
+    )
+    log.info(
+        f"    self_consist: {sc_best_of_n_acc:.4f} ({sc_best_of_n_correct}/{best_of_n_total})"
+    )
+    log.info(f"    random: {random_acc:.4f} ({random_correct}/{random_total})")
+    log.info("")
+    log.info(
+        f"  Selection — best-of-N, MIXED prompts only ({mixed_total}/{best_of_n_total}) "
+        "[HEADLINE — all-correct/all-incorrect dropped; the pick can't matter there]:"
+    )
+    log.info(f"    q           : {q_mixed_acc:.4f} ({q_mixed_correct}/{mixed_total})")
+    log.info(f"    p_self      : {p_mixed_acc:.4f} ({p_mixed_correct}/{mixed_total})")
+    log.info(
+        f"    length      : {length_mixed_acc:.4f} ({length_mixed_correct}/{mixed_total})"
+    )
+    log.info(f"    self_consist: {sc_mixed_acc:.4f} ({sc_mixed_correct}/{mixed_total})")
+    log.info(
+        f"    random      : {random_mixed_acc:.4f} ({random_mixed_correct}/{mixed_total})"
+    )
+    log.info(
+        f"    lift (q − self_consist): {q_mixed_acc - sc_mixed_acc:+.4f}    "
+        f"lift (q − length): {q_mixed_acc - length_mixed_acc:+.4f}    "
+        f"lift (q − p_self): {q_mixed_acc - p_mixed_acc:+.4f}"
+    )
+    log.info("")
+    log.info(
+        "  Length-stratified (mixed prompts; isolates q signal beyond CoT length):"
+    )
+    log.info(
+        f"    length-aligned     (shortest CoT correct, {len_aligned_total} prompts): "
+        f"q={q_len_aligned_acc:.4f}  (length=1.0000 by construction)"
+    )
+    log.info(
+        f"    length-adversarial (shortest CoT wrong,   {len_adv_total} prompts): "
+        f"q={q_len_adv_acc:.4f}  self_consist={sc_len_adv_acc:.4f}  "
+        f"p_self={p_len_adv_acc:.4f}  random={random_len_adv_acc:.4f}  "
+        f"(length=0.0000 by construction)"
+    )
+    log.info(
+        "    -> q accuracy on the adversarial stratum is q's content signal that "
+        "CoT length cannot explain; self_consist is the model-free rival there."
     )
     log.info("")
     log.info("  Score gaps (correct − incorrect):")
@@ -400,44 +643,46 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
     )
 
     if extty.has_active_run():
+        # Lean metric set — one series per claim we actually make. The console
+        # log above stays verbose (means, gaps, PR-AUCs, per-baseline lifts);
+        # this dict is what becomes plottable series, so it's pruned to the
+        # confound story: pooled AUC is inflated -> q beats the length confound
+        # -> q beats the self-consistency rival -> q's signal survives where
+        # length is adversarial.
         metrics: dict = {
+            # data + confound evidence
             "n_prompts": n_prompts_evaluated,
             "n_completions": n_completions,
             "n_correct": n_correct,
-            "n_incorrect": n_incorrect,
             "prevalence_correct": prevalence_correct,
-            "prevalence_incorrect": prevalence_incorrect,
-            # q metrics
-            "q_score_correct_mean": correct_q_mean,
-            "q_score_incorrect_mean": incorrect_q_mean,
             "q_score_gap": q_gap,
-            "q_roc_auc": q_roc_auc,
-            "q_pr_auc_on_correct": q_pr_auc_on_correct,
-            "q_pr_auc_on_incorrect": q_pr_auc_on_incorrect,
-            "q_best_of_n_accuracy": q_best_of_n_acc,
-            # p_self baseline metrics
-            "p_self_score_correct_mean": correct_p_mean,
-            "p_self_score_incorrect_mean": incorrect_p_mean,
-            "p_self_score_gap": p_gap,
-            "p_self_roc_auc": p_roc_auc,
-            "p_self_pr_auc_on_correct": p_pr_auc_on_correct,
-            "p_self_pr_auc_on_incorrect": p_pr_auc_on_incorrect,
-            "p_self_best_of_n_accuracy": p_best_of_n_acc,
-            # random selection baseline
-            "random_best_of_n_accuracy": random_acc,
-            # apples-to-apples lifts vs p_self
-            "roc_auc_lift_vs_p_self": q_roc_auc - p_roc_auc,
-            "pr_auc_on_correct_lift_vs_p_self": q_pr_auc_on_correct
-            - p_pr_auc_on_correct,
-            "pr_auc_on_incorrect_lift_vs_p_self": q_pr_auc_on_incorrect
-            - p_pr_auc_on_incorrect,
-            "best_of_n_lift_vs_p_self": q_best_of_n_acc - p_best_of_n_acc,
-            # diagnostics
             "avg_correct_cot_len": avg_correct_cot,
             "avg_incorrect_cot_len": avg_incorrect_cot,
-            "correct_answer_tag_pct": correct_has_answer_tag / max(n_correct, 1),
-            "incorrect_answer_tag_pct": incorrect_has_answer_tag / max(n_incorrect, 1),
             "n_skipped_too_long": n_skipped_too_long,
+            # pooled AUC — kept only to show the length inflation (not a
+            # quality measure). p_self_roc_auc documents p's flat/<0.5 artifact.
+            "q_roc_auc": q_roc_auc,
+            "length_roc_auc": length_roc_auc,
+            "self_consist_roc_auc": sc_roc_auc,
+            "p_self_roc_auc": p_roc_auc,
+            # full-set selection anchor
+            "q_best_of_n_accuracy": q_best_of_n_acc,
+            # HEADLINE — mixed-only best-of-N (all-correct/all-incorrect dropped)
+            "n_mixed_prompts": mixed_total,
+            "q_mixed_best_of_n_accuracy": q_mixed_acc,
+            "self_consist_mixed_best_of_n_accuracy": sc_mixed_acc,
+            "length_mixed_best_of_n_accuracy": length_mixed_acc,
+            "p_self_mixed_best_of_n_accuracy": p_mixed_acc,
+            "random_mixed_best_of_n_accuracy": random_mixed_acc,
+            "mixed_best_of_n_lift_vs_length": q_mixed_acc - length_mixed_acc,
+            "mixed_best_of_n_lift_vs_self_consist": q_mixed_acc - sc_mixed_acc,
+            # residual-confound isolation — length-adversarial stratum
+            "n_len_aligned_prompts": len_aligned_total,
+            "n_len_adversarial_prompts": len_adv_total,
+            "q_len_aligned_best_of_n_accuracy": q_len_aligned_acc,
+            "q_len_adversarial_best_of_n_accuracy": q_len_adv_acc,
+            "self_consist_len_adversarial_best_of_n_accuracy": sc_len_adv_acc,
+            "random_len_adversarial_best_of_n_accuracy": random_len_adv_acc,
         }
         if examples:
             metrics["examples"] = extty.BatchExample(
@@ -448,15 +693,55 @@ def _eval_q_verifier(*, eval_params: EvalCommonParams) -> None:
             )
         extty.log(metrics, step=0)
 
+    if cfg.dump_scores and extty.has_active_run():
+        import json
+        import os
+        import tempfile
+
+        # Artifact names are globally unique in extty, so bake the q checkpoint
+        # AND rollout-artifact identity into the name — same q evaluated on two
+        # rollout sets (e.g. GSM-Symbolic p1 vs p2, both split "train") must
+        # not collide.
+        q_run_slug = cfg.q_ckpt_run.split("/")[-1]
+        rollout_slug = cfg.p_rollout_artifact.rsplit("-", 1)[-1]
+        artifact_name = (
+            f"q-verifier-scores-{cfg.split}-{rollout_slug}-{q_run_slug}"
+            f"-s{cfg.q_ckpt_step}"
+        )
+        jsonl = "\n".join(json.dumps(rec) for rec in per_prompt_scores)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as fh:
+            fh.write(jsonl)
+            tmp_path = fh.name
+        try:
+            meta = extty.save_artifact(
+                artifact_name,
+                tmp_path,
+                description=(
+                    f"Per-completion q/p scores on {cfg.split} split "
+                    f"({len(per_prompt_scores)} prompts) for offline early-stopping "
+                    "Pareto analysis."
+                ),
+                metadata={
+                    "q_ckpt_run": cfg.q_ckpt_run,
+                    "q_ckpt_step": cfg.q_ckpt_step,
+                    "p_rollout_artifact": cfg.p_rollout_artifact,
+                    "split": cfg.split,
+                    "max_prompts": cfg.max_prompts,
+                },
+            )
+        finally:
+            os.unlink(tmp_path)
+        log.info(f"Saved per-completion scores artifact: {meta.name}")
+
 
 @extty.experiment(project="eval-q-verifier-countdown")
 def eval_q_verifier_countdown(*, eval_params: EvalCommonParams) -> None:
-    _eval_q_verifier(eval_params=eval_params)
+    _eval_q_verifier(eval_params=eval_params, answer_value_fn=_countdown_answer_value)
 
 
 @extty.experiment(project="eval-q-verifier-gsm8k")
 def eval_q_verifier_gsm8k(*, eval_params: EvalCommonParams) -> None:
-    _eval_q_verifier(eval_params=eval_params)
+    _eval_q_verifier(eval_params=eval_params, answer_value_fn=_gsm8k_answer_value)
 
 
 if __name__ == "__main__":

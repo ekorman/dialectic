@@ -162,6 +162,11 @@ class EvalCommonParams:
     seed: int = 42
     split: str = "val"
     max_prompts: int | None = None
+    # When set, ``eval_q_verifier`` saves a per-completion scores artifact
+    # (q/p score, correctness, answer value, CoT length, grouped by prompt) for
+    # downstream offline analysis — e.g. the early-stopping compute/accuracy
+    # Pareto curve in ``scripts/q_verifier_pareto.py``.
+    dump_scores: bool = False
 
 
 @dataclass
@@ -289,6 +294,11 @@ class DatasetGenParams:
     val_pct: float
     test_pct: float
     seed: int
+    # Comma-separated names of existing countdown-dataset artifacts whose
+    # problems must NOT reappear in this dataset (dedup on the same canonical
+    # key the generator uses internally: number-multiset + target). Use when
+    # generating fresh synthesis prompts disjoint from a prior dataset.
+    exclude_artifacts: str | None = None
 
 
 @dataclass
