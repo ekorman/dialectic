@@ -9,6 +9,7 @@ Both ``eval_inverse_cot.py`` and ``eval_q_verifier.py`` need to:
 Both ops are pure and have no env-specific logic, so they live here.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,32 @@ import extty
 from dialectic.experiments.params import EvalCommonParams, InverseCotEvalParams
 from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
 from dialectic.log import log
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased pass@k estimator (Chen et al. 2021): ``1 - C(n-c, k) / C(n, k)``.
+
+    Estimates the probability that at least one of k samples is correct,
+    given c correct out of n drawn — using all n samples for every k, so
+    it's both unbiased and lower-variance than grading any k-subset.
+    At k == n it reduces exactly to ``any``-of-n. ``k`` is clamped to ``n``
+    so callers with per-prompt sample counts can pass a global k safely.
+    """
+    k = min(k, n)
+    if n - c < k:
+        return 1.0
+    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
+
+
+def pass_at_ks(n_samples: int) -> list[int]:
+    """Powers of two up to ``n_samples``, plus ``n_samples`` itself."""
+    ks = []
+    k = 1
+    while k < n_samples:
+        ks.append(k)
+        k *= 2
+    ks.append(n_samples)
+    return ks
 
 
 @dataclass

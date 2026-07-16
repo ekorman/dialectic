@@ -36,6 +36,23 @@ def generate_countdown_dataset(
     )
 
     seen: set[tuple[frozenset, int]] = set()
+    n_excluded_keys = 0
+    if p.exclude_artifacts is not None:
+        for artifact_name in p.exclude_artifacts.split(","):
+            artifact_name = artifact_name.strip()
+            data = extty.load_artifact(artifact_name, cache=True)
+            if not isinstance(data, bytes):
+                raise ValueError(f"Expected bytes from artifact {artifact_name!r}")
+            for line in data.decode().splitlines():
+                if not line.strip():
+                    continue
+                ex = json.loads(line)
+                seen.add((frozenset(Counter(ex["numbers"]).items()), ex["target"]))
+        n_excluded_keys = len(seen)
+        log.info(
+            f"Excluding {n_excluded_keys} problems from "
+            f"{p.exclude_artifacts!r} (all splits)"
+        )
     examples: list[dict] = []
 
     pbar = tqdm(total=p.n_examples, desc="Generating problems")
@@ -64,7 +81,11 @@ def generate_countdown_dataset(
         pbar.set_postfix(generated=n_generated, kept=len(examples))
     pbar.close()
 
-    log.info(f"Generated {n_generated} total, kept {len(examples)} unique")
+    log.info(
+        f"Generated {n_generated} total, kept {len(examples)} unique "
+        f"({n_generated - len(examples)} rejected as duplicates"
+        f"{' or excluded-artifact collisions' if n_excluded_keys else ''})"
+    )
 
     rng = random.Random(p.seed)
     rng.shuffle(examples)
@@ -106,6 +127,7 @@ def generate_countdown_dataset(
             metadata={
                 "dataset_gen_params": dataclasses.asdict(p),
                 "countdown_params": dataclasses.asdict(countdown_params),
+                "n_excluded_keys": n_excluded_keys,
             },
         )
         log.info(f"Uploaded artifact: {meta}")

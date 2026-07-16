@@ -1,4 +1,3 @@
-import math
 from typing import Callable
 
 import extty
@@ -7,6 +6,8 @@ import torch
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.launchers._eval_helpers import (
     load_run_config,
+    pass_at_k,
+    pass_at_ks,
 )
 from dialectic.experiments.params import GrpoEvalParams
 from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
@@ -32,30 +33,6 @@ except ModuleNotFoundError:
 GradeFn = Callable[[str | None, str], bool]
 
 
-def _pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased pass@k estimator (Chen et al. 2021): ``1 - C(n-c, k) / C(n, k)``.
-
-    Estimates the probability that at least one of k samples is correct,
-    given c correct out of n drawn — using all n samples for every k, so
-    it's both unbiased and lower-variance than grading any k-subset.
-    At k == n it reduces exactly to ``any``-of-n.
-    """
-    if n - c < k:
-        return 1.0
-    return 1.0 - math.comb(n - c, k) / math.comb(n, k)
-
-
-def _pass_at_ks(n_samples: int) -> list[int]:
-    """Powers of two up to ``n_samples``, plus ``n_samples`` itself."""
-    ks = []
-    k = 1
-    while k < n_samples:
-        ks.append(k)
-        k *= 2
-    ks.append(n_samples)
-    return ks
-
-
 def _bucket_metrics(bucket: list[tuple[int, int]], ks: list[int]) -> dict:
     """``pass_rate`` (per-sample mean) and unbiased ``pass@k`` for a prompt subset.
 
@@ -67,7 +44,7 @@ def _bucket_metrics(bucket: list[tuple[int, int]], ks: list[int]) -> dict:
         "total": total,
         "pass_rate_at_n": sum(c for _, c in bucket) / max(n_gen, 1),
         "pass_at_k": {
-            k: sum(_pass_at_k(n, c, k) for n, c in bucket) / max(total, 1) for k in ks
+            k: sum(pass_at_k(n, c, k) for n, c in bucket) / max(total, 1) for k in ks
         },
     }
 
@@ -317,7 +294,7 @@ def _eval_grpo(
         stop_token_ids=[model_info.eos_token_id],
         seed=eval_params.seed,
     )
-    ks = _pass_at_ks(eval_params.n_samples)
+    ks = pass_at_ks(eval_params.n_samples)
     vllm_prompts = [TokensPrompt(prompt_token_ids=pr.prompt_ids) for pr in prompts]
 
     def _load_ckpt_model(step: int):
@@ -378,7 +355,7 @@ def _eval_grpo(
         # all_incorrect is the cleanest rescue test: rejection sampling (mix=0)
         # has zero training data for these prompts by construction, so any gain
         # there is pure q. pass@k for every k is estimated from the full n
-        # samples via `_pass_at_k` — no subsetting.
+        # samples via `pass_at_k` — no subsetting.
         counts: list[tuple[int, int, bool, bool]] = []
         for pr, out in zip(prompts, vllm_outputs):
             assert pr.equation is not None

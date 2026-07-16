@@ -9,6 +9,8 @@ from tqdm import tqdm
 from dialectic.experiments.arg_parser import Experiment, run_experiments_parser
 from dialectic.experiments.launchers._eval_helpers import (
     load_with_optional_lora,
+    pass_at_k,
+    pass_at_ks,
     resolve_inverse_cot_eval_params,
     strip_rng_state,
 )
@@ -75,37 +77,45 @@ def _aggregate_fcr(
     ]
     hard_mask = [r <= HARD_PROMPT_THRESHOLD for r in p_artifact_rates]
 
+    ks = pass_at_ks(N)
+
     def _bucket_metrics(
         grid: list[list[bool]], mask: list[bool] | None
-    ) -> tuple[float, float, float, int]:
+    ) -> tuple[float, float, float, int, dict[int, float]]:
         idxs = [i for i in range(P) if mask is None or mask[i]]
         bucket_total = len(idxs)
         if bucket_total == 0:
-            return 0.0, 0.0, 0.0, 0
+            return 0.0, 0.0, 0.0, 0, {k: 0.0 for k in ks}
         total_samples = sum(len(grid[i]) for i in idxs)
         total_correct = sum(sum(grid[i]) for i in idxs)
         any_correct = sum(1 for i in idxs if any(grid[i]))
         at_1 = sum(1 for i in idxs if grid[i] and grid[i][0])
+        pass_k = {
+            k: sum(pass_at_k(len(grid[i]), sum(grid[i]), k) for i in idxs)
+            / bucket_total
+            for k in ks
+        }
         return (
             _safe_div(at_1, bucket_total),
             _safe_div(total_correct, total_samples),
             _safe_div(any_correct, bucket_total),
             bucket_total,
+            pass_k,
         )
 
-    fcr_at_1, fcr_pr, fcr_any, _ = _bucket_metrics(fcr_correct_by_prompt, None)
-    ai_at_1, ai_pr, ai_any, ai_total = _bucket_metrics(
+    fcr_at_1, fcr_pr, fcr_any, _, fcr_pk = _bucket_metrics(fcr_correct_by_prompt, None)
+    ai_at_1, ai_pr, ai_any, ai_total, ai_pk = _bucket_metrics(
         fcr_correct_by_prompt, all_incorrect_mask
     )
-    hard_at_1, hard_pr, hard_any, hard_total = _bucket_metrics(
+    hard_at_1, hard_pr, hard_any, hard_total, hard_pk = _bucket_metrics(
         fcr_correct_by_prompt, hard_mask
     )
 
-    _, base_pr, base_any, _ = _bucket_metrics(baseline_correct_by_prompt, None)
-    _, base_pr_ai, base_any_ai, _ = _bucket_metrics(
+    _, base_pr, base_any, _, base_pk = _bucket_metrics(baseline_correct_by_prompt, None)
+    _, base_pr_ai, base_any_ai, _, base_pk_ai = _bucket_metrics(
         baseline_correct_by_prompt, all_incorrect_mask
     )
-    _, base_pr_hard, base_any_hard, _ = _bucket_metrics(
+    _, base_pr_hard, base_any_hard, _, base_pk_hard = _bucket_metrics(
         baseline_correct_by_prompt, hard_mask
     )
 
@@ -138,6 +148,12 @@ def _aggregate_fcr(
         fcr_pass_at_n_lift_on_all_incorrect=ai_any - base_any_ai,
         fcr_pass_rate_lift_on_hard=hard_pr - base_pr_hard,
         fcr_pass_at_n_lift_on_hard=hard_any - base_any_hard,
+        fcr_pass_at_k=fcr_pk,
+        fcr_pass_at_k_on_all_incorrect=ai_pk,
+        fcr_pass_at_k_on_hard=hard_pk,
+        p_pass_at_k=base_pk,
+        p_pass_at_k_on_all_incorrect=base_pk_ai,
+        p_pass_at_k_on_hard=base_pk_hard,
     )
 
 
@@ -378,6 +394,18 @@ def _eval_inverse_cot(
     log.info(f"  fcr_at_1:                            {result.fcr_at_1:.4f}")
     log.info(f"  fcr_pass_rate_at_n:                  {result.fcr_pass_rate_at_n:.4f}")
     log.info(f"  fcr_pass_at_n:                       {result.fcr_pass_at_n:.4f}")
+    for label, pk in (
+        ("fcr", result.fcr_pass_at_k),
+        ("fcr[hard]", result.fcr_pass_at_k_on_hard),
+        ("fcr[all_incorrect]", result.fcr_pass_at_k_on_all_incorrect),
+        ("p", result.p_pass_at_k),
+        ("p[hard]", result.p_pass_at_k_on_hard),
+        ("p[all_incorrect]", result.p_pass_at_k_on_all_incorrect),
+    ):
+        log.info(
+            f"  {label + ':':22s}"
+            + "  ".join(f"pass@{k}={v:.4f}" for k, v in sorted(pk.items()))
+        )
     log.info(f"  p_baseline_artifact:                 {result.p_baseline_artifact:.4f}")
     log.info(f"  p_pass_rate_at_n (fresh):            {result.p_pass_rate_at_n:.4f}")
     log.info(f"  p_pass_at_n (fresh):                 {result.p_pass_at_n:.4f}")
@@ -447,6 +475,24 @@ def _eval_inverse_cot(
                 "fcr_pass_at_n_lift_on_all_incorrect": result.fcr_pass_at_n_lift_on_all_incorrect,
                 "fcr_pass_rate_lift_on_hard": result.fcr_pass_rate_lift_on_hard,
                 "fcr_pass_at_n_lift_on_hard": result.fcr_pass_at_n_lift_on_hard,
+                **{f"fcr_pass_at_{k}": v for k, v in result.fcr_pass_at_k.items()},
+                **{
+                    f"fcr_pass_at_{k}_on_hard": v
+                    for k, v in result.fcr_pass_at_k_on_hard.items()
+                },
+                **{
+                    f"fcr_pass_at_{k}_on_all_incorrect": v
+                    for k, v in result.fcr_pass_at_k_on_all_incorrect.items()
+                },
+                **{f"p_pass_at_{k}": v for k, v in result.p_pass_at_k.items()},
+                **{
+                    f"p_pass_at_{k}_on_hard": v
+                    for k, v in result.p_pass_at_k_on_hard.items()
+                },
+                **{
+                    f"p_pass_at_{k}_on_all_incorrect": v
+                    for k, v in result.p_pass_at_k_on_all_incorrect.items()
+                },
             },
             step=0,
         )

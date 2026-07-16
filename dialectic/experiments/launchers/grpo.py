@@ -85,6 +85,8 @@ def _train_grpo(
         barrier()
     net, opt = load_model_and_opt(
         model_name=train_params.model_name,
+        start_ckpt_run=train_params.start_ckpt_run,
+        start_ckpt_step=train_params.start_ckpt_step,
         device=device,
         use_bf16=train_params.use_bf16,
         compile_model=train_params.compile_model,

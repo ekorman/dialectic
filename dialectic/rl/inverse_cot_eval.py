@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
@@ -104,6 +104,18 @@ class EvalFcrResult:
     fcr_pass_at_n_lift_on_all_incorrect: float
     fcr_pass_rate_lift_on_hard: float
     fcr_pass_at_n_lift_on_hard: float
+
+    # Unbiased pass@k curves (Chen et al. 2021 estimator over the full N
+    # samples) at k = 1, 2, 4, ..., N — mirrors eval_grpo's reporting. Keyed
+    # by k. Note pass@N equals the corresponding *_pass_at_n field, and
+    # pass@1 is the estimator (mean c/n), NOT the legacy first-sample-only
+    # ``fcr_at_1``.
+    fcr_pass_at_k: dict[int, float] = field(default_factory=dict)
+    fcr_pass_at_k_on_all_incorrect: dict[int, float] = field(default_factory=dict)
+    fcr_pass_at_k_on_hard: dict[int, float] = field(default_factory=dict)
+    p_pass_at_k: dict[int, float] = field(default_factory=dict)
+    p_pass_at_k_on_all_incorrect: dict[int, float] = field(default_factory=dict)
+    p_pass_at_k_on_hard: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
