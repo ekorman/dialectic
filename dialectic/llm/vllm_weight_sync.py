@@ -46,6 +46,7 @@ from tokenizers import Tokenizer  # noqa: E402
 
 from dialectic.distributed import unwrap_model  # noqa: E402
 from dialectic.llm.base import BaseTransformer  # noqa: E402
+from dialectic.llm.lora import merged_state_dict  # noqa: E402
 from dialectic.llm.qwen_hf_export import _dialectic_to_hf_key  # noqa: E402
 from dialectic.llm.vllm_loader import load_dialectic_qwen_as_vllm  # noqa: E402
 from dialectic.log import log  # noqa: E402
@@ -158,9 +159,13 @@ def sync_weights_to_vllm(llm: "LLM", net: BaseTransformer) -> None:
     persist briefly until the cache turns over naturally.
     """
     bare = unwrap_model(net)
+    # `merged_state_dict` folds any LoRA adapter deltas into plain-keyed base
+    # weights (a passthrough for non-LoRA nets); vLLM only knows the
+    # un-wrapped key layout, so pushing the raw state dict of a LoRA net
+    # would silently leave the engine running the frozen base policy.
     weights = [
         (_dialectic_to_hf_key(k), v.detach())
-        for k, v in bare.state_dict().items()
+        for k, v in merged_state_dict(bare).items()
         # `lm_head.weight` is tied to `embed_tokens.weight`; vLLM re-ties via
         # the `tie_word_embeddings` flag the offline exporter writes into
         # config.json, so don't push it twice.

@@ -56,7 +56,7 @@ class _QCkptMixin:
 
 
 @dataclass
-class TrainParams(_StartCkptMixin):
+class TrainParams(_LoraMixin, _StartCkptMixin):
     model_name: str
     batch_size: int
     lr: float

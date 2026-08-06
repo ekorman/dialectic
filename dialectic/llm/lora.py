@@ -62,6 +62,18 @@ def apply_lora(
     return net
 
 
+def resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
+    if target_modules == "all":
+        return DEFAULT_TARGET_MODULES
+    if target_modules == "attn":
+        return ("q_proj", "k_proj", "v_proj", "o_proj")
+    if target_modules == "mlp":
+        return ("gate_proj", "up_proj", "down_proj")
+    raise ValueError(
+        f"Unknown lora_target_modules: {target_modules!r} (expected 'all', 'attn', or 'mlp')"
+    )
+
+
 def freeze_base_params(net: nn.Module) -> None:
     for name, param in net.named_parameters():
         param.requires_grad_("lora_" in name)
@@ -73,6 +85,52 @@ def get_lora_params(net: nn.Module) -> list[nn.Parameter]:
 
 def get_lora_state_dict(net: nn.Module) -> dict[str, torch.Tensor]:
     return {k: v for k, v in net.state_dict().items() if "lora_" in k}
+
+
+def merged_state_dict(net: nn.Module) -> dict[str, torch.Tensor]:
+    """Return a plain-keyed state dict with LoRA deltas merged into the base.
+
+    Unlike :func:`merge_lora`, ``net`` is not mutated — safe to call inside a
+    training loop (e.g. to push merged weights into a vLLM engine between
+    optimizer steps). Adapter keys (``lora_A``/``lora_B``) are dropped and
+    every ``<prefix>.base.<param>`` key is rewritten to ``<prefix>.<param>``,
+    so the result matches the state dict of the un-wrapped model.
+
+    Parameters
+    ----------
+    net
+        Module tree, with or without ``LoRALinear`` layers. Without them the
+        state dict passes through unchanged.
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        State dict keyed as if ``apply_lora`` had never run. Merged weight
+        tensors are freshly allocated; all other tensors are the live ones
+        from ``net.state_dict()``.
+    """
+    lora_modules = {
+        name: module
+        for name, module in net.named_modules()
+        if isinstance(module, LoRALinear)
+    }
+    sd: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for key, value in net.state_dict().items():
+            prefix, sep, rest = key.rpartition(".base.")
+            if sep and prefix in lora_modules:
+                if rest == "weight":
+                    module = lora_modules[prefix]
+                    sd[f"{prefix}.weight"] = value + module.scaling * (
+                        module.lora_B.weight @ module.lora_A.weight
+                    )
+                else:
+                    sd[f"{prefix}.{rest}"] = value
+            elif ".lora_A." in key or ".lora_B." in key:
+                continue
+            else:
+                sd[key] = value
+    return sd
 
 
 def merge_lora(net: nn.Module) -> nn.Module:

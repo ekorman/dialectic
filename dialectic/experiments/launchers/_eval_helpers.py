@@ -16,7 +16,7 @@ from typing import Any
 import extty
 
 from dialectic.experiments.params import EvalCommonParams, InverseCotEvalParams
-from dialectic.llm.lora import DEFAULT_TARGET_MODULES, apply_lora, merge_lora
+from dialectic.llm.lora import apply_lora, merge_lora, resolve_lora_targets
 from dialectic.log import log
 
 
@@ -103,10 +103,10 @@ def load_run_config(ckpt_run: str) -> dict[str, Any] | None:
 def _pick_lora_section(config: dict[str, Any]) -> dict[str, Any]:
     """Find the param section in a run config that carries lora settings.
 
-    GRPO's ``TrainParams`` has no LoRA fields, but SFT's ``SftParams`` and
-    inverse-cot's ``InverseCotParams`` do. Scan candidate sections in order
-    and return the first one with a ``lora_rank`` key; otherwise an empty
-    dict (no LoRA was used).
+    Inverse-cot's ``InverseCotParams``, SFT's ``SftParams``, and GRPO's
+    ``TrainParams`` all carry LoRA fields (via ``_LoraMixin``). Scan
+    candidate sections in order and return the first one with a
+    ``lora_rank`` key; otherwise an empty dict (no LoRA was used).
     """
     for section_name in ("inverse_cot_params", "sft_params", "train_params"):
         section = config.get(section_name)
@@ -287,18 +287,6 @@ def _log_resolved(resolved: ResolvedEvalCommonParams) -> None:
         f"  q LoRA:               rank={resolved.q_lora_rank} alpha={resolved.q_lora_alpha} target={resolved.q_lora_target_modules}"
     )
     log.info(f"  p_rollout_artifact:   {resolved.p_rollout_artifact}")
-
-
-def resolve_lora_targets(target_modules: str) -> tuple[str, ...]:
-    if target_modules == "all":
-        return DEFAULT_TARGET_MODULES
-    if target_modules == "attn":
-        return ("q_proj", "k_proj", "v_proj", "o_proj")
-    if target_modules == "mlp":
-        return ("gate_proj", "up_proj", "down_proj")
-    raise ValueError(
-        f"Unknown lora_target_modules: {target_modules!r} (expected 'all', 'attn', or 'mlp')"
-    )
 
 
 def strip_rng_state(state: dict) -> None:

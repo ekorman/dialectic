@@ -1,3 +1,4 @@
+import random
 import sys
 from functools import partial
 from typing import Callable
@@ -9,6 +10,7 @@ from dialectic.distributed import (
     barrier,
     cleanup,
     get_device,
+    get_local_rank,
     get_rank,
     get_world_size,
     init_distributed,
@@ -33,8 +35,9 @@ from dialectic.experiments.reward_fns import (
     get_countdown_reward_fn,
     get_gsm8k_reward_fn,
 )
+from dialectic.llm.lora import apply_lora, freeze_base_params, resolve_lora_targets
 from dialectic.llm.registry import MODEL_REGISTRY
-from dialectic.llm.vllm_weight_sync import build_vllm_for_training
+from dialectic.llm.vllm_weight_sync import build_vllm_for_training, sync_weights_to_vllm
 from dialectic.log import log
 from dialectic.rl.dataset_env import DatasetEnv
 from dialectic.rl.env import Env, GSM8kEnv
@@ -81,25 +84,43 @@ def _train_grpo(
     advantage_fn = partial(grpo_advantage, normalize=grpo_params.normalize_advantages)
 
     model_info = MODEL_REGISTRY[train_params.model_name]
+    use_lora = train_params.lora_rank is not None
+
     if is_distributed() and not is_main_process():
         barrier()
+
+    # With LoRA enabled, the start checkpoint decides the load path: a LoRA
+    # checkpoint (wrapped `.base.` / `lora_` keys) only lines up AFTER
+    # `apply_lora`, while a plain checkpoint warm-starts the base model
+    # through `load_model_and_opt` as usual. Fetch it up front (inside the
+    # rank-0 download barrier) to inspect its keys.
+    start_ckpt: dict | None = None
+    resume_lora_ckpt = False
+    if use_lora and train_params.start_ckpt_run is not None:
+        if train_params.start_ckpt_step is None:
+            raise ValueError("--start-ckpt-step required with --start-ckpt-run")
+        project, run_name = train_params.start_ckpt_run.rsplit("/", 1)
+        ckpt: dict = extty.load_checkpoint_from(
+            project=project,
+            run_name=run_name,
+            step=train_params.start_ckpt_step,
+        )
+        start_ckpt = ckpt
+        resume_lora_ckpt = any("lora_" in k for k in ckpt["model_state_dict"])
+
     net, opt = load_model_and_opt(
         model_name=train_params.model_name,
-        start_ckpt_run=train_params.start_ckpt_run,
-        start_ckpt_step=train_params.start_ckpt_step,
+        start_ckpt_run=None if resume_lora_ckpt else train_params.start_ckpt_run,
+        start_ckpt_step=None if resume_lora_ckpt else train_params.start_ckpt_step,
         device=device,
         use_bf16=train_params.use_bf16,
         compile_model=train_params.compile_model,
-        load_opt=True,
+        load_opt=not use_lora,
         lr=train_params.lr,
         weight_decay=train_params.weight_decay,
     )
-    if is_distributed():
-        if is_main_process():
-            barrier()
-        from dialectic.distributed import get_local_rank
-
-        net = wrap_ddp(net, get_local_rank())
+    if is_distributed() and is_main_process():
+        barrier()
     format_messages = model_info.format_messages
 
     state_to_str = get_state_to_str(
@@ -112,7 +133,10 @@ def _train_grpo(
     # Build the vLLM sampler engine once. Each rank gets its own engine on
     # its own LOCAL_RANK GPU; weights get pushed in-place after every
     # optimizer step via `sync_weights_to_vllm`, so we only pay engine init
-    # cost once per run.
+    # cost once per run. Built BEFORE any LoRA wrapping: the HF export path
+    # reads plain module attributes (e.g. `gate_proj.out_features`) and
+    # plain state-dict keys. `lora_B` is zero-initialized, so the base
+    # weights loaded here equal the merged weights at step 0.
     vllm_max_model_len = train_params.max_tokens_generated + 1024
     llm = build_vllm_for_training(
         net,
@@ -124,6 +148,60 @@ def _train_grpo(
         dtype="bfloat16" if train_params.use_bf16 else "float16",
         seed=train_params.seed + rank,
     )
+
+    if use_lora:
+        # Applied after `load_model_and_opt` has cast/moved the net so the
+        # adapter layers inherit the right dtype/device from their base, and
+        # before the optimizer is built so it only collects adapter params.
+        assert train_params.lora_rank is not None
+        apply_lora(
+            net,
+            rank=train_params.lora_rank,
+            alpha=train_params.lora_alpha,
+            dropout=train_params.lora_dropout,
+            target_modules=resolve_lora_targets(train_params.lora_target_modules),
+        )
+        freeze_base_params(net)
+        trainable_params = [param for param in net.parameters() if param.requires_grad]
+        opt = torch.optim.AdamW(
+            trainable_params,
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+        if start_ckpt is not None and resume_lora_ckpt:
+            state_dict = start_ckpt["model_state_dict"]
+            rng_torch = state_dict.pop("_rng_torch", None)
+            rng_python = state_dict.pop("_rng_python", None)
+            rng_cuda = state_dict.pop("_rng_cuda", None)
+            net.load_state_dict(state_dict)
+            if "optimizer_state_dict" in start_ckpt:
+                opt.load_state_dict(start_ckpt["optimizer_state_dict"])
+            if rng_torch is not None:
+                torch.random.set_rng_state(rng_torch)
+            if rng_python is not None:
+                random.setstate(rng_python)
+            if rng_cuda is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng_cuda)
+            log.info(
+                f"Resumed LoRA checkpoint from {train_params.start_ckpt_run} "
+                f"step {train_params.start_ckpt_step}"
+            )
+            # The engine was built from base-only weights; push the resumed
+            # adapters (merged) so step-1 rollouts run the resumed policy.
+            sync_weights_to_vllm(llm, net)
+        total_params = sum(param.numel() for param in net.parameters())
+        trainable_count = sum(param.numel() for param in trainable_params)
+        log.info(
+            f"[rank {rank}] applied LoRA "
+            f"(rank={train_params.lora_rank}, "
+            f"alpha={train_params.lora_alpha}, "
+            f"dropout={train_params.lora_dropout}, "
+            f"target={train_params.lora_target_modules}); "
+            f"total params: {total_params:,}, trainable: {trainable_count:,}"
+        )
+
+    if is_distributed():
+        net = wrap_ddp(net, get_local_rank())
 
     train_grpo(
         net=net,
