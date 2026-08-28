@@ -1,0 +1,11 @@
+# Gitleaks configuration. Extends the upstream default ruleset.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "False positives from the generic-api-key rule"
+# `min_completions_per_prompt=<n>` in the test suite looks like an API-key
+# assignment to the generic rule. It is an ordinary keyword argument.
+regexes = [
+  '''min_completions_per_prompt''',
+]
