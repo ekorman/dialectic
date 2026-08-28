@@ -4,6 +4,7 @@ from typing import Callable
 import extty
 import torch
 from tokenizers import Tokenizer
+from tqdm import tqdm
 
 from dialectic.llm.base import BaseTransformer
 from dialectic.rl.env import Env
@@ -38,6 +39,7 @@ def evaluate(
     temperature: float = 0.0,
     n_examples: int = 10,
     use_bf16: bool = False,
+    show_progress: bool = False,
 ) -> tuple[EvaluationResult, list[extty.Example]]:
     """Evaluate a model against an environment and reward function.
 
@@ -84,6 +86,7 @@ def evaluate(
     all_prompts: list[str] = []
     all_output_strs_nested: list[list[str]] = []
 
+    pbar = tqdm(total=max_episodes, desc="Evaluating", disable=not show_progress)
     n_episodes = 0
     while n_episodes < max_episodes:
         current_batch_size = min(batch_size, max_episodes - n_episodes)
@@ -118,7 +121,9 @@ def evaluate(
             )
 
         n_episodes += current_batch_size
+        pbar.update(current_batch_size)
 
+    pbar.close()
     reward_tensor = torch.tensor(all_rewards)
     reward_mean = reward_tensor.mean().item()
     reward_std = reward_tensor.std().item()

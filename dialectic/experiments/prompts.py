@@ -35,15 +35,18 @@ class PromptCollection:
     assistant_prefill: str | None
 
 
-MAZE_INTERNAL_REASONING_PROMPT = PromptCollection(
-    system_prompt=None,
-    env_prompt=(
-        "Navigate the maze from Start to Goal. "
-        "Each line shows a cell and the directions you can move from it.\n\n"
-        "{maze}"
-    ),
-    assistant_prefill=None,
+GSM8K_ENV_PROMPT_WITH_REASONING_TAGS = (
+    "{question}\n\n"
+    f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
+    "Put your final numerical answer in <answer></answer> tags, "
+    "for example <answer>42</answer>."
 )
+GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS = (
+    "{question}\n\n"
+    "Show your reasoning step by step. Put your final numerical answer in "
+    "<answer></answer> tags, for example <answer>42</answer>."
+)
+
 
 COUNTDOWN_INTERNAL_REASONING_PROMPT = PromptCollection(
     system_prompt=None,
@@ -71,47 +74,33 @@ PROMPT_COLLECTIONS: dict[str, list[PromptCollection]] = {
             env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill="Let me solve this step by step.",
         ),
-    ],
-    "maze": [
         PromptCollection(
             system_prompt=None,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                f"Show your reasoning in <{REASONING_TAG}></{REASONING_TAG}> tags. "
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
-        ),
-        PromptCollection(
-            system_prompt=STHT_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
+            env_prompt=ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill=None,
-        ),
-        PromptCollection(
-            system_prompt=SIMPLE_SYSTEM_PROMPT,
-            env_prompt=(
-                "Navigate the maze from Start to Goal. "
-                "Each line shows a cell and the directions you can move from it.\n\n"
-                "{maze}\n\n"
-                "Put your moves in <answer></answer> tags as a comma-separated list, "
-                "for example <answer>right, down, right, down</answer>."
-            ),
-            assistant_prefill="Let me solve this step by step.",
         ),
     ],
     "math": [
         PromptCollection(
             system_prompt="Solve the math problem. Respond with only the numerical answer.",
             env_prompt="",
+            assistant_prefill=None,
+        ),
+    ],
+    "gsm8k": [
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=GSM8K_ENV_PROMPT_WITH_REASONING_TAGS,
+            assistant_prefill=f"Let me solve this step by step\n<{REASONING_TAG}>",
+        ),
+        PromptCollection(
+            system_prompt=SIMPLE_SYSTEM_PROMPT,
+            env_prompt=GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS,
+            assistant_prefill="Let me solve this step by step.",
+        ),
+        PromptCollection(
+            system_prompt=None,
+            env_prompt=GSM8K_ENV_PROMPT_WITHOUT_REASONING_TAGS,
             assistant_prefill=None,
         ),
     ],

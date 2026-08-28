@@ -1,10 +1,13 @@
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 import requests
 from safetensors.torch import load_file
+
+from dialectic.log import log
 
 WEIGHTS_CACHE = Path(
     os.getenv("DIALECTIC_WEIGHTS_PATH", Path.home() / ".dialectic" / "weights")
@@ -22,17 +25,23 @@ def get_artifact(artifact: Artifact) -> list[Path]:
     for url, filename in zip(artifact.urls, artifact.filenames, strict=True):
         local_path = WEIGHTS_CACHE / filename
         if not local_path.exists():
-            print(
+            log.info(
                 f"artifact {artifact} not found in cache, downloading to {local_path}"
             )
             local_path.parent.mkdir(parents=True, exist_ok=True)
             response = requests.get(url, stream=True)
             response.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-                    f.write(chunk)
+            fd, tmp_path = tempfile.mkstemp(dir=local_path.parent)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                        f.write(chunk)
+                os.replace(tmp_path, local_path)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
         else:
-            print(f"artifact file {filename} found at {local_path}")
+            log.info(f"artifact file {filename} found at {local_path}")
         local_paths.append(local_path)
 
     return local_paths

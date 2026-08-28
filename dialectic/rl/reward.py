@@ -1,9 +1,8 @@
 import re
 from typing import Callable, Protocol, Sequence
 
-from dialectic.rl.env import Countdown, MazeState
-from dialectic.rl.maze import bfs_distance, validate_path
-from dialectic.rl.types import QA, E, EnvResponse, RewardResult, T
+from dialectic.rl.env import Countdown, MathState
+from dialectic.rl.types import E, EnvResponse, RewardResult, T
 
 RewardComponentFn = Callable[..., float]
 
@@ -81,33 +80,20 @@ def countdown_correct(
         return 0.0
 
 
-def countdown_hybrid_correct(
-    *, env_response: EnvResponse[Countdown], raw_model_output: str | None, **_
+# --- GSM8K-specific ---
+
+
+def gsm8k_correct(
+    *, env_response: EnvResponse[MathState], extracted_model_output: str | None, **_
 ) -> float:
-    if not raw_model_output:
+    if extracted_model_output is None:
         return 0.0
     try:
-        text = raw_model_output.strip()
-        segments = text.split("|")
-        last_segment = segments[-1].strip()
-        if "=" not in last_segment:
-            return 0.0
-        expr, stated_result_str = last_segment.rsplit("=", 1)
-        expr = expr.strip()
-        stated_result_str = stated_result_str.strip()
-        if not stated_result_str:
-            return 0.0
-        stated_result = float(stated_result_str)
-        target = env_response.data.target
-        if abs(stated_result - target) > 1e-6:
-            return 0.0
-        return (
-            1.0
-            if _evaluate_and_verify_countdown(expr, env_response.data.numbers, target)
-            else 0.0
-        )
-    except Exception:
+        predicted = float(extracted_model_output.replace(",", "").strip())
+        target = float(env_response.data.answer)
+    except (ValueError, TypeError):
         return 0.0
+    return 1.0 if abs(predicted - target) < 1e-6 else 0.0
 
 
 # --- Generic (environment-agnostic) ---
@@ -142,87 +128,5 @@ def think_tags(
         ):
             return 1.0
         return 0.0
-
-    return fn
-
-
-def length_bonus(
-    max_bonus: float = 0.05, normalize_length: int = 500
-) -> RewardComponentFn:
-    def fn(*, raw_model_output: str | None, **_) -> float:
-        if raw_model_output is None:
-            return 0.0
-        return min(len(raw_model_output) / normalize_length, max_bonus)
-
-    return fn
-
-
-# --- Maze-specific ---
-
-
-def maze_correct(
-    *,
-    env_response: EnvResponse[MazeState],
-    extracted_model_output: list[str] | None,
-    **_,
-) -> float:
-    if not extracted_model_output:
-        return 0.0
-    result = validate_path(env_response.data.maze, extracted_model_output)
-    return 1.0 if result.reached_goal else 0.0
-
-
-def maze_validity(
-    *,
-    env_response: EnvResponse[MazeState],
-    extracted_model_output: list[str] | None,
-    **_,
-) -> float:
-    if not extracted_model_output:
-        return 0.0
-    result = validate_path(env_response.data.maze, extracted_model_output)
-    if result.total_moves == 0:
-        return 0.0
-    return result.valid_moves / result.total_moves
-
-
-def maze_distance(
-    *,
-    env_response: EnvResponse[MazeState],
-    extracted_model_output: list[str] | None,
-    **_,
-) -> float:
-    """
-    Proportional credit for getting closer to the goal.
-
-    Returns 1.0 if at goal, 0.0 if at start or farther, linear in between.
-    """
-    maze = env_response.data.maze
-    if not extracted_model_output:
-        return 0.0
-    result = validate_path(maze, extracted_model_output)
-    if result.reached_goal:
-        return 1.0
-    start_dist = bfs_distance(maze.connections, maze.start, maze.goal)
-    if start_dist is None or start_dist == 0:
-        return 0.0
-    final_dist = bfs_distance(maze.connections, result.final_pos, maze.goal)
-    if final_dist is None:
-        return 0.0
-    return max(0.0, 1.0 - final_dist / start_dist)
-
-
-# --- Arithmetic ---
-
-
-def arithmetic_correct(tolerance: float = 1e-6) -> RewardComponentFn:
-    def fn(
-        *, env_response: EnvResponse[QA[float]], extracted_model_output: float, **_
-    ) -> float:
-        return (
-            1.0
-            if abs(env_response.data.answer - extracted_model_output) < tolerance
-            else 0.0
-        )
 
     return fn

@@ -1,7 +1,7 @@
 import sys
 import time
 from copy import deepcopy
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import extty
 import torch
@@ -10,14 +10,16 @@ from jaxtyping import Bool, Float, Integer
 from tokenizers import Tokenizer
 
 from dialectic.llm.base import BaseTransformer
-from dialectic.llm.generate import PreFill
 from dialectic.rl.env import Env
 from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
 from dialectic.rl.reward import RewardFn
-from dialectic.rl.rollout import generate_rollout_batch, generate_soft_rollout_batch
+from dialectic.rl.rollout import generate_rollout_batch, generate_rollout_batch_vllm
 from dialectic.rl.types import A, E, RewardResult, T
 from dialectic.training import StepFunctionReturn, train_loop
+
+if TYPE_CHECKING:
+    from vllm import LLM
 
 
 def aggregate_reward_components(
@@ -73,26 +75,6 @@ def get_completion_mask(
     l_prompt = attention_mask.shape[1]
     only_completion = stacked[:, :, l_prompt:]
     completion_mask = only_completion != pad_token_id
-    return completion_mask
-
-
-def get_completion_mask_soft(
-    *,
-    attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    completion_embeddings: list[Float[torch.Tensor, "B L D"]],
-    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]],
-    hard_tokens_mask: list[Bool[torch.Tensor, "B L"]],
-    pad_token_id: int,
-) -> Bool[torch.Tensor, "B G L_new"]:
-    l_prompt = attention_mask.shape[1]
-    _, stacked_shadow_ids, _, non_pad_mask = stack_and_pad_soft(
-        embeddings=completion_embeddings,
-        shadow_ids=completion_shadow_ids,
-        hard_masks=hard_tokens_mask,
-        pad_token_id=pad_token_id,
-    )
-    pad_mask = stacked_shadow_ids != pad_token_id
-    completion_mask = (non_pad_mask & pad_mask)[:, :, l_prompt:]
     return completion_mask
 
 
@@ -224,13 +206,6 @@ def grpo_advantage(
     return rewards - mean
 
 
-def rloo_advantage(rewards: Float[torch.Tensor, "G B"]) -> Float[torch.Tensor, "G B"]:
-    G = rewards.shape[0]
-    if G == 1:
-        raise RuntimeError("Group size must be > 1 to use RLOO")
-    return G / (G - 1) * rewards - 1 / (G - 1) * rewards.sum(0, keepdim=True)
-
-
 def compute_grpo_loss(
     *,
     log_probs: Float[torch.Tensor, "B G L_new"],
@@ -339,6 +314,7 @@ def collect_micro_batch(
     *,
     net: BaseTransformer,
     ref_net: BaseTransformer | None,
+    llm: "LLM | None" = None,
     env: Env[T, A],
     reward_fn: RewardFn[T, E],
     state_to_str: Callable[[T], str],
@@ -355,23 +331,39 @@ def collect_micro_batch(
     use_bf16: bool = False,
 ) -> dict:
     """Collect a single micro-batch of data for gradient accumulation."""
-    rollout = generate_rollout_batch(
-        net=net,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        extractor=extractor,
-        batch_size=batch_size,
-        group_size=group_size,
-        temperature=temperature,
-        max_tokens_generated=max_tokens_generated,
-        use_bf16=use_bf16,
-    )
-
     device = next(net.parameters()).device
+    if llm is not None:
+        rollout = generate_rollout_batch_vllm(
+            llm=llm,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+            device=device,
+        )
+    else:
+        rollout = generate_rollout_batch(
+            net=net,
+            env=env,
+            reward_fn=reward_fn,
+            state_to_str=state_to_str,
+            tokenizer=tokenizer,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            extractor=extractor,
+            batch_size=batch_size,
+            group_size=group_size,
+            temperature=temperature,
+            max_tokens_generated=max_tokens_generated,
+            use_bf16=use_bf16,
+        )
     t_logprobs_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
@@ -435,6 +427,7 @@ def create_grpo_step_fn(
     batch_size: int,
     group_size: int,
     normalize_by_sequence_length: bool,
+    llm: "LLM | None" = None,
     accumulation_steps: int,
     max_grad_norm: float,
     use_bf16: bool,
@@ -469,6 +462,7 @@ def create_grpo_step_fn(
         t_gen_total = 0.0
         t_logprobs_total = 0.0
         micro_batches: list[dict] = []
+        all_bwd_metrics: list[dict] = []
 
         for _ in range(accumulation_steps):
             micro_batch = collect_fn(net, ref_net)
@@ -541,6 +535,10 @@ def create_grpo_step_fn(
             opt.step()
             if scheduler is not None:
                 scheduler.step()
+            if llm is not None:
+                from dialectic.llm.vllm_weight_sync import sync_weights_to_vllm
+
+                sync_weights_to_vllm(llm, net)
 
         t_opt = time.perf_counter() - t_opt_start
         current_lr = opt.param_groups[0]["lr"]
@@ -592,46 +590,6 @@ def create_grpo_step_fn(
             "train/logprobs_time": t_logprobs_total,
             "train/optimization_time": t_opt,
             "train/lr": current_lr,
-            **(
-                {
-                    "train/hard_completion_ratio": sum(
-                        mb["hard_completion_ratio"] for mb in micro_batches
-                    )
-                    / len(micro_batches)
-                }
-                if "hard_completion_ratio" in micro_batches[0]
-                else {}
-            ),
-            **(
-                {
-                    "train/hard_lp_mean": sum(
-                        mb["hard_lp_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/hard_lp_std": sum(mb["hard_lp_std"] for mb in micro_batches)
-                    / len(micro_batches),
-                    "train/soft_lp_mean": sum(
-                        mb["soft_lp_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/soft_lp_std": sum(mb["soft_lp_std"] for mb in micro_batches)
-                    / len(micro_batches),
-                    "train/gaussian_dist_mean": sum(
-                        mb["gaussian_dist_mean"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/soft_tokens_per_seq": sum(
-                        mb["soft_tokens_per_seq"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                    "train/hard_tokens_per_seq": sum(
-                        mb["hard_tokens_per_seq"] for mb in micro_batches
-                    )
-                    / len(micro_batches),
-                }
-                if "hard_lp_mean" in micro_batches[0]
-                else {}
-            ),
             **{f"train/reward/{name}": mean for name, mean in component_means.items()},
         }
         if total_kl_loss is not None:
@@ -642,6 +600,12 @@ def create_grpo_step_fn(
             metrics["train/logprob_recompute_max_diff"] = max(
                 logprob_recompute_max_diffs
             )
+        if all_bwd_metrics:
+            all_keys = set().union(*(m.keys() for m in all_bwd_metrics))
+            for key in all_keys:
+                vals = [m[key] for m in all_bwd_metrics if key in m]
+                if vals:
+                    metrics[key] = sum(vals) / len(vals)
 
         return StepFunctionReturn(
             n_episodes_processed=all_rewards.shape[1], metrics=metrics
@@ -710,6 +674,7 @@ def _grpo_train_loop(
     val_envs: list[Env],
     val_freq: int = 0,
     warmup_steps: int = 0,
+    llm: "LLM | None" = None,
 ) -> None:
     device = next(net.parameters()).device
 
@@ -731,6 +696,7 @@ def _grpo_train_loop(
         device=device,
         advantage_fn=advantage_fn,
         warmup_steps=warmup_steps,
+        llm=llm,
     )
 
     train_loop(
@@ -777,6 +743,7 @@ def train_grpo(
     val_batch_size: int,
     val_freq: int = 0,
     warmup_steps: int = 0,
+    llm: "LLM | None" = None,
 ) -> None:
     if use_bf16:
         net = net.to(dtype=torch.bfloat16)
@@ -787,6 +754,7 @@ def train_grpo(
         return collect_micro_batch(
             net=net,
             ref_net=ref_net,
+            llm=llm,
             env=env,
             reward_fn=reward_fn,
             state_to_str=state_to_str,
@@ -849,93 +817,8 @@ def train_grpo(
         val_envs=val_envs,
         val_fn=val_fn,
         warmup_steps=warmup_steps,
+        llm=llm,
     )
-
-
-def stack_and_pad_soft(
-    *,
-    embeddings: list[Float[torch.Tensor, "B L D"]],
-    shadow_ids: list[Integer[torch.Tensor, "B L"]],
-    hard_masks: list[Bool[torch.Tensor, "B L"]],
-    pad_token_id: int,
-) -> tuple[
-    Float[torch.Tensor, "B G L D"],
-    Integer[torch.Tensor, "B G L"],
-    Bool[torch.Tensor, "B G L"],
-    Bool[torch.Tensor, "B G L"],
-]:
-    max_len = max(e.shape[1] for e in embeddings)
-    batch_size = embeddings[0].shape[0]
-    group_size = len(embeddings)
-    D = embeddings[0].shape[2]
-    device = embeddings[0].device
-
-    stacked_embeddings = torch.zeros(
-        batch_size, group_size, max_len, D, device=device, dtype=embeddings[0].dtype
-    )
-    stacked_shadow_ids = torch.full(
-        (batch_size, group_size, max_len),
-        pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
-    stacked_masks = torch.ones(
-        batch_size, group_size, max_len, device=device, dtype=torch.bool
-    )
-    non_pad_mask = torch.zeros(
-        batch_size, group_size, max_len, device=device, dtype=torch.bool
-    )
-
-    for g, (e, s, m) in enumerate(zip(embeddings, shadow_ids, hard_masks)):
-        L = e.shape[1]
-        stacked_embeddings[:, g, :L] = e
-        stacked_shadow_ids[:, g, :L] = s
-        stacked_masks[:, g, :L] = m
-        non_pad_mask[:, g, :L] = True
-
-    return stacked_embeddings, stacked_shadow_ids, stacked_masks, non_pad_mask
-
-
-def compute_soft_log_probs(
-    *,
-    net: BaseTransformer,
-    attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    completion_embeddings: list[Float[torch.Tensor, "B L D"]],
-    completion_shadow_ids: list[Integer[torch.Tensor, "B L"]],
-    hard_tokens_mask: list[Bool[torch.Tensor, "B L"]],
-    noise_std: float,
-    temperature: float,
-    pad_token_id: int,
-    normalize_soft_pdf_by_dim: bool,
-    chunk_size: int = 0,
-) -> tuple[Float[torch.Tensor, "B G L_c"], Bool[torch.Tensor, "B G L_c"]]:
-    l_prompt = attention_mask.shape[1]
-    stacked_embeddings, stacked_shadow_ids, stacked_masks, non_pad_mask = (
-        stack_and_pad_soft(
-            embeddings=completion_embeddings,
-            shadow_ids=completion_shadow_ids,
-            hard_masks=hard_tokens_mask,
-            pad_token_id=pad_token_id,
-        )
-    )
-
-    log_probs = _compute_soft_log_probs_chunked(
-        net=net,
-        stacked_embeddings=stacked_embeddings,
-        stacked_shadow_ids=stacked_shadow_ids,
-        stacked_masks=stacked_masks,
-        attention_mask=attention_mask,
-        l_prompt=l_prompt,
-        noise_std=noise_std,
-        temperature=temperature,
-        chunk_size=chunk_size,
-        normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-    )
-
-    pad_mask = stacked_shadow_ids != pad_token_id
-    completion_mask = (non_pad_mask & pad_mask)[:, :, l_prompt:]
-
-    return log_probs, completion_mask
 
 
 def _expand_attention_mask(
@@ -956,477 +839,3 @@ def _expand_attention_mask(
     full_mask[:, :l_prompt] = attention_mask
     full_mask = full_mask.unsqueeze(1).expand(-1, group_size, -1)
     return full_mask.reshape(batch_size * group_size, seq_len)
-
-
-def _compute_soft_log_probs_chunked(
-    *,
-    net: BaseTransformer,
-    stacked_embeddings: Float[torch.Tensor, "B G L D"],
-    stacked_shadow_ids: Integer[torch.Tensor, "B G L"],
-    stacked_masks: Bool[torch.Tensor, "B G L"],
-    attention_mask: Bool[torch.Tensor, "B L_prompt"],
-    l_prompt: int,
-    noise_std: float,
-    temperature: float,
-    chunk_size: int,
-    normalize_soft_pdf_by_dim: bool,
-) -> Float[torch.Tensor, "B G L_c"]:
-    batch_size, group_size, seq_len, D = stacked_embeddings.shape
-    BG = batch_size * group_size
-    V = net.vocab_size
-
-    flat_embeddings = stacked_embeddings.view(BG, seq_len, D)
-    flat_shadow_ids = stacked_shadow_ids.view(BG, seq_len)
-
-    full_mask = _expand_attention_mask(attention_mask, batch_size, group_size, seq_len)
-
-    hidden_states = net(
-        flat_embeddings,
-        attention_mask=full_mask,
-        return_hidden_states=True,
-    )
-
-    completion_len = seq_len - l_prompt
-    hidden_for_completion = hidden_states[:, l_prompt - 1 : -1]
-    comp_shadow_ids = flat_shadow_ids[:, l_prompt:]
-    comp_embeddings = flat_embeddings[:, l_prompt:]
-    comp_masks = stacked_masks.view(BG, seq_len)[:, l_prompt:]
-    W = net.embed_tokens.weight
-
-    if chunk_size == 0:
-        chunk_size = completion_len
-
-    log_probs_list = []
-    for chunk_start in range(0, completion_len, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, completion_len)
-
-        chunk_hidden = hidden_for_completion[:, chunk_start:chunk_end]
-        chunk_logits = net.lm_head(chunk_hidden)
-        chunk_shadow_ids = comp_shadow_ids[:, chunk_start:chunk_end]
-        chunk_embeddings = comp_embeddings[:, chunk_start:chunk_end]
-        chunk_masks = comp_masks[:, chunk_start:chunk_end]
-
-        BG_c, L_chunk, _ = chunk_logits.shape
-
-        hard_lp = -torch.nn.functional.cross_entropy(
-            chunk_logits.reshape(BG_c * L_chunk, V).float(),
-            chunk_shadow_ids.reshape(BG_c * L_chunk),
-            reduction="none",
-        ).reshape(BG_c, L_chunk)
-
-        device_type = chunk_embeddings.device.type
-        with torch.amp.autocast(device_type=device_type, enabled=False):
-            e_action = chunk_embeddings.float()
-            mu_new = (
-                torch.softmax(chunk_logits.float() / temperature, dim=-1) @ W.float()
-            )
-            soft_lp = -0.5 * ((e_action - mu_new) ** 2) / (noise_std**2)
-            if normalize_soft_pdf_by_dim:
-                soft_lp = soft_lp.mean(-1)
-            else:
-                soft_lp = soft_lp.sum(-1)
-
-        chunk_log_probs = torch.where(chunk_masks, hard_lp, soft_lp)
-        log_probs_list.append(chunk_log_probs)
-
-        del chunk_logits
-
-    log_probs_flat = torch.cat(log_probs_list, dim=1).view(
-        batch_size, group_size, completion_len
-    )
-
-    return log_probs_flat
-
-
-@torch.no_grad()
-def collect_soft_micro_batch(
-    *,
-    net: BaseTransformer,
-    ref_net: BaseTransformer | None,
-    env: Env[T, A],
-    reward_fn: RewardFn[T, E],
-    state_to_str: Callable[[T], str],
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
-    extractor: Callable[[str], E],
-    batch_size: int,
-    group_size: int,
-    temperature: float,
-    max_tokens_generated: int,
-    noise_std: float,
-    collect_old_log_probs: bool,
-    normalize_soft_pdf_by_dim: bool,
-    switch_to_hard_tokens_condition: torch.Tensor | None = None,
-    max_tokens_prefill: torch.Tensor | None = None,
-    max_tokens_prefill_steps_before_end: int = 0,
-    min_soft_steps: int = 0,
-    prefill: PreFill | None = None,
-    logprob_chunk_size: int = 0,
-    use_bf16: bool = False,
-) -> dict:
-    rollout = generate_soft_rollout_batch(
-        net=net,
-        env=env,
-        reward_fn=reward_fn,
-        state_to_str=state_to_str,
-        tokenizer=tokenizer,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        extractor=extractor,
-        batch_size=batch_size,
-        group_size=group_size,
-        temperature=temperature,
-        max_tokens_generated=max_tokens_generated,
-        noise_std=noise_std,
-        switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
-        max_tokens_prefill=max_tokens_prefill,
-        max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
-        min_soft_steps=min_soft_steps,
-        prefill=prefill,
-        use_bf16=use_bf16,
-    )
-
-    device = next(net.parameters()).device
-    t_logprobs_start = time.perf_counter()
-    with torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
-    ):
-        if ref_net is not None:
-            ref_log_probs, _ = compute_soft_log_probs(
-                net=ref_net,
-                attention_mask=rollout.attention_mask,
-                completion_embeddings=rollout.completion_embeddings,
-                completion_shadow_ids=rollout.completion_shadow_ids,
-                hard_tokens_mask=rollout.hard_tokens_mask,
-                noise_std=rollout.noise_std,
-                temperature=rollout.temperature,
-                pad_token_id=pad_token_id,
-                chunk_size=logprob_chunk_size,
-                normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-            )
-        else:
-            ref_log_probs = None
-        diag_log_probs, completion_mask = compute_soft_log_probs(
-            net=net,
-            attention_mask=rollout.attention_mask,
-            completion_embeddings=rollout.completion_embeddings,
-            completion_shadow_ids=rollout.completion_shadow_ids,
-            hard_tokens_mask=rollout.hard_tokens_mask,
-            noise_std=rollout.noise_std,
-            temperature=rollout.temperature,
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-        )
-        old_log_probs = diag_log_probs if collect_old_log_probs else None
-    t_logprobs = time.perf_counter() - t_logprobs_start
-
-    # Soft-token debug stats (cheap): fraction of completion tokens that are hard,
-    # and a guard that pad tokens are not counted in completion_mask.
-    l_prompt = rollout.attention_mask.shape[1]
-    B = rollout.attention_mask.shape[0]
-    G = len(rollout.hard_tokens_mask)
-    Lc = completion_mask.shape[2]
-    hard_completion_mask = torch.zeros((B, G, Lc), device=device, dtype=torch.bool)
-    pad_ok_mask = torch.zeros((B, G, Lc), device=device, dtype=torch.bool)
-
-    for g, hard_mask in enumerate(rollout.hard_tokens_mask):
-        comp_hard = hard_mask[:, l_prompt:]
-        comp_len = min(comp_hard.shape[1], Lc)
-        hard_completion_mask[:, g, :comp_len] = comp_hard[:, :comp_len]
-
-        comp_pad_ok = rollout.completion_shadow_ids[g][:, l_prompt:] != pad_token_id
-        pad_len = min(comp_pad_ok.shape[1], Lc)
-        pad_ok_mask[:, g, :pad_len] = comp_pad_ok[:, :pad_len]
-
-    if __debug__:
-        if torch.any(completion_mask & ~pad_ok_mask):
-            raise RuntimeError("completion_mask includes padded tokens in soft rollout")
-
-    hard_completion_ratio = (
-        (hard_completion_mask & completion_mask).sum().float()
-        / completion_mask.sum().float().clamp_min(1.0)
-    ).item()
-
-    hard_pos_mask = hard_completion_mask & completion_mask
-    soft_pos_mask = ~hard_completion_mask & completion_mask
-
-    if hard_pos_mask.any():
-        hard_lp_vals = diag_log_probs[hard_pos_mask]
-        hard_lp_mean = hard_lp_vals.mean().item()
-        hard_lp_std = hard_lp_vals.std().item()
-    else:
-        hard_lp_mean = hard_lp_std = 0.0
-
-    if soft_pos_mask.any():
-        soft_lp_vals = diag_log_probs[soft_pos_mask]
-        soft_lp_mean = soft_lp_vals.mean().item()
-        soft_lp_std = soft_lp_vals.std().item()
-        if normalize_soft_pdf_by_dim:
-            gaussian_dist_mean = (-2.0 * soft_lp_vals).mean().item()
-        else:
-            gaussian_dist_mean = (-2.0 * soft_lp_vals / net.d).mean().item()
-    else:
-        soft_lp_mean = soft_lp_std = gaussian_dist_mean = 0.0
-
-    soft_tokens_per_seq = soft_pos_mask.sum(dim=-1).float().mean().item()
-    hard_tokens_per_seq = hard_pos_mask.sum(dim=-1).float().mean().item()
-
-    return {
-        "prompts": rollout.prompts,
-        "env_responses": rollout.env_responses,
-        "attention_mask": rollout.attention_mask,
-        "completion_embeddings": rollout.completion_embeddings,
-        "completion_shadow_ids": rollout.completion_shadow_ids,
-        "hard_tokens_mask": rollout.hard_tokens_mask,
-        "noise_std": rollout.noise_std,
-        "temperature": rollout.temperature,
-        "output_strs": rollout.output_strs,
-        "reward_results": rollout.reward_results,
-        "rewards": rollout.rewards,
-        "ref_log_probs": ref_log_probs,
-        "old_log_probs": old_log_probs,
-        "diag_log_probs": diag_log_probs,
-        "completion_mask": completion_mask,
-        "hard_completion_ratio": hard_completion_ratio,
-        "hard_lp_mean": hard_lp_mean,
-        "hard_lp_std": hard_lp_std,
-        "soft_lp_mean": soft_lp_mean,
-        "soft_lp_std": soft_lp_std,
-        "gaussian_dist_mean": gaussian_dist_mean,
-        "soft_tokens_per_seq": soft_tokens_per_seq,
-        "hard_tokens_per_seq": hard_tokens_per_seq,
-        "t_gen": rollout.t_generation,
-        "t_logprobs": t_logprobs,
-    }
-
-
-def train_soft_grpo(
-    *,
-    net: BaseTransformer,
-    opt: torch.optim.Optimizer,
-    env: Env[T, A],
-    reward_fn: RewardFn[T, E],
-    state_to_str: Callable[[T], str],
-    tokenizer: Tokenizer,
-    eos_token_id: int,
-    pad_token_id: int,
-    extractor: Callable[[str], E],
-    beta: float,
-    eps: float | None,
-    mu: int,
-    max_tokens_generated: int,
-    max_episodes: int,
-    update_ref_net_batch_cadence: int | None,
-    batch_size: int,
-    group_size: int,
-    temperature: float,
-    noise_std: float,
-    normalize_by_sequence_length: bool,
-    normalize_soft_pdf_by_dim: bool,
-    advantage_fn: Callable[[Float[torch.Tensor, "G B"]], Float[torch.Tensor, "G B"]],
-    switch_to_hard_tokens_condition: torch.Tensor | None = None,
-    max_tokens_prefill: torch.Tensor | None = None,
-    min_soft_steps: int = 0,
-    prefill: PreFill | None = None,
-    max_tokens_prefill_steps_before_end: int = 0,
-    accumulation_steps: int,
-    max_grad_norm: float,
-    logprob_chunk_size: int = 64,
-    use_bf16: bool = True,
-    save_ckpt_freq: int = sys.maxsize,
-    val_episodes: int,
-    val_envs: list[Env],
-    val_batch_size: int,
-    val_freq: int = 0,
-    warmup_steps: int = 0,
-) -> None:
-    if use_bf16:
-        net = net.to(dtype=torch.bfloat16)
-
-    collect_old_log_probs = eps is not None
-
-    def collect_fn(net: BaseTransformer, ref_net: BaseTransformer) -> dict:
-        return collect_soft_micro_batch(
-            net=net,
-            ref_net=ref_net,
-            env=env,
-            reward_fn=reward_fn,
-            state_to_str=state_to_str,
-            tokenizer=tokenizer,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            extractor=extractor,
-            batch_size=batch_size,
-            group_size=group_size,
-            temperature=temperature,
-            max_tokens_generated=max_tokens_generated,
-            collect_old_log_probs=collect_old_log_probs,
-            noise_std=noise_std,
-            switch_to_hard_tokens_condition=switch_to_hard_tokens_condition,
-            max_tokens_prefill=max_tokens_prefill,
-            max_tokens_prefill_steps_before_end=max_tokens_prefill_steps_before_end,
-            min_soft_steps=min_soft_steps,
-            prefill=prefill,
-            logprob_chunk_size=logprob_chunk_size,
-            use_bf16=use_bf16,
-            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-        )
-
-    def recompute_fn(
-        net: BaseTransformer, mb: dict
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return compute_soft_log_probs(
-            net=net,
-            attention_mask=mb["attention_mask"],
-            completion_embeddings=mb["completion_embeddings"],
-            completion_shadow_ids=mb["completion_shadow_ids"],
-            hard_tokens_mask=mb["hard_tokens_mask"],
-            noise_std=mb["noise_std"],
-            temperature=mb["temperature"],
-            pad_token_id=pad_token_id,
-            chunk_size=logprob_chunk_size,
-            normalize_soft_pdf_by_dim=normalize_soft_pdf_by_dim,
-        )
-
-    val_fn = create_grpo_val_fn(
-        net=net,
-        state_to_str=state_to_str,
-        tokenizer=tokenizer,
-        pad_token_id=pad_token_id,
-        eos_token_id=eos_token_id,
-        use_bf16=use_bf16,
-        val_episodes=val_episodes,
-        val_batch_size=val_batch_size,
-        reward_fn=reward_fn,
-        max_tokens_generated=max_tokens_generated,
-    )
-
-    _grpo_train_loop(
-        net=net,
-        opt=opt,
-        collect_fn=collect_fn,
-        recompute_log_probs_fn=recompute_fn,
-        advantage_fn=advantage_fn,
-        beta=beta,
-        eps=eps,
-        mu=mu,
-        max_episodes=max_episodes,
-        update_ref_net_batch_cadence=update_ref_net_batch_cadence,
-        batch_size=batch_size,
-        group_size=group_size,
-        normalize_by_sequence_length=normalize_by_sequence_length,
-        accumulation_steps=accumulation_steps,
-        max_grad_norm=max_grad_norm,
-        use_bf16=use_bf16,
-        save_ckpt_freq=save_ckpt_freq,
-        val_freq=val_freq,
-        val_fn=val_fn,
-        val_envs=val_envs,
-        warmup_steps=warmup_steps,
-    )
-
-
-def stack_and_pad_internal_reasoning(
-    hard_token_ids: list[Integer[torch.Tensor, "B C"]],
-    n_cycles: list[Integer[torch.Tensor, " B"]],
-    pad_token_id: int,
-) -> tuple[Integer[torch.Tensor, "B G C"], Integer[torch.Tensor, "B G"]]:
-    max_c = max(t.shape[1] for t in hard_token_ids)
-    B = hard_token_ids[0].shape[0]
-    G = len(hard_token_ids)
-    device = hard_token_ids[0].device
-
-    stacked_ids = torch.full(
-        (B, G, max_c), pad_token_id, dtype=torch.long, device=device
-    )
-    stacked_n = torch.zeros(B, G, dtype=torch.long, device=device)
-
-    for g, (ids, nc) in enumerate(zip(hard_token_ids, n_cycles)):
-        C = ids.shape[1]
-        stacked_ids[:, g, :C] = ids
-        stacked_n[:, g] = nc
-
-    return stacked_ids, stacked_n
-
-
-def make_per_cycle_backward_callback(
-    *,
-    B: int,
-    G: int,
-    advs: Float[torch.Tensor, "B G 1"],
-    completion_mask: Bool[torch.Tensor, "B G C"],
-    old_log_probs: Float[torch.Tensor, "B G C"] | None,
-    ref_log_probs: Float[torch.Tensor, "B G C"] | None,
-    beta: float,
-    eps: float | None,
-    normalize_by_sequence_length: bool,
-    loss_scale: float,
-    clip_ratio_c: float = 3.0,
-) -> Callable[[Float[torch.Tensor, "B G"], int], Float[torch.Tensor, "B G"]]:
-    """Build a cycle_callback that computes per-cycle GRPO loss and calls backward.
-
-    This frees each cycle's autograd graph immediately, reducing peak memory
-    from O(C) cycles to O(1).
-    """
-    advs_bg = advs.squeeze(-1)  # [B, G]
-    if normalize_by_sequence_length:
-        seq_lengths = completion_mask.sum(dim=-1).clamp(min=1).float()  # [B, G]
-    else:
-        seq_lengths = torch.ones(B, G, device=advs.device)
-
-    def callback(
-        lp: Float[torch.Tensor, "B G"], cycle_idx: int
-    ) -> Float[torch.Tensor, "B G"]:
-        lp_bg = lp.view(B, G)
-        mask_c = completion_mask[:, :, cycle_idx]
-
-        if eps is not None and old_log_probs is not None:
-            ratio = (lp_bg - old_log_probs[:, :, cycle_idx]).exp()
-            unclipped = ratio * advs_bg
-            clipped = torch.clip(ratio, 1 - eps, 1 + eps) * advs_bg
-            main_obj = torch.min(unclipped, clipped)
-            dual_clip_obj = clip_ratio_c * advs_bg
-            main_obj = torch.where(
-                advs_bg < 0, torch.max(main_obj, dual_clip_obj), main_obj
-            )
-        else:
-            main_obj = lp_bg * advs_bg
-
-        cycle_loss = -(main_obj * mask_c / seq_lengths).mean()
-
-        if beta != 0 and ref_log_probs is not None:
-            kl_diff = torch.clamp(
-                ref_log_probs[:, :, cycle_idx] - lp_bg, min=-20, max=20
-            )
-            kl = torch.clamp(torch.exp(kl_diff) - kl_diff - 1, min=-10, max=10)
-            cycle_loss = cycle_loss + beta * (kl * mask_c / seq_lengths).mean()
-
-        (cycle_loss * loss_scale).backward()
-        return lp.detach()
-
-    return callback
-
-
-def _encode_prompts(
-    env_responses, state_to_str, tokenizer, pad_token_id, batch_size, device
-):
-    prompts = [state_to_str(er.data) for er in env_responses]
-    encoded = tokenizer.encode_batch(prompts)
-    max_prompt_len = max(len(e.ids) for e in encoded)
-    prompt_token_ids = torch.full(
-        (batch_size, max_prompt_len),
-        pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
-    attention_mask = torch.zeros(
-        batch_size, max_prompt_len, dtype=torch.bool, device=device
-    )
-    for b, enc in enumerate(encoded):
-        ids = torch.tensor(enc.ids, device=device)
-        prompt_token_ids[b, max_prompt_len - len(ids) :] = ids
-        attention_mask[b, max_prompt_len - len(ids) :] = True
-
-    return prompt_token_ids, attention_mask

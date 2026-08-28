@@ -49,10 +49,10 @@ class TestRunValidation:
         metrics = run_validation(val_envs=[env], val_fn=val_fn)
 
         label = str(env)
-        assert f"val/{label}/reward_mean" in metrics
-        assert f"val/{label}/reward_std" in metrics
-        assert f"val/{label}/reward/correct" in metrics
-        assert "val/reward_mean" in metrics
+        assert f"val/{label}/mean" in metrics
+        assert f"val/{label}/std" in metrics
+        assert f"val/{label}/correct" in metrics
+        assert "val/mean" in metrics
 
     def test_multiple_envs_returns_per_env_metrics(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=100)
@@ -63,10 +63,10 @@ class TestRunValidation:
 
         for env in [env1, env2]:
             label = str(env)
-            assert f"val/{label}/reward_mean" in metrics
-            assert f"val/{label}/reward_std" in metrics
+            assert f"val/{label}/mean" in metrics
+            assert f"val/{label}/std" in metrics
 
-        assert "val/reward_mean" in metrics
+        assert "val/mean" in metrics
 
     def test_aggregate_reward_is_mean_of_per_env(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=100)
@@ -75,9 +75,9 @@ class TestRunValidation:
 
         metrics = run_validation(val_envs=[env1, env2], val_fn=val_fn)
 
-        per_env_means = [metrics[f"val/{str(env)}/reward_mean"] for env in [env1, env2]]
+        per_env_means = [metrics[f"val/{str(env)}/mean"] for env in [env1, env2]]
         expected = sum(per_env_means) / len(per_env_means)
-        assert metrics["val/reward_mean"] == expected
+        assert metrics["val/mean"] == expected
 
     def test_deterministic_with_same_seeds(self, tiny_model, tokenizer):
         env1 = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)
@@ -88,9 +88,7 @@ class TestRunValidation:
         metrics2 = run_validation(val_envs=[env2], val_fn=val_fn)
 
         label = str(env1)
-        assert (
-            metrics1[f"val/{label}/reward_mean"] == metrics2[f"val/{label}/reward_mean"]
-        )
+        assert metrics1[f"val/{label}/mean"] == metrics2[f"val/{label}/mean"]
 
     def test_no_grad_during_validation(self, tiny_model, tokenizer):
         env = CountdownEnv(n_ops=3, n_total=4, n_larges=1, seed=42)

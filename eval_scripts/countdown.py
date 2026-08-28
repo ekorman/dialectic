@@ -18,6 +18,7 @@ from tokenizers import Tokenizer
 from dialectic.llm.qwen import load_qwen3_06b
 from dialectic.llm.templates import Message, get_qwen_input_text_from_messages
 from dialectic.llm.utils import get_default_device
+from dialectic.log import log
 from dialectic.rl.env import Countdown, CountdownEnv
 from dialectic.rl.evaluate import evaluate
 from dialectic.rl.extractors import extract_from_answer_tags
@@ -84,7 +85,7 @@ def eval(
         torch.load(weights_path, map_location=device, weights_only=True)
     )
 
-    print(
+    log.info(
         f"Model loaded: {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M parameters"
     )
 
@@ -109,7 +110,7 @@ def eval(
         prompt_template=get_prompt_template(enable_thinking=use_qwen_thinking),
     )
     device = device or get_default_device()
-    print(f"device: {device}")
+    log.info(f"device: {device}")
     net = net.to(device)
 
     state_to_str = get_state_to_str(enable_thinking=use_qwen_thinking)

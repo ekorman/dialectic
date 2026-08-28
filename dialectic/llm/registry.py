@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from tokenizers import Tokenizer
+from torch import nn
 
 from dialectic.artifacts import Artifact, get_artifact
 from dialectic.llm.llama import (
@@ -25,7 +26,7 @@ class ModelInfo:
     pad_token_id: int
     format_messages: Callable[[list[Message], bool], str]
 
-    def load_net(self, **kwargs):
+    def load_net(self, **kwargs) -> nn.Module:
         return self.net_factory(**kwargs)
 
     def load_tokenizer(self) -> Tokenizer:
@@ -45,6 +46,15 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
             msgs, gen, enable_thinking=False
         ),
     ),
+    "qwen3-0.6b-thinking": ModelInfo(
+        net_factory=load_qwen3_06b,
+        tokenizer="Qwen/Qwen3-0.6B",
+        eos_token_id=151645,
+        pad_token_id=151643,
+        format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
+            msgs, gen, enable_thinking=True
+        ),
+    ),
     "qwen3-1.7b": ModelInfo(
         net_factory=load_qwen3_17b,
         tokenizer="Qwen/Qwen3-1.7B",
@@ -52,6 +62,15 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         pad_token_id=151643,
         format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
             msgs, gen, enable_thinking=False
+        ),
+    ),
+    "qwen3-1.7b-thinking": ModelInfo(
+        net_factory=load_qwen3_17b,
+        tokenizer="Qwen/Qwen3-1.7B",
+        eos_token_id=151645,
+        pad_token_id=151643,
+        format_messages=lambda msgs, gen: get_qwen_input_text_from_messages(
+            msgs, gen, enable_thinking=True
         ),
     ),
     "llama-3.2-1b-instruct": ModelInfo(

@@ -21,10 +21,12 @@ def attention(
 ) -> Float[Tensor, "B NH L DHead"]:
     sdpa_mask = None
     if attention_mask is not None:
-        # reshape to (B, 1, 1, L) for broadcasting
-        sdpa_mask = attention_mask.view(
-            attention_mask.shape[0], 1, 1, attention_mask.shape[1]
-        )
+        if attention_mask.ndim == 2:
+            sdpa_mask = attention_mask.view(
+                attention_mask.shape[0], 1, 1, attention_mask.shape[1]
+            )
+        else:
+            sdpa_mask = attention_mask
 
     use_sdpa_causal = False
 
@@ -40,6 +42,19 @@ def attention(
                 sdpa_mask = sdpa_mask & causal_mask
             else:
                 use_sdpa_causal = True
+
+    # NOTE on SDPA backend selection for custom (non-causal) masks:
+    # flash attention never accepts a custom mask. Memory-efficient
+    # attention was tested (via `torch.nn.attention.sdpa_kernel` forcing
+    # `SDPBackend.EFFICIENT_ATTENTION`) and refuses the prefix-LM
+    # `[B, 1, L, L]` mask shape on this hardware/torch combo, so the
+    # dispatcher falls back to the math backend. Math is O(L²) activation
+    # memory and noticeably slower than mem-efficient; if you want to
+    # recover that speedup, the path is `torch.nn.attention.flex_attention`
+    # (torch ≥2.5) with a `mask_mod` closure built from `prefix_lengths` —
+    # not a trivial drop-in because it requires routing through a separate
+    # `BlockMask` API. See the relevant conversation history for the full
+    # diagnosis and options.
     return nn.functional.scaled_dot_product_attention(
         q,
         k,
@@ -81,6 +96,10 @@ class MHSA(nn.Module):
         self.causal = causal  # ty: ignore[unresolved-attribute]
         self.use_rope = rope_base_value is not None  # ty: ignore[unresolved-attribute]
         self.apply_rms_norm = apply_rms_norm  # ty: ignore[unresolved-attribute]
+        self.rope_base_value = rope_base_value  # ty: ignore[unresolved-attribute]
+        self.max_position_embeddings = (
+            max_position_embeddings  # ty: ignore[unresolved-attribute]
+        )
 
         if apply_rms_norm:
             self.q_norm = RMSNorm(self.head_d, rms_norm_eps)
