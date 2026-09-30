@@ -87,20 +87,45 @@ uv run --group eval-q python scripts/q_verifier_pareto.py --artifact <scores art
 This experiment asks whether q works on prompts that neither p nor q saw in training. All arms start from p at step 700, and all are evaluated with the original `$ROLLOUTS` so they share the same test prompts and hard buckets.
 
 ```bash
-# 40k new train-only problems, deduplicated against $DATASET          -> $FRESH
+# 1. 40k new train-only problems, deduplicated against $DATASET       -> $FRESH
 uv run python -m $M.generate_countdown_dataset \
   --dataset_gen_params.n-examples 40000 --dataset_gen_params.seed 13 \
   --dataset_gen_params.train-pct 1 --dataset_gen_params.val-pct 0 --dataset_gen_params.test-pct 0 \
   --dataset_gen_params.exclude-artifacts $DATASET \
   --countdown_params.n-larges 1,2 --countdown_params.n-total 4,4 --countdown_params.n-ops 3,3
 
-# Step 3 with --dataset-glob $FRESH                                   -> $FRESH_ROLLOUTS
-# Continued-GRPO arm: step 2 with --dataset-glob $FRESH --train_params.val-freq 9999999999999 \
-#   --train_params.start-ckpt-run $P_RUN --train_params.start-ckpt-step 700   (seeds 20 and 81)
-# Step 5 with --gen_params.p-rollout-artifact $FRESH_ROLLOUTS         -> $FRESH_QCOT
-# Step 6 with --sft_params.q-cot-artifact $FRESH_QCOT --sft_params.p-rollout-artifact $FRESH_ROLLOUTS
-#   (pass both: the rollout artifact is otherwise inferred as the original one)
-# Step 7 on every arm. Pick each run's checkpoint by hard_pass_at_8 on test, then report it on --eval_params.split val.
+# 2. 32 rollouts per fresh prompt from p                               -> $FRESH_ROLLOUTS
+uv run --group vllm python -m $M.generate_inverse_cot_rollouts countdown "${ROLLOUT[@]}" \
+  --dataset-glob $FRESH --prompt-collection-id 3 \
+  --rollout_gen_params.start-ckpt-run $P_RUN --rollout_gen_params.start-ckpt-step 700
+
+# 3. Continued-GRPO arm: resume p from step 700 on the fresh prompts
+for SEED in 20 81; do
+  uv run --group vllm python -m $M.grpo countdown "${GRPO[@]}" --train_params.seed $SEED \
+    --dataset-glob $FRESH --prompt-collection-id 3 --train_params.max-tokens-generated 600 \
+    --train_params.start-ckpt-run $P_RUN --train_params.start-ckpt-step 700
+done
+
+# 4. Synthesize CoTs with q for the fresh prompts                      -> $FRESH_QCOT
+uv run python -m $M.generate_q_cot countdown --gen_params.q-ckpt-run $Q_RUN \
+  --gen_params.q-ckpt-step 1000 --gen_params.batch-size 64 --gen_params.temperature 1.0 \
+  --gen_params.p-rollout-artifact $FRESH_ROLLOUTS
+
+# 5. Distill into p. Pass both artifacts: otherwise the rollout artifact is inferred as the original $ROLLOUTS
+for MIX in 0 0.25 0.5 0.75 1.0; do for SEED in 81 20; do
+  uv run python -m $M.sft_inverse_cot countdown "${SFT[@]}" \
+    --sft_params.q-cot-artifact $FRESH_QCOT --sft_params.p-rollout-artifact $FRESH_ROLLOUTS \
+    --sft_params.mix-ratio $MIX --sft_params.seed $SEED
+done; done
+
+# 6. Select each run's checkpoint by hard_pass_at_8 on the original test prompts
+#    (grid: 1000..101000..6000 for SFT runs, 100..2000..100 for GRPO runs)
+uv run --group vllm python -m $M.eval_grpo countdown "${EVAL[@]}" --eval_params.split test \
+  --eval_params.p-rollout-artifact $ROLLOUTS --eval_params.ckpt-run <run> --eval_params.ckpt-step <grid>
+
+# 7. Report each selected checkpoint, plus the baseline ($P_RUN at step 700), on val
+uv run --group vllm python -m $M.eval_grpo countdown "${EVAL[@]}" --eval_params.split val \
+  --eval_params.p-rollout-artifact $ROLLOUTS --eval_params.ckpt-run <run> --eval_params.ckpt-step <selected step>
 ```
 
 ## GSM8K
@@ -112,17 +137,3 @@ The GSM8K pipeline runs steps 2–9 with `gsm8k` in place of `countdown`, with t
 - **q:** the paper uses q at step 25000 for q-CoT synthesis, FCR and the verifier.
 - **SFT:** drop the three `val-*` flags. Validation uses a stratified holdout from train.
 - **Evals:** drop `--eval_params.split`. `eval_grpo` also takes `--eval_params.max-tokens-generated 600`. `eval_inverse_cot` drops `--eval_params.seed`.
-
-## Paper runs
-
-These are the extty names the paper used. Pass one in place of the matching shell variable to start from that stage.
-
-| | Countdown | GSM8K |
-|---|---|---|
-| dataset | `countdown-dataset-n50000-ops3_3-20260511_161814` | `data/gsm8k/*.jsonl` |
-| p | `grpo-countdown/2026-05-13_03-46-52_4b09` @ 700 | `grpo-gsm8k/2026-05-14_22-19-08_494a` @ 3600 |
-| rollouts | `inverse-cot-rollouts-qwen3-0.6b-thinking-g32-20260525_162956` | `inverse-cot-rollouts-qwen3-0.6b-thinking-g32-20260518_164034` |
-| q | `inverse-cot-countdown/2026-05-26_03-54-26_d838` @ 1000 | `inverse-cot-gsm8k/2026-05-20_16-35-32_dddf` @ 25000 |
-| q-CoTs | `q-cot-countdown-qwen3-0.6b-thinking-20260611_223854-train` | `q-cot-gsm8k-qwen3-0.6b-thinking-20260610_160830-train` |
-
-Fresh-data experiment: dataset `countdown-dataset-n40000-ops3_3-20260708_092638`, rollouts `inverse-cot-rollouts-countdown-qwen3-0.6b-thinking-g32-20260708_144618`, q-CoTs `q-cot-countdown-qwen3-0.6b-thinking-20260708_205843-train`, and continued GRPO `grpo-countdown/2026-07-08_15-16-23_13ff` (seed 20) and `grpo-countdown/2026-07-13_00-55-31_634c` (seed 81).
