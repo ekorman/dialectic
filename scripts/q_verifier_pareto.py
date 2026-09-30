@@ -12,6 +12,11 @@ verifier-guided best-of-N schemes that stop *before* drawing all N completions:
   answer values, and stop once the plurality's lead (top count − second count)
   reaches a margin ``m``; return a random completion of the plurality value.
   Sweeping ``m`` traces its own accuracy vs expected draws.
+- **length-threshold**: the adaptive analog of the shortest-CoT selector and
+  the length-confound control for the q-threshold rule. Draw one at a time;
+  accept the first whose CoT length is ``<= L`` tokens; if none, fall back to
+  the shortest seen (== full shortest-CoT best-of-N). Sweeping ``L`` traces
+  its curve. Same orderings as the other two schemes.
 
 Rollouts have no intrinsic generation order, so each prompt is replayed over
 ``--n-orderings`` random shuffles and averaged — that both de-biases the order
@@ -52,6 +57,7 @@ import argparse
 import json
 import random
 from collections import Counter
+from collections.abc import Callable
 
 import extty
 
@@ -73,23 +79,53 @@ def _mixed(prompts: list[list[dict]]) -> list[list[dict]]:
     return out
 
 
-def _q_threshold_point(
-    prompts: list[list[dict]], tau: float, orderings: dict[int, list[list[int]]]
+ScoreFn = Callable[[dict], float]
+"""Per-completion score; higher is better. The threshold rules accept the first
+completion whose score clears ``tau`` and fall back to the argmax."""
+
+
+def _q_score(c: dict) -> float:
+    return c["q"]
+
+
+def _neg_length(c: dict) -> float:
+    return -float(c["cot_len"])
+
+
+def _threshold_point(
+    prompts: list[list[dict]],
+    tau: float,
+    orderings: dict[int, list[list[int]]],
+    score: ScoreFn = _q_score,
 ) -> tuple[float, float]:
-    """Return (mean_draws, accuracy) for q-threshold early-stop at ``tau``."""
+    """Return (mean_draws, accuracy) for score-threshold early-stop at ``tau``.
+
+    Parameters
+    ----------
+    prompts
+        Mixed prompts, each a list of per-completion records.
+    tau
+        Accept the first completion in draw order with ``score(c) >= tau``.
+    orderings
+        Precomputed random draw orders keyed by completion count.
+    score
+        Higher-is-better per-completion score: ``_q_score`` for the q-threshold
+        rule, ``_neg_length`` for the length-threshold rule (``tau = -L``).
+    """
     draws_sum = 0
     correct_sum = 0
     n = 0
     for comps in prompts:
         order_idx = orderings[len(comps)]
         for order in order_idx:
-            best = None  # (q, correct) best-so-far, for the no-accept fallback
+            best = None  # (score, correct) best-so-far, for the no-accept fallback
             accepted = None
             for pos, i in enumerate(order, start=1):
                 c = comps[i]
-                if best is None or c["q"] > best[0]:
-                    best = (c["q"], c["correct"])
-                if c["q"] >= tau:
+                sc = score(c)
+                if best is None or sc > best[0]:
+                    best = (sc, c["correct"])
+                if sc >= tau:
                     accepted = (pos, c["correct"])
                     break
             assert best is not None  # set on the first iteration
@@ -260,11 +296,20 @@ def main() -> None:
     taus = sorted(
         {q_scores[int(i * (len(q_scores) - 1) / (n_taus - 1))] for i in range(n_taus)}
     ) + [float("inf")]
-    q_curve = [_q_threshold_point(prompts, t, orderings) for t in taus]
+    q_curve = [_threshold_point(prompts, t, orderings, _q_score) for t in taus]
 
     max_n = max(sizes)
     margins = list(range(1, min(max_n, 20) + 1))
     sc_curve = [_adaptive_sc_point(prompts, m, orderings, rng) for m in margins]
+
+    # Length-threshold: same quantile-grid construction over CoT lengths.
+    # Scores are -cot_len so "accept if score >= tau" means "accept if
+    # cot_len <= L"; the +inf entry is the full-N shortest-CoT fallback.
+    lengths = sorted(-float(c["cot_len"]) for comps in prompts for c in comps)
+    len_taus = sorted(
+        {lengths[int(i * (len(lengths) - 1) / (n_taus - 1))] for i in range(n_taus)}
+    ) + [float("inf")]
+    len_curve = [_threshold_point(prompts, t, orderings, _neg_length) for t in len_taus]
 
     print("\nq-threshold  (draws, acc):")
     for d, a in _frontier(q_curve):
@@ -272,14 +317,22 @@ def main() -> None:
     print("\nadaptive self-consistency  (draws, acc):")
     for d, a in _frontier(sc_curve):
         print(f"  {d:5.2f}  {a:.4f}")
+    print("\nlength-threshold  (draws, acc):")
+    for d, a in _frontier(len_curve):
+        print(f"  {d:5.2f}  {a:.4f}")
 
-    # At matched budgets, how much more accurate is q?
-    print("\nq accuracy − adaptive-SC accuracy at matched expected-draws:")
+    # At matched budgets, how much more accurate is q than each rival?
+    print("\nq vs adaptive-SC vs length-threshold at matched expected-draws:")
     for budget in (2, 3, 4, 6, 8):
         qa = _interp_acc(q_curve, budget)
         sa = _interp_acc(sc_curve, budget)
-        if qa is not None and sa is not None:
-            print(f"  ~{budget} draws: q={qa:.4f}  sc={sa:.4f}  lift={qa - sa:+.4f}")
+        la = _interp_acc(len_curve, budget)
+        lift_sc = "" if qa is None or sa is None else f"  q−sc={qa - sa:+.4f}"
+        lift_len = "" if qa is None or la is None else f"  q−len={qa - la:+.4f}"
+        print(
+            f"  ~{budget} draws: q={_fmt_acc(qa)}  sc={_fmt_acc(sa)}  len={_fmt_acc(la)}"
+            f"{lift_sc}{lift_len}"
+        )
 
     # Full-N best-of-N accuracy stratified by vote margin. Margin 0 is the
     # vote-tie stratum: self-consistency has no signal there and drops to the
@@ -316,8 +369,13 @@ def main() -> None:
         )
 
     if args.out:
-        _plot(q_curve, sc_curve, args.out)
+        _plot(q_curve, sc_curve, len_curve, args.out)
         print(f"\nsaved plot: {args.out}")
+
+
+def _fmt_acc(acc: float | None) -> str:
+    """Format an interpolated accuracy, or a placeholder when out of range."""
+    return "  n/a " if acc is None else f"{acc:.4f}"
 
 
 def _interp_acc(curve, budget: float):
@@ -333,7 +391,7 @@ def _interp_acc(curve, budget: float):
     return None
 
 
-def _plot(q_curve, sc_curve, out: str) -> None:
+def _plot(q_curve, sc_curve, len_curve, out: str) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -343,6 +401,7 @@ def _plot(q_curve, sc_curve, out: str) -> None:
     for curve, label, marker in (
         (q_curve, "q-threshold", "o"),
         (sc_curve, "adaptive self-consistency", "s"),
+        (len_curve, "length-threshold", "^"),
     ):
         pts = sorted(curve)
         ax.plot([d for d, _ in pts], [a for _, a in pts], marker=marker, label=label)
