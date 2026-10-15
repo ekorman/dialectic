@@ -1,6 +1,6 @@
 # dialectic
 
-Code for *[Inverse Reasoning Models for Efficient Post-Training and Verification from Answer-Only Data](https://openreview.net/forum?id=DtSUbLSHLn&nesting=2&sort=date-desc)*. This method trains an inverse model q(CoT | prompt, answer) on the rollouts of a GRPO-trained forward model p. q is then used two ways: to synthesize CoTs that are distilled back into p with SFT, and as a best-of-N verifier. All experiments use Qwen3-0.6B (thinking mode) on Countdown and GSM8K.
+Code for *Inverse Reasoning Models for Efficient Post-Training and Verification from Answer-Only Data* [[OpenReview]](https://openreview.net/forum?id=DtSUbLSHLn&nesting=2&sort=date-desc) [[arXiv]](https://arxiv.org/abs/2610.18878). This method trains an inverse model q(CoT | prompt, answer) on the rollouts of a GRPO-trained forward model p. q is then used two ways: to synthesize CoTs that are distilled back into p with SFT, and as a best-of-N verifier. All experiments use Qwen3-0.6B (thinking mode) on Countdown and GSM8K.
 
 ## Setup
 
